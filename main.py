@@ -86,7 +86,16 @@ def get_smm_balance():
         "action": "balance"
     }
 
-    response = requests.post(SMM_API_URL, data=payload, timeout=30)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+    }
+
+    response = requests.post(
+        SMM_API_URL,
+        data=payload,
+        headers=headers,
+        timeout=30
+    )
 
     print("SMM BALANCE STATUS:", response.status_code, flush=True)
     print("SMM BALANCE RESPONSE:", response.text[:500], flush=True)
@@ -95,7 +104,7 @@ def get_smm_balance():
         return response.json()
     except Exception:
         return {
-            "error": "SMM panel JSON cevap vermedi. Cloudflare veya API erişim engeli olabilir.",
+            "error": "SMM panel JSON cevap vermedi.",
             "raw": response.text[:300]
         }
 
