@@ -10,15 +10,17 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN veya CHAT_ID eksik")
+        print("BOT_TOKEN veya CHAT_ID eksik", flush=True)
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={
+    response = requests.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
         "parse_mode": "HTML"
     })
+
+    print("TELEGRAM RESPONSE:", response.text, flush=True)
 
 
 @app.get("/")
@@ -59,6 +61,8 @@ Müşteri: test_user
 @app.post("/itemsatis-webhook")
 async def itemsatis_webhook(request: Request):
     data = await request.json()
+
+    print("ITEMSATIS WEBHOOK DATA:", data, flush=True)
 
     order_id = data.get("order_id", "Bilinmiyor")
     product_name = data.get("product_name", "Bilinmiyor")
