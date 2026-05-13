@@ -11,6 +11,8 @@ SMM_API_URL = os.getenv("SMM_API_URL")
 SMM_API_KEY = os.getenv("SMM_API_KEY")
 INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
 
+PROCESSED_LINKS = set()
+
 
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -48,21 +50,6 @@ https://lzt.market/steam/?order_by=price_to_up&title=cs2%20medal
 """
 
 
-def create_smm_order(link: str, quantity: int = 1000):
-    payload = {
-        "key": SMM_API_KEY,
-        "action": "add",
-        "service": INSTAGRAM_1000_SERVICE_ID,
-        "link": link,
-        "quantity": quantity
-    }
-
-    response = requests.post(SMM_API_URL, data=payload)
-    print("SMM RESPONSE:", response.text, flush=True)
-
-    return response.json()
-
-
 def find_customer_link(data: dict):
     possible_fields = [
         "link",
@@ -75,36 +62,47 @@ def find_customer_link(data: dict):
         "content",
         "description",
         "order_note",
-        "customer_note"
+        "customer_note",
+        "message"
     ]
 
     for field in possible_fields:
         value = data.get(field)
         if value and isinstance(value, str):
-            if "instagram.com" in value or value.startswith("@") or len(value) > 2:
-                return value.strip()
+            return value.strip()
 
     details = data.get("details")
     if isinstance(details, dict):
         for field in possible_fields:
             value = details.get(field)
             if value and isinstance(value, str):
-                if "instagram.com" in value or value.startswith("@") or len(value) > 2:
-                    return value.strip()
+                return value.strip()
 
     return ""
+
+
+def create_smm_order(link: str, quantity: int = 1000):
+    payload = {
+        "key": SMM_API_KEY,
+        "action": "add",
+        "service": INSTAGRAM_1000_SERVICE_ID,
+        "link": link,
+        "quantity": quantity
+    }
+
+    response = requests.post(SMM_API_URL, data=payload)
+
+    print("SMM RESPONSE:", response.text, flush=True)
+
+    return response.json()
 
 
 @app.get("/test")
 def test_message():
     message = f"""
-Test siparişi geldi.
+Test mesajı geldi.
 
-Sipariş ID: 12345
-Ürün: CS2 5 Year Medal
-Müşteri: test_user
-
-{get_lzt_links()}
+Bot aktif çalışıyor.
 """
     send_telegram(message)
     return {"ok": True}
@@ -180,16 +178,34 @@ Sipariş ID: {order_id}
 Ürün: {product_name}
 Müşteri: {buyer}
 
-Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmından müşteri linkinin hangi alanda geldiğini kontrol et.
+Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
 """
             send_telegram(message)
             return {"ok": False, "error": "customer_link_not_found"}
+
+        normalized_link = customer_link.lower().strip().replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
+
+        if normalized_link in PROCESSED_LINKS:
+            message = f"""
+Aynı Instagram linki tekrar geldi.
+
+Sipariş ID: {order_id}
+Ürün: {product_name}
+Link: {customer_link}
+
+Bu sipariş panele tekrar girilmedi.
+"""
+            send_telegram(message)
+            print("DUPLICATE LINK IGNORED:", normalized_link, flush=True)
+            return {"ignored": True, "reason": "duplicate_link"}
 
         if not SMM_API_URL or not SMM_API_KEY:
             send_telegram("SMM API ayarları eksik. Render Environment Variables kontrol et.")
             return {"ok": False, "error": "smm_api_missing"}
 
         smm_result = create_smm_order(customer_link, 1000)
+
+        PROCESSED_LINKS.add(normalized_link)
 
         message = f"""
 Instagram 1000 takipçi siparişi panele girildi.
