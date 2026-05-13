@@ -31,7 +31,18 @@ async def itemsatis_webhook(request: Request):
     product_name = data.get("product_name", "Bilinmiyor")
     buyer = data.get("buyer", "Bilinmiyor")
 
-    lzt_search_link = "https://lzt.market/steam/?order_by=price_to_up&title=5%20year%20medal%20cs2"
+   lzt_links = """
+LZT arama linkleri:
+
+1) 5 years medal:
+https://lzt.market/steam/?order_by=price_to_up&title=5%20years%20medal
+
+2) CS2 5 years:
+https://lzt.market/steam/?order_by=price_to_up&title=cs2%205%20years
+
+3) CS2 medal:
+https://lzt.market/steam/?order_by=price_to_up&title=cs2%20medal
+"""
 
     message = f"""
 Yeni sipariş geldi.
@@ -40,8 +51,7 @@ Sipariş ID: {order_id}
 Ürün: {product_name}
 Müşteri: {buyer}
 
-LZT arama linki:
-{lzt_search_link}
+{lzt_links}
 
 Hesabı manuel kontrol edip satın al.
 """
