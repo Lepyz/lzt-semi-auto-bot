@@ -20,7 +20,6 @@ def send_telegram(text: str):
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     response = requests.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
@@ -81,6 +80,18 @@ def find_customer_link(data: dict):
     return ""
 
 
+def get_smm_balance():
+    payload = {
+        "key": SMM_API_KEY,
+        "action": "balance"
+    }
+
+    response = requests.post(SMM_API_URL, data=payload, timeout=30)
+    print("SMM BALANCE RESPONSE:", response.text, flush=True)
+
+    return response.json()
+
+
 def create_smm_order(link: str, quantity: int = 1000):
     payload = {
         "key": SMM_API_KEY,
@@ -90,21 +101,15 @@ def create_smm_order(link: str, quantity: int = 1000):
         "quantity": quantity
     }
 
-    response = requests.post(SMM_API_URL, data=payload)
-
-    print("SMM RESPONSE:", response.text, flush=True)
+    response = requests.post(SMM_API_URL, data=payload, timeout=30)
+    print("SMM ORDER RESPONSE:", response.text, flush=True)
 
     return response.json()
 
 
 @app.get("/test")
 def test_message():
-    message = f"""
-Test mesajı geldi.
-
-Bot aktif çalışıyor.
-"""
-    send_telegram(message)
+    send_telegram("Test mesajı geldi. Bot aktif çalışıyor.")
     return {"ok": True}
 
 
@@ -171,31 +176,28 @@ Hesabı manuel kontrol edip satın al.
         customer_link = find_customer_link(data)
 
         if not customer_link:
-            message = f"""
+            send_telegram(f"""
 Instagram 1000 takipçi siparişi geldi ama müşteri linki bulunamadı.
 
-Sipariş ID: {order_id}
+Itemsatış Sipariş ID: {order_id}
 Ürün: {product_name}
 Müşteri: {buyer}
 
 Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
-"""
-            send_telegram(message)
+""")
             return {"ok": False, "error": "customer_link_not_found"}
 
         normalized_link = customer_link.lower().strip().replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
 
         if normalized_link in PROCESSED_LINKS:
-            message = f"""
+            send_telegram(f"""
 Aynı Instagram linki tekrar geldi.
 
-Sipariş ID: {order_id}
-Ürün: {product_name}
+Itemsatış Sipariş ID: {order_id}
 Link: {customer_link}
 
 Bu sipariş panele tekrar girilmedi.
-"""
-            send_telegram(message)
+""")
             print("DUPLICATE LINK IGNORED:", normalized_link, flush=True)
             return {"ignored": True, "reason": "duplicate_link"}
 
@@ -203,24 +205,103 @@ Bu sipariş panele tekrar girilmedi.
             send_telegram("SMM API ayarları eksik. Render Environment Variables kontrol et.")
             return {"ok": False, "error": "smm_api_missing"}
 
-        smm_result = create_smm_order(customer_link, 1000)
+        try:
+            balance_data = get_smm_balance()
+        except Exception as e:
+            send_telegram(f"""
+SMM bakiye kontrolü başarısız oldu.
 
-        PROCESSED_LINKS.add(normalized_link)
+Itemsatış Sipariş ID: {order_id}
+Hata: {str(e)}
 
-        message = f"""
-Instagram 1000 takipçi siparişi panele girildi.
+Sipariş panele girilmedi.
+""")
+            return {"ok": False, "error": "balance_check_failed"}
 
-Sipariş ID: {order_id}
+        balance = balance_data.get("balance", "Bilinmiyor")
+        currency = balance_data.get("currency", "")
+                try:
+            numeric_balance = float(balance)
+
+            # USD ise yaklaşık TL çevir
+            if currency.upper() == "USD":
+                balance_tl = numeric_balance * 39
+            else:
+                balance_tl = numeric_balance
+
+            if balance_tl <= 100:
+                send_telegram(f"""
+SMM panel bakiyesi 100 TL altına düştü.
+
+Kalan Bakiye:
+{balance} {currency}
+
+Lütfen panel bakiyesini kontrol et.
+""")
+
+        except Exception as e:
+            print("BALANCE CHECK ERROR:", str(e), flush=True)
+
+        try:
+            smm_result = create_smm_order(customer_link, 1000)
+        except Exception as e:
+            send_telegram(f"""
+Instagram 1000 takipçi siparişi panele girilemedi.
+
+Itemsatış Sipariş ID: {order_id}
+Link: {customer_link}
+Hata: {str(e)}
+""")
+            return {"ok": False, "error": "smm_order_failed"}
+
+        if "error" in smm_result:
+            send_telegram(f"""
+Instagram 1000 takipçi siparişi panele girilemedi.
+
+Itemsatış Sipariş ID: {order_id}
 Ürün: {product_name}
 Müşteri: {buyer}
 Link: {customer_link}
 
-SMM Cevap:
-{smm_result}
-"""
-        send_telegram(message)
+Panel Hatası:
+{smm_result.get("error")}
 
-        return {"ok": True, "type": "instagram_1000", "smm_result": smm_result}
+Bakiye:
+{balance} {currency}
+""")
+            return {"ok": False, "error": "smm_panel_error", "detail": smm_result}
+
+        smm_order_id = smm_result.get("order", "Bilinmiyor")
+
+        PROCESSED_LINKS.add(normalized_link)
+
+        print(
+            f"ORDER MAP | ITEMSATIS_ID={order_id} | SMM_ORDER_ID={smm_order_id} | LINK={customer_link}",
+            flush=True
+        )
+
+        send_telegram(f"""
+Instagram 1000 takipçi siparişi panele girildi.
+
+Itemsatış Sipariş ID: {order_id}
+SMM Sipariş ID: {smm_order_id}
+
+Ürün: {product_name}
+Müşteri: {buyer}
+Link: {customer_link}
+
+Bakiye:
+{balance} {currency}
+""")
+
+        return {
+            "ok": True,
+            "type": "instagram_1000",
+            "itemsatis_order_id": order_id,
+            "smm_order_id": smm_order_id,
+            "balance": balance,
+            "currency": currency
+        }
 
     print("IGNORED PRODUCT:", product_name, flush=True)
-    return {"ignored": True, "product": product_name}
+    return {"ignored": True, "product": product_name}      
