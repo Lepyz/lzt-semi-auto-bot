@@ -218,19 +218,19 @@ Sipariş panele girilmedi.
 """)
             return {"ok": False, "error": "balance_check_failed"}
 
-balance = balance_data.get("balance", "Bilinmiyor")
-currency = balance_data.get("currency", "")
+        balance = balance_data.get("balance", "Bilinmiyor")
+        currency = balance_data.get("currency", "")
 
-try:
-    numeric_balance = float(balance)
+        try:
+            numeric_balance = float(balance)
 
-    if currency.upper() == "USD":
-        balance_tl = numeric_balance * 39
-    else:
-        balance_tl = numeric_balance
+            if currency.upper() == "USD":
+                balance_tl = numeric_balance * 39
+            else:
+                balance_tl = numeric_balance
 
-    if balance_tl <= 100:
-        send_telegram(f"""
+            if balance_tl <= 100:
+                send_telegram(f"""
 SMM panel bakiyesi 100 TL altına düştü.
 
 Kalan Bakiye:
@@ -239,8 +239,8 @@ Kalan Bakiye:
 Lütfen panel bakiyesini kontrol et.
 """)
 
-except Exception as e:
-    print("BALANCE CHECK ERROR:", str(e), flush=True)
+        except Exception as e:
+            print("BALANCE CHECK ERROR:", str(e), flush=True)
 
         try:
             smm_result = create_smm_order(customer_link, 1000)
