@@ -105,14 +105,22 @@ def create_smm_order(link: str, quantity: int = 1000):
         "key": SMM_API_KEY,
         "action": "add",
         "service": INSTAGRAM_1000_SERVICE_ID,
-        "link": link,
+        "url": link,
         "quantity": quantity
     }
 
     response = requests.post(SMM_API_URL, data=payload, timeout=30)
-    print("SMM ORDER RESPONSE:", response.text, flush=True)
 
-    return response.json()
+    print("SMM ORDER STATUS:", response.status_code, flush=True)
+    print("SMM ORDER RESPONSE:", response.text[:500], flush=True)
+
+    try:
+        return response.json()
+    except Exception:
+        return {
+            "error": "SMM panel JSON cevap vermedi. Cloudflare veya API erişim engeli olabilir.",
+            "raw": response.text[:300]
+        }
 
 
 @app.get("/test")
