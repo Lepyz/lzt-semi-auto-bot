@@ -305,3 +305,75 @@ Bakiye:
 
     print("IGNORED PRODUCT:", product_name, flush=True)
     return {"ignored": True, "product": product_name}      
+
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+
+    print("TELEGRAM WEBHOOK DATA:", data, flush=True)
+
+    message = data.get("message", {})
+    text = message.get("text", "")
+    chat = message.get("chat", {})
+    chat_id = str(chat.get("id", ""))
+
+    if chat_id != str(CHAT_ID):
+        return {"ignored": True, "reason": "unauthorized_chat"}
+
+    if text == "/start" or text == "/help":
+        send_telegram("""
+Bot komutları:
+
+/balance - SMM panel bakiyesini gösterir
+/status - Bot durumunu gösterir
+/help - Komutları gösterir
+""")
+        return {"ok": True}
+
+    if text == "/status":
+        send_telegram("""
+Bot aktif çalışıyor.
+
+Render: Aktif
+Telegram: Aktif
+Itemsatış Webhook: Aktif
+""")
+        return {"ok": True}
+
+    if text == "/balance":
+        if not SMM_API_URL or not SMM_API_KEY:
+            send_telegram("SMM API ayarları eksik.")
+            return {"ok": False}
+
+        try:
+            balance_data = get_smm_balance()
+
+            balance = balance_data.get("balance", "Bilinmiyor")
+            currency = balance_data.get("currency", "")
+
+            send_telegram(f"""
+SMM Panel Bakiyesi:
+
+Bakiye:
+{balance} {currency}
+""")
+
+            return {"ok": True, "balance": balance, "currency": currency}
+
+        except Exception as e:
+            send_telegram(f"""
+Bakiye alınamadı.
+
+Hata:
+{str(e)}
+""")
+            return {"ok": False, "error": str(e)}
+
+    send_telegram("""
+Bilinmeyen komut.
+
+Komutları görmek için:
+/help
+""")
+
+    return {"ok": True}
