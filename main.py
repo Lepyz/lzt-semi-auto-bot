@@ -7,6 +7,10 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+SMM_API_URL = os.getenv("SMM_API_URL")
+SMM_API_KEY = os.getenv("SMM_API_KEY")
+INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
+
 
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -44,6 +48,53 @@ https://lzt.market/steam/?order_by=price_to_up&title=cs2%20medal
 """
 
 
+def create_smm_order(link: str, quantity: int = 1000):
+    payload = {
+        "key": SMM_API_KEY,
+        "action": "add",
+        "service": INSTAGRAM_1000_SERVICE_ID,
+        "link": link,
+        "quantity": quantity
+    }
+
+    response = requests.post(SMM_API_URL, data=payload)
+    print("SMM RESPONSE:", response.text, flush=True)
+
+    return response.json()
+
+
+def find_customer_link(data: dict):
+    possible_fields = [
+        "link",
+        "account_link",
+        "profile_link",
+        "instagram",
+        "instagram_link",
+        "username",
+        "note",
+        "content",
+        "description",
+        "order_note",
+        "customer_note"
+    ]
+
+    for field in possible_fields:
+        value = data.get(field)
+        if value and isinstance(value, str):
+            if "instagram.com" in value or value.startswith("@") or len(value) > 2:
+                return value.strip()
+
+    details = data.get("details")
+    if isinstance(details, dict):
+        for field in possible_fields:
+            value = details.get(field)
+            if value and isinstance(value, str):
+                if "instagram.com" in value or value.startswith("@") or len(value) > 2:
+                    return value.strip()
+
+    return ""
+
+
 @app.get("/test")
 def test_message():
     message = f"""
@@ -56,7 +107,7 @@ Müşteri: test_user
 {get_lzt_links()}
 """
     send_telegram(message)
-    return {"ok": True, "message": "Telegram test mesajı gönderildi"}
+    return {"ok": True}
 
 
 @app.post("/itemsatis-webhook")
@@ -98,17 +149,13 @@ Başlık:
         or "Bilinmiyor"
     )
 
-    allowed_products = [
-        "cs2 5 yıllık rozetli hesap mail değişen | hızlı"
-    ]
-
     product = product_name.lower().strip()
 
-    if product not in allowed_products:
-        print("IGNORED PRODUCT:", product_name, flush=True)
-        return {"ignored": True, "product": product_name}
+    cs2_allowed_product = "cs2 5 yıllık rozetli hesap mail değişen | hızlı"
+    instagram_allowed_product = "1000 instagram takipçi | garantili telafili"
 
-    message = f"""
+    if product == cs2_allowed_product:
+        message = f"""
 Yeni CS2 5 yıllık hesap siparişi geldi.
 
 Sipariş ID: {order_id}
@@ -119,7 +166,45 @@ Müşteri: {buyer}
 
 Hesabı manuel kontrol edip satın al.
 """
+        send_telegram(message)
+        return {"ok": True, "type": "cs2"}
 
-    send_telegram(message)
+    if product == instagram_allowed_product:
+        customer_link = find_customer_link(data)
 
-    return {"ok": True}
+        if not customer_link:
+            message = f"""
+Instagram 1000 takipçi siparişi geldi ama müşteri linki bulunamadı.
+
+Sipariş ID: {order_id}
+Ürün: {product_name}
+Müşteri: {buyer}
+
+Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmından müşteri linkinin hangi alanda geldiğini kontrol et.
+"""
+            send_telegram(message)
+            return {"ok": False, "error": "customer_link_not_found"}
+
+        if not SMM_API_URL or not SMM_API_KEY:
+            send_telegram("SMM API ayarları eksik. Render Environment Variables kontrol et.")
+            return {"ok": False, "error": "smm_api_missing"}
+
+        smm_result = create_smm_order(customer_link, 1000)
+
+        message = f"""
+Instagram 1000 takipçi siparişi panele girildi.
+
+Sipariş ID: {order_id}
+Ürün: {product_name}
+Müşteri: {buyer}
+Link: {customer_link}
+
+SMM Cevap:
+{smm_result}
+"""
+        send_telegram(message)
+
+        return {"ok": True, "type": "instagram_1000", "smm_result": smm_result}
+
+    print("IGNORED PRODUCT:", product_name, flush=True)
+    return {"ignored": True, "product": product_name}
