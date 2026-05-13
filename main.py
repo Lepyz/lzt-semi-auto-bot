@@ -7,6 +7,7 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
         print("BOT_TOKEN veya CHAT_ID eksik")
@@ -19,19 +20,14 @@ def send_telegram(text: str):
         "parse_mode": "HTML"
     })
 
+
 @app.get("/")
 def home():
     return {"status": "bot çalışıyor"}
 
-@app.post("/itemsatis-webhook")
-async def itemsatis_webhook(request: Request):
-    data = await request.json()
 
-    order_id = data.get("order_id", "Bilinmiyor")
-    product_name = data.get("product_name", "Bilinmiyor")
-    buyer = data.get("buyer", "Bilinmiyor")
-
-   lzt_links = """
+def get_lzt_links():
+    return """
 LZT arama linkleri:
 
 1) 5 years medal:
@@ -44,6 +40,30 @@ https://lzt.market/steam/?order_by=price_to_up&title=cs2%205%20years
 https://lzt.market/steam/?order_by=price_to_up&title=cs2%20medal
 """
 
+
+@app.get("/test")
+def test_message():
+    message = f"""
+Test siparişi geldi.
+
+Sipariş ID: 12345
+Ürün: CS2 5 Year Medal
+Müşteri: test_user
+
+{get_lzt_links()}
+"""
+    send_telegram(message)
+    return {"ok": True, "message": "Telegram test mesajı gönderildi"}
+
+
+@app.post("/itemsatis-webhook")
+async def itemsatis_webhook(request: Request):
+    data = await request.json()
+
+    order_id = data.get("order_id", "Bilinmiyor")
+    product_name = data.get("product_name", "Bilinmiyor")
+    buyer = data.get("buyer", "Bilinmiyor")
+
     message = f"""
 Yeni sipariş geldi.
 
@@ -51,7 +71,7 @@ Sipariş ID: {order_id}
 Ürün: {product_name}
 Müşteri: {buyer}
 
-{lzt_links}
+{get_lzt_links()}
 
 Hesabı manuel kontrol edip satın al.
 """
@@ -59,17 +79,3 @@ Hesabı manuel kontrol edip satın al.
     send_telegram(message)
 
     return {"ok": True}
-@app.get("/test")
-def test_message():
-    message = """
-Test siparişi geldi.
-
-Sipariş ID: 12345
-Ürün: CS2 5 Year Medal
-Müşteri: test_user
-
-LZT arama linki:
-https://lzt.market/steam/?order_by=price_to_up&title=5%20year%20medal%20cs2
-"""
-    send_telegram(message)
-    return {"ok": True, "message": "Telegram test mesajı gönderildi"}
