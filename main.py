@@ -97,7 +97,7 @@ def get_smm_balance():
         return {
             "error": "SMM panel JSON cevap vermedi. Cloudflare veya API erişim engeli olabilir.",
             "raw": response.text[:300]
-        }+-
+        }
 
 
 def create_smm_order(link: str, quantity: int = 1000):
