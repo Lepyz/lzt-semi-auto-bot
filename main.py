@@ -64,9 +64,43 @@ async def itemsatis_webhook(request: Request):
 
     print("ITEMSATIS WEBHOOK DATA:", data, flush=True)
 
-    order_id = data.get("order_id", "Bilinmiyor")
-    product_name = data.get("product_name", "Bilinmiyor")
-    buyer = data.get("buyer", "Bilinmiyor")
+    # Test bildirimi kontrolü
+    if data.get("details", {}).get("test") is True:
+
+        message = f"""
+Itemsatış webhook test mesajı geldi.
+
+Başlık:
+{data.get("title")}
+
+İçerik:
+{data.get("content")}
+"""
+
+        send_telegram(message)
+
+        return {"ok": True, "type": "test"}
+
+    # Gerçek sipariş alanları
+    order_id = (
+        data.get("order_id")
+        or data.get("id")
+        or "Bilinmiyor"
+    )
+
+    product_name = (
+        data.get("product_name")
+        or data.get("product")
+        or data.get("title")
+        or "Bilinmiyor"
+    )
+
+    buyer = (
+        data.get("buyer")
+        or data.get("username")
+        or data.get("customer")
+        or "Bilinmiyor"
+    )
 
     message = f"""
 Yeni sipariş geldi.
