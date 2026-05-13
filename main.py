@@ -387,3 +387,8 @@ Komutları görmek için:
 """)
 
     return {"ok": True}
+
+@app.get("/my-ip")
+def my_ip():
+    response = requests.get("https://api.ipify.org?format=json", timeout=30)
+    return response.json()
