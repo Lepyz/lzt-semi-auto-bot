@@ -118,8 +118,16 @@ def create_smm_order(link: str, quantity: int = 1000):
         "quantity": quantity
     }
 
-    response = requests.post(SMM_API_URL, data=payload, timeout=30)
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+}
 
+response = requests.post(
+    SMM_API_URL,
+    data=payload,
+    headers=headers,
+    timeout=30
+)
     print("SMM ORDER STATUS:", response.status_code, flush=True)
     print("SMM ORDER RESPONSE:", response.text[:500], flush=True)
 
