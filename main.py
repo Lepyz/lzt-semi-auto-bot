@@ -49,3 +49,17 @@ Hesabı manuel kontrol edip satın al.
     send_telegram(message)
 
     return {"ok": True}
+@app.get("/test")
+def test_message():
+    message = """
+Test siparişi geldi.
+
+Sipariş ID: 12345
+Ürün: CS2 5 Year Medal
+Müşteri: test_user
+
+LZT arama linki:
+https://lzt.market/steam/?order_by=price_to_up&title=5%20year%20medal%20cs2
+"""
+    send_telegram(message)
+    return {"ok": True, "message": "Telegram test mesajı gönderildi"}
