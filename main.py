@@ -13,6 +13,11 @@ INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
 
 PROCESSED_LINKS = set()
 
+SMM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*"
+}
+
 
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -20,6 +25,7 @@ def send_telegram(text: str):
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
     response = requests.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
@@ -52,6 +58,7 @@ https://lzt.market/steam/?order_by=price_to_up&title=cs2%20medal
 def find_customer_link(data: dict):
     possible_fields = [
         "link",
+        "url",
         "account_link",
         "profile_link",
         "instagram",
@@ -86,14 +93,10 @@ def get_smm_balance():
         "action": "balance"
     }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-    }
-
     response = requests.post(
         SMM_API_URL,
         data=payload,
-        headers=headers,
+        headers=SMM_HEADERS,
         timeout=30
     )
 
@@ -104,7 +107,7 @@ def get_smm_balance():
         return response.json()
     except Exception:
         return {
-            "error": "SMM panel JSON cevap vermedi.",
+            "error": "SMM panel JSON cevap vermedi. Cloudflare veya API erişim engeli olabilir.",
             "raw": response.text[:300]
         }
 
@@ -118,16 +121,13 @@ def create_smm_order(link: str, quantity: int = 1000):
         "quantity": quantity
     }
 
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-}
+    response = requests.post(
+        SMM_API_URL,
+        data=payload,
+        headers=SMM_HEADERS,
+        timeout=30
+    )
 
-response = requests.post(
-    SMM_API_URL,
-    data=payload,
-    headers=headers,
-    timeout=30
-)
     print("SMM ORDER STATUS:", response.status_code, flush=True)
     print("SMM ORDER RESPONSE:", response.text[:500], flush=True)
 
@@ -153,7 +153,7 @@ async def itemsatis_webhook(request: Request):
     print("ITEMSATIS WEBHOOK DATA:", data, flush=True)
 
     if data.get("details", {}).get("test") is True:
-        message = f"""
+        send_telegram(f"""
 Itemsatış webhook test mesajı geldi.
 
 Başlık:
@@ -161,29 +161,12 @@ Başlık:
 
 İçerik:
 {data.get("content")}
-"""
-        send_telegram(message)
+""")
         return {"ok": True, "type": "test"}
 
-    order_id = (
-        data.get("order_id")
-        or data.get("id")
-        or "Bilinmiyor"
-    )
-
-    product_name = (
-        data.get("product_name")
-        or data.get("product")
-        or data.get("title")
-        or ""
-    )
-
-    buyer = (
-        data.get("buyer")
-        or data.get("username")
-        or data.get("customer")
-        or "Bilinmiyor"
-    )
+    order_id = data.get("order_id") or data.get("id") or "Bilinmiyor"
+    product_name = data.get("product_name") or data.get("product") or data.get("title") or ""
+    buyer = data.get("buyer") or data.get("username") or data.get("customer") or "Bilinmiyor"
 
     product = product_name.lower().strip()
 
@@ -191,7 +174,7 @@ Başlık:
     instagram_allowed_product = "1000 instagram takipçi | garantili telafili"
 
     if product == cs2_allowed_product:
-        message = f"""
+        send_telegram(f"""
 Yeni CS2 5 yıllık hesap siparişi geldi.
 
 Sipariş ID: {order_id}
@@ -201,8 +184,7 @@ Müşteri: {buyer}
 {get_lzt_links()}
 
 Hesabı manuel kontrol edip satın al.
-"""
-        send_telegram(message)
+""")
         return {"ok": True, "type": "cs2"}
 
     if product == instagram_allowed_product:
@@ -220,7 +202,14 @@ Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
 """)
             return {"ok": False, "error": "customer_link_not_found"}
 
-        normalized_link = customer_link.lower().strip().replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
+        normalized_link = (
+            customer_link.lower()
+            .strip()
+            .replace("https://", "")
+            .replace("http://", "")
+            .replace("www.", "")
+            .rstrip("/")
+        )
 
         if normalized_link in PROCESSED_LINKS:
             send_telegram(f"""
@@ -231,25 +220,25 @@ Link: {customer_link}
 
 Bu sipariş panele tekrar girilmedi.
 """)
-            print("DUPLICATE LINK IGNORED:", normalized_link, flush=True)
             return {"ignored": True, "reason": "duplicate_link"}
 
         if not SMM_API_URL or not SMM_API_KEY:
             send_telegram("SMM API ayarları eksik. Render Environment Variables kontrol et.")
             return {"ok": False, "error": "smm_api_missing"}
 
-        try:
-            balance_data = get_smm_balance()
-        except Exception as e:
+        balance_data = get_smm_balance()
+
+        if "error" in balance_data:
             send_telegram(f"""
-SMM bakiye kontrolü başarısız oldu.
+SMM bakiye alınamadı.
 
 Itemsatış Sipariş ID: {order_id}
-Hata: {str(e)}
+Hata:
+{balance_data.get("error")}
 
 Sipariş panele girilmedi.
 """)
-            return {"ok": False, "error": "balance_check_failed"}
+            return {"ok": False, "error": "balance_failed"}
 
         balance = balance_data.get("balance", "Bilinmiyor")
         currency = balance_data.get("currency", "")
@@ -271,21 +260,10 @@ Kalan Bakiye:
 
 Lütfen panel bakiyesini kontrol et.
 """)
-
         except Exception as e:
             print("BALANCE CHECK ERROR:", str(e), flush=True)
 
-        try:
-            smm_result = create_smm_order(customer_link, 1000)
-        except Exception as e:
-            send_telegram(f"""
-Instagram 1000 takipçi siparişi panele girilemedi.
-
-Itemsatış Sipariş ID: {order_id}
-Link: {customer_link}
-Hata: {str(e)}
-""")
-            return {"ok": False, "error": "smm_order_failed"}
+        smm_result = create_smm_order(customer_link, 1000)
 
         if "error" in smm_result:
             send_telegram(f"""
@@ -305,7 +283,6 @@ Bakiye:
             return {"ok": False, "error": "smm_panel_error", "detail": smm_result}
 
         smm_order_id = smm_result.get("order", "Bilinmiyor")
-
         PROCESSED_LINKS.add(normalized_link)
 
         print(
@@ -337,7 +314,8 @@ Bakiye:
         }
 
     print("IGNORED PRODUCT:", product_name, flush=True)
-    return {"ignored": True, "product": product_name}      
+    return {"ignored": True, "product": product_name}
+
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
@@ -378,29 +356,28 @@ Itemsatış Webhook: Aktif
             send_telegram("SMM API ayarları eksik.")
             return {"ok": False}
 
-        try:
-            balance_data = get_smm_balance()
+        balance_data = get_smm_balance()
 
-            balance = balance_data.get("balance", "Bilinmiyor")
-            currency = balance_data.get("currency", "")
-
+        if "error" in balance_data:
             send_telegram(f"""
+SMM bakiye alınamadı.
+
+Hata:
+{balance_data.get("error")}
+""")
+            return {"ok": False, "error": balance_data.get("error")}
+
+        balance = balance_data.get("balance", "Bilinmiyor")
+        currency = balance_data.get("currency", "")
+
+        send_telegram(f"""
 SMM Panel Bakiyesi:
 
 Bakiye:
 {balance} {currency}
 """)
 
-            return {"ok": True, "balance": balance, "currency": currency}
-
-        except Exception as e:
-            send_telegram(f"""
-Bakiye alınamadı.
-
-Hata:
-{str(e)}
-""")
-            return {"ok": False, "error": str(e)}
+        return {"ok": True, "balance": balance, "currency": currency}
 
     send_telegram("""
 Bilinmeyen komut.
