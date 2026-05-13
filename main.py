@@ -87,9 +87,17 @@ def get_smm_balance():
     }
 
     response = requests.post(SMM_API_URL, data=payload, timeout=30)
-    print("SMM BALANCE RESPONSE:", response.text, flush=True)
 
-    return response.json()
+    print("SMM BALANCE STATUS:", response.status_code, flush=True)
+    print("SMM BALANCE RESPONSE:", response.text[:500], flush=True)
+
+    try:
+        return response.json()
+    except Exception:
+        return {
+            "error": "SMM panel JSON cevap vermedi. Cloudflare veya API erişim engeli olabilir.",
+            "raw": response.text[:300]
+        }+-
 
 
 def create_smm_order(link: str, quantity: int = 1000):
