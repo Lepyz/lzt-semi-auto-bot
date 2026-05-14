@@ -388,7 +388,6 @@ def home():
 
 @app.get("/test")
 def test_message():
-    send_telegram("Test mesajı geldi.\nBot aktif çalışıyor.")
     return {"ok": True}
 
 @app.head("/test")
