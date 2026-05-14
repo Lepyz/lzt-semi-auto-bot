@@ -391,6 +391,10 @@ def test_message():
     send_telegram("Test mesajı geldi.\nBot aktif çalışıyor.")
     return {"ok": True}
 
+@app.head("/test")
+def test_head():
+    return {"ok": True}
+
 
 @app.get("/my-ip")
 def my_ip():
