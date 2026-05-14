@@ -165,7 +165,21 @@ Başlık:
         return {"ok": True, "type": "test"}
 
     order_id = data.get("order_id") or data.get("id") or "Bilinmiyor"
-    product_name = data.get("product_name") or data.get("product") or data.get("title") or ""
+        event = data.get("details", {}).get("event", "")
+
+    if event and event != "purchase_created":
+        print("IGNORED EVENT:", event, flush=True)
+        return {"ignored": True, "event": event}
+
+    advert = data.get("advert", {})
+
+    product_name = (
+        data.get("product_name")
+        or data.get("product")
+        or advert.get("title")
+        or data.get("title")
+        or ""
+    )
     buyer = data.get("buyer") or data.get("username") or data.get("customer") or "Bilinmiyor"
 
     product = product_name.lower().strip()
