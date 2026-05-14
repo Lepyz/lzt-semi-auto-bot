@@ -16,10 +16,11 @@ INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
 CS2_ADVERT_ID = "5282114"
 INSTAGRAM_ADVERT_ID = "5098093"
 
+PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
 
 SMM_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0",
     "Accept": "application/json,text/plain,*/*",
 }
 
@@ -28,11 +29,28 @@ def normalize_text(text: str) -> str:
     return str(text or "").lower().strip()
 
 
-def normalize_link(link: str) -> str:
+def normalize_instagram_link(link: str) -> str:
+    link = str(link or "").strip()
+
+    if not link:
+        return ""
+
+    if link.startswith("@"):
+        link = f"https://www.instagram.com/{link[1:]}"
+
+    if not link.startswith("http"):
+        link = "https://" + link
+
+    link = link.split("?")[0]
+    link = link.rstrip("/")
+
+    return link
+
+
+def normalize_link_for_check(link: str) -> str:
     return (
-        str(link or "")
+        normalize_instagram_link(link)
         .lower()
-        .strip()
         .replace("https://", "")
         .replace("http://", "")
         .replace("www.", "")
@@ -243,9 +261,10 @@ def find_instagram_link(data: dict) -> str:
 
     for path in priority_paths:
         value = get_nested(data, path)
+
         if isinstance(value, str) and value.strip():
-            if "instagram.com" in value.lower():
-                return value.strip().split("?")[0]
+            if "instagram.com" in value.lower() or value.strip().startswith("@"):
+                return normalize_instagram_link(value)
 
     all_strings = collect_strings(data)
     joined = "\n".join(all_strings)
@@ -258,14 +277,12 @@ def find_instagram_link(data: dict) -> str:
 
     if match:
         link = match.group(0)
-        if not link.startswith("http"):
-            link = "https://" + link
-        return link.strip()
+        return normalize_instagram_link(link)
 
     for text in all_strings:
         text = text.strip()
         if text.startswith("@") and len(text) > 2:
-            return f"https://instagram.com/{text.lstrip('@')}"
+            return normalize_instagram_link(text)
 
     return ""
 
@@ -310,7 +327,7 @@ def create_smm_order(link: str, quantity: int = 1000):
         "key": SMM_API_KEY,
         "action": "add",
         "service": INSTAGRAM_1000_SERVICE_ID,
-        "url": link,
+        "link": link,
         "quantity": quantity,
     }
 
@@ -347,14 +364,16 @@ def check_low_balance(balance, currency):
             balance_tl = numeric_balance
 
         if balance_tl <= 100:
-            send_telegram(f"""
+            send_telegram(
+                f"""
 SMM panel bakiyesi 100 TL altına düştü.
 
-Kalan Bakiye:
-{balance} {currency}
+Kalan Bakiye: {balance} {currency}
 
 Lütfen panel bakiyesini kontrol et.
-""")
+"""
+            )
+
     except Exception as e:
         print("BALANCE CHECK ERROR:", str(e), flush=True)
 
@@ -366,7 +385,7 @@ def home():
 
 @app.get("/test")
 def test_message():
-    send_telegram("Test mesajı geldi. Bot aktif çalışıyor.")
+    send_telegram("Test mesajı geldi.\nBot aktif çalışıyor.")
     return {"ok": True}
 
 
@@ -392,7 +411,21 @@ async def itemsatis_webhook(request: Request):
     product_name = get_product_name(data)
     buyer = get_buyer(data)
 
-    send_telegram(f"""
+    if order_id in PROCESSED_ORDERS and order_id != "Bilinmiyor":
+        send_telegram(
+            f"""
+Aynı Itemsatış siparişi tekrar geldi.
+
+Sipariş ID: {order_id}
+Advert ID: {advert_id or "Yok"}
+
+Tekrar işlem yapılmadı.
+"""
+        )
+        return {"ignored": True, "reason": "duplicate_order"}
+
+    send_telegram(
+        f"""
 Itemsatış webhook geldi.
 
 Event: {event or "Yok"}
@@ -400,7 +433,8 @@ Advert ID: {advert_id or "Yok"}
 Ürün: {product_name or "Bulunamadı"}
 Sipariş ID: {order_id}
 Müşteri: {buyer}
-""")
+"""
+    )
 
     ignored_events = {
         "review_received",
@@ -415,7 +449,10 @@ Müşteri: {buyer}
         return {"ignored": True, "event": event}
 
     if advert_id == CS2_ADVERT_ID:
-        send_telegram(f"""
+        PROCESSED_ORDERS.add(order_id)
+
+        send_telegram(
+            f"""
 Yeni CS2 5 yıllık hesap siparişi geldi.
 
 Sipariş ID: {order_id}
@@ -426,14 +463,22 @@ Müşteri: {buyer}
 {get_lzt_links()}
 
 Hesabı manuel kontrol edip satın al.
-""")
-        return {"ok": True, "type": "cs2", "order_id": order_id, "advert_id": advert_id}
+"""
+        )
+
+        return {
+            "ok": True,
+            "type": "cs2",
+            "order_id": order_id,
+            "advert_id": advert_id,
+        }
 
     if advert_id == INSTAGRAM_ADVERT_ID:
         customer_link = find_instagram_link(data)
 
         if not customer_link:
-            send_telegram(f"""
+            send_telegram(
+                f"""
 Instagram siparişi geldi ama müşteri linki bulunamadı.
 
 Itemsatış Sipariş ID: {order_id}
@@ -442,27 +487,33 @@ Advert ID: {advert_id}
 Müşteri: {buyer}
 
 Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
-""")
+"""
+            )
+
             return {"ok": False, "error": "instagram_link_not_found"}
 
-        normalized = normalize_link(customer_link)
+        normalized_link = normalize_link_for_check(customer_link)
 
-        if normalized in PROCESSED_LINKS:
-            send_telegram(f"""
+        if normalized_link in PROCESSED_LINKS:
+            send_telegram(
+                f"""
 Aynı Instagram linki tekrar geldi.
 
 Itemsatış Sipariş ID: {order_id}
 Advert ID: {advert_id}
 Link: {customer_link}
 
-Tekrar işlem yapılmadı.
-""")
+Bu sipariş panele tekrar girilmedi.
+"""
+            )
+
             return {"ignored": True, "reason": "duplicate_link"}
 
         balance_data = get_smm_balance()
 
         if "error" in balance_data:
-            send_telegram(f"""
+            send_telegram(
+                f"""
 Instagram siparişi geldi ama SMM bakiye alınamadığı için panele girilmedi.
 
 Itemsatış Sipariş ID: {order_id}
@@ -470,9 +521,10 @@ Advert ID: {advert_id}
 Ürün: {product_name}
 Link: {customer_link}
 
-Hata:
-{balance_data.get("error")}
-""")
+Hata: {balance_data.get("error")}
+"""
+            )
+
             return {"ok": False, "error": "balance_failed"}
 
         balance = balance_data.get("balance", "Bilinmiyor")
@@ -483,7 +535,8 @@ Hata:
         smm_result = create_smm_order(customer_link, 1000)
 
         if "error" in smm_result:
-            send_telegram(f"""
+            send_telegram(
+                f"""
 Instagram 1000 takipçi siparişi panele girilemedi.
 
 Itemsatış Sipariş ID: {order_id}
@@ -492,36 +545,41 @@ Advert ID: {advert_id}
 Müşteri: {buyer}
 Link: {customer_link}
 
-Panel Hatası:
-{smm_result.get("error")}
+Panel Hatası: {smm_result.get("error")}
+Bakiye: {balance} {currency}
+"""
+            )
 
-Bakiye:
-{balance} {currency}
-""")
-            return {"ok": False, "error": "smm_panel_error", "detail": smm_result}
+            return {
+                "ok": False,
+                "error": "smm_panel_error",
+                "detail": smm_result,
+            }
 
         smm_order_id = smm_result.get("order", "Bilinmiyor")
-        PROCESSED_LINKS.add(normalized)
+
+        PROCESSED_LINKS.add(normalized_link)
+        PROCESSED_ORDERS.add(order_id)
 
         print(
             f"ORDER MAP | ITEMSATIS_ID={order_id} | ADVERT_ID={advert_id} | SMM_ORDER_ID={smm_order_id} | LINK={customer_link}",
             flush=True,
         )
 
-        send_telegram(f"""
+        send_telegram(
+            f"""
 Instagram 1000 takipçi siparişi panele girildi.
 
 Itemsatış Sipariş ID: {order_id}
 Advert ID: {advert_id}
 SMM Sipariş ID: {smm_order_id}
-
 Ürün: {product_name}
 Müşteri: {buyer}
 Link: {customer_link}
 
-Bakiye:
-{balance} {currency}
-""")
+Bakiye: {balance} {currency}
+"""
+        )
 
         return {
             "ok": True,
@@ -535,6 +593,7 @@ Bakiye:
         }
 
     print("IGNORED PRODUCT:", product_name, "ADVERT ID:", advert_id, flush=True)
+
     return {
         "ignored": True,
         "product": product_name,
@@ -546,6 +605,7 @@ Bakiye:
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
+
     print("TELEGRAM WEBHOOK DATA:", json.dumps(data, ensure_ascii=False), flush=True)
 
     message = data.get("message", {})
@@ -557,46 +617,54 @@ async def telegram_webhook(request: Request):
         return {"ignored": True, "reason": "unauthorized_chat"}
 
     if text in ["/start", "/help"]:
-        send_telegram("""
+        send_telegram(
+            """
 Bot komutları:
 
 /balance - SMM panel bakiyesini gösterir
 /status - Bot durumunu gösterir
 /help - Komutları gösterir
-""")
+"""
+        )
         return {"ok": True}
 
     if text == "/status":
-        send_telegram("""
+        send_telegram(
+            """
 Bot aktif çalışıyor.
 
 Render: Aktif
 Telegram: Aktif
 Itemsatış Webhook: Aktif
 SMMRush: /balance ile kontrol edilebilir
-""")
+"""
+        )
         return {"ok": True}
 
     if text == "/balance":
         balance_data = get_smm_balance()
 
         if "error" in balance_data:
-            send_telegram(f"""
+            send_telegram(
+                f"""
 SMM bakiye alınamadı.
 
-Hata:
-{balance_data.get("error")}
-""")
+Hata: {balance_data.get("error")}
+"""
+            )
             return {"ok": False, "error": balance_data.get("error")}
 
         balance = balance_data.get("balance", "Bilinmiyor")
         currency = balance_data.get("currency", "")
 
-        send_telegram(f"""
+        send_telegram(
+            f"""
 SMM Panel Bakiyesi:
 
 Bakiye: {balance} {currency}
-""")
+"""
+        )
+
         return {"ok": True, "balance": balance, "currency": currency}
 
     send_telegram("Bilinmeyen komut. Komutları görmek için: /help")
