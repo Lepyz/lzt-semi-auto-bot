@@ -208,6 +208,9 @@ def collect_strings(obj, results=None):
 
 def find_instagram_link(data: dict) -> str:
     priority_paths = [
+        "post_datas.Profil Linki",
+        "details.post_datas.Profil Linki",
+        "data.post_datas.Profil Linki",
         "url",
         "link",
         "instagram",
@@ -242,7 +245,7 @@ def find_instagram_link(data: dict) -> str:
         value = get_nested(data, path)
         if isinstance(value, str) and value.strip():
             if "instagram.com" in value.lower():
-                return value.strip()
+                return value.strip().split("?")[0]
 
     all_strings = collect_strings(data)
     joined = "\n".join(all_strings)
