@@ -40,6 +40,12 @@ def home():
     return {"status": "bot çalışıyor"}
 
 
+@app.get("/my-ip")
+def my_ip():
+    response = requests.get("https://api.ipify.org?format=json", timeout=30)
+    return response.json()
+
+
 def get_lzt_links():
     return """
 LZT arama linkleri:
@@ -163,28 +169,38 @@ Başlık:
 {data.get("content")}
 """)
         return {"ok": True, "type": "test"}
-        
-order_id = data.get("order_id") or data.get("id") or "Bilinmiyor"
 
-event = data.get("details", {}).get("event", "")
+    event = data.get("details", {}).get("event", "")
 
-if event and event != "purchase_created":
-    print("IGNORED EVENT:", event, flush=True)
-    return {"ignored": True, "event": event}
+    if event and event != "purchase_created":
+        print("IGNORED EVENT:", event, flush=True)
+        return {"ignored": True, "event": event}
 
-advert = data.get("advert", {})
+    order_id = (
+        data.get("order_id")
+        or data.get("id")
+        or data.get("purchaseId")
+        or "Bilinmiyor"
+    )
 
-product_name = (
-    data.get("product_name")
-    or data.get("product")
-    or advert.get("title")
-    or data.get("title")
-    or ""
-)
+    advert = data.get("advert", {})
 
-buyer = data.get("buyer") or data.get("username") or data.get("customer") or "Bilinmiyor"
+    product_name = (
+        data.get("product_name")
+        or data.get("product")
+        or advert.get("title")
+        or data.get("title")
+        or ""
+    )
 
-product = product_name.lower().strip()
+    buyer = (
+        data.get("buyer")
+        or data.get("username")
+        or data.get("customer")
+        or "Bilinmiyor"
+    )
+
+    product = product_name.lower().strip()
 
     cs2_allowed_product = "cs2 5 yıllık rozetli hesap mail değişen | hızlı"
     instagram_allowed_product = "1000 instagram takipçi | garantili telafili"
@@ -299,6 +315,7 @@ Bakiye:
             return {"ok": False, "error": "smm_panel_error", "detail": smm_result}
 
         smm_order_id = smm_result.get("order", "Bilinmiyor")
+
         PROCESSED_LINKS.add(normalized_link)
 
         print(
@@ -403,8 +420,3 @@ Komutları görmek için:
 """)
 
     return {"ok": True}
-
-@app.get("/my-ip")
-def my_ip():
-    response = requests.get("https://api.ipify.org?format=json", timeout=30)
-    return response.json()
