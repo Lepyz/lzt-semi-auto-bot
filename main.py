@@ -39,6 +39,9 @@ def normalize_instagram_link(link: str) -> str:
         link = f"https://www.instagram.com/{link[1:]}"
 
     if not link.startswith("http"):
+    if "instagram.com" not in link:
+        link = f"https://www.instagram.com/{link.lstrip('@')}"
+    else:
         link = "https://" + link
 
     link = link.split("?")[0]
