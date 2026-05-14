@@ -163,7 +163,7 @@ Başlık:
 {data.get("content")}
 """)
         return {"ok": True, "type": "test"}
-
+        
 order_id = data.get("order_id") or data.get("id") or "Bilinmiyor"
 
 event = data.get("details", {}).get("event", "")
@@ -184,7 +184,7 @@ product_name = (
 
 buyer = data.get("buyer") or data.get("username") or data.get("customer") or "Bilinmiyor"
 
-    product = product_name.lower().strip()
+product = product_name.lower().strip()
 
     cs2_allowed_product = "cs2 5 yıllık rozetli hesap mail değişen | hızlı"
     instagram_allowed_product = "1000 instagram takipçi | garantili telafili"
