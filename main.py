@@ -2,6 +2,7 @@ import os
 import re
 import json
 import requests
+from datetime import datetime
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -22,7 +23,7 @@ CS2_ADVERT_ID = "5282114"
 SMM_SERVICE_MAP = {
     "5098093": {
         "name": "Instagram 1000 Normal Takipçi",
-        "panel": "smmrush",
+        "panel": "SMMRush",
         "api_url": SMM_API_URL,
         "api_key": SMM_API_KEY,
         "service_id": INSTAGRAM_1000_SERVICE_ID,
@@ -30,7 +31,7 @@ SMM_SERVICE_MAP = {
     },
     "5191839": {
         "name": "Instagram 100 Türk Takipçi",
-        "panel": "medyabayim",
+        "panel": "MedyaBayim",
         "api_url": MEDYABAYIM_API_URL,
         "api_key": MEDYABAYIM_API_KEY,
         "service_id": MEDYABAYIM_100_TURK_SERVICE_ID,
@@ -43,10 +44,34 @@ PROCESSED_LINKS = set()
 FAILED_ORDERS = []
 PENDING_ORDERS = []
 
+DAILY_STATS = {}
+LAST_DAILY_REPORT_DATE = ""
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json,text/plain,*/*",
 }
+
+
+def send_telegram(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("BOT_TOKEN veya CHAT_ID eksik", flush=True)
+        return
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=30,
+        )
+        print("TELEGRAM RESPONSE:", r.status_code, r.text[:500], flush=True)
+    except Exception as e:
+        print("TELEGRAM ERROR:", str(e), flush=True)
 
 
 def normalize_text(text: str) -> str:
@@ -85,27 +110,6 @@ def normalize_link_for_check(link: str) -> str:
     )
 
 
-def send_telegram(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN veya CHAT_ID eksik", flush=True)
-        return
-
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=30,
-        )
-        print("TELEGRAM RESPONSE:", r.status_code, r.text[:500], flush=True)
-    except Exception as e:
-        print("TELEGRAM ERROR:", str(e), flush=True)
-
-
 def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
     FAILED_ORDERS.append(
         {
@@ -121,7 +125,14 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
         FAILED_ORDERS.pop(0)
 
 
+def add_daily_stat(product_name: str):
+    DAILY_STATS[product_name] = DAILY_STATS.get(product_name, 0) + 1
+
+
 def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
+    if not smm_order_id or str(smm_order_id) == "Bilinmiyor":
+        return
+
     PENDING_ORDERS.append(
         {
             "itemsatis_order_id": str(order_id),
@@ -179,6 +190,9 @@ def get_event(data: dict) -> str:
             "details.event",
             "details.type",
             "details.action",
+            "data.event",
+            "data.type",
+            "data.action",
         )
     )
 
@@ -209,6 +223,9 @@ def get_advert_id(data: dict) -> str:
             "advert.id",
             "details.advert.id",
             "data.advert.id",
+            "advert_id",
+            "details.advert_id",
+            "data.advert_id",
         )
         or ""
     )
@@ -316,6 +333,7 @@ def find_instagram_link(data: dict) -> str:
 
     for path in priority_paths:
         value = get_nested(data, path)
+
         if isinstance(value, str) and value.strip():
             if "instagram.com" in value.lower() or value.strip().startswith("@"):
                 return normalize_instagram_link(value)
@@ -398,6 +416,9 @@ def create_panel_order(api_url, api_key, service_id, link, quantity):
 
 
 def check_panel_order_status(api_url, api_key, order_id):
+    if not api_url or not api_key or not order_id:
+        return {"error": "Status için API bilgisi veya order ID eksik"}
+
     try:
         r = requests.post(
             api_url,
@@ -464,10 +485,12 @@ def test_head():
 def my_ip():
     r = requests.get("https://api.ipify.org?format=json", timeout=30)
     return r.json()
-    
+
+
 @app.head("/check-orders")
 def check_orders_head():
     return {"ok": True}
+
 
 @app.get("/check-orders")
 def check_orders():
@@ -510,6 +533,48 @@ Müşteriye değerlendirme mesajı gönderebilirsin.
         "pending_count": len(PENDING_ORDERS),
         "completed_count": len(completed_indexes),
     }
+
+
+@app.head("/daily-report")
+def daily_report_head():
+    return {"ok": True}
+
+
+@app.get("/daily-report")
+def daily_report():
+    global LAST_DAILY_REPORT_DATE
+    global DAILY_STATS
+
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+
+    if now.hour != 0:
+        return {"ok": True, "message": "Rapor saati değil"}
+
+    if LAST_DAILY_REPORT_DATE == today:
+        return {"ok": True, "message": "Bugünün raporu zaten gönderildi"}
+
+    lines = ["Günlük Satış Özeti\n"]
+
+    total = 0
+
+    if DAILY_STATS:
+        for product_name, count in DAILY_STATS.items():
+            lines.append(f"{product_name}: {count}")
+            total += count
+    else:
+        lines.append("Bugün kayıtlı otomatik sipariş yok.")
+
+    lines.append(f"\nToplam otomatik sipariş: {total}")
+    lines.append(f"Başarısız sipariş kaydı: {len(FAILED_ORDERS)}")
+    lines.append(f"Bekleyen sipariş: {len(PENDING_ORDERS)}")
+
+    send_telegram("\n".join(lines))
+
+    LAST_DAILY_REPORT_DATE = today
+    DAILY_STATS = {}
+
+    return {"ok": True, "sent": True}
 
 
 @app.post("/itemsatis-webhook")
@@ -602,7 +667,7 @@ Instagram siparişi geldi ama müşteri linki bulunamadı.
 
 Itemsatış Sipariş ID: {order_id}
 Advert ID: {advert_id}
-Ürün: {product_name}
+Ürün: {service["name"]}
 Müşteri: {buyer}
 
 Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
@@ -612,7 +677,7 @@ Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
             add_failed_order(
                 order_id,
                 advert_id,
-                product_name,
+                service["name"],
                 "Instagram linki bulunamadı",
                 "Müşteri link alanı bot tarafından algılanamadı.",
             )
@@ -713,18 +778,18 @@ Bakiye: {balance} {currency}
 
         PROCESSED_LINKS.add(duplicate_key)
         PROCESSED_ORDERS.add(order_id)
+        add_daily_stat(service["name"])
 
-        if smm_order_id != "Bilinmiyor":
-            add_pending_order(
-                order_id,
-                advert_id,
-                service["name"],
-                service["panel"],
-                service["api_url"],
-                service["api_key"],
-                smm_order_id,
-                customer_link,
-            )
+        add_pending_order(
+            order_id,
+            advert_id,
+            service["name"],
+            service["panel"],
+            service["api_url"],
+            service["api_key"],
+            smm_order_id,
+            customer_link,
+        )
 
         send_telegram(
             f"""
@@ -785,12 +850,13 @@ async def telegram_webhook(request: Request):
             """
 Bot komutları:
 
-/balance - Ana panel bakiyesini gösterir
+/balance - SMMRush bakiyesini gösterir
 /medyabalance - MedyaBayim bakiyesini gösterir
 /status - Bot durumunu gösterir
 /health - Genel sistem durumunu gösterir
 /failed - Başarısız siparişleri gösterir
 /pending - Takip edilen siparişleri gösterir
+/report - Günlük sayaç durumunu gösterir
 /help - Komutları gösterir
 """
         )
@@ -911,6 +977,24 @@ SMM ID: {item["smm_order_id"]}
 Link: {item["link"]}
 """
             )
+
+        send_telegram("\n".join(lines))
+        return {"ok": True}
+
+    if text == "/report":
+        lines = ["Bugünkü Otomatik Sipariş Sayacı:\n"]
+        total = 0
+
+        if DAILY_STATS:
+            for product_name, count in DAILY_STATS.items():
+                lines.append(f"{product_name}: {count}")
+                total += count
+        else:
+            lines.append("Bugün kayıtlı otomatik sipariş yok.")
+
+        lines.append(f"\nToplam: {total}")
+        lines.append(f"Başarısız: {len(FAILED_ORDERS)}")
+        lines.append(f"Bekleyen: {len(PENDING_ORDERS)}")
 
         send_telegram("\n".join(lines))
         return {"ok": True}
