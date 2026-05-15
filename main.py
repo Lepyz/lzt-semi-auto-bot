@@ -18,6 +18,7 @@ INSTAGRAM_ADVERT_ID = "5098093"
 
 PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
+FAILED_ORDERS = []
 
 SMM_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -82,6 +83,20 @@ def send_telegram(text: str):
         print("TELEGRAM RESPONSE:", r.status_code, r.text[:500], flush=True)
     except Exception as e:
         print("TELEGRAM ERROR:", str(e), flush=True)
+
+def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
+    failed = {
+        "order_id": str(order_id),
+        "advert_id": str(advert_id),
+        "product_name": str(product_name),
+        "reason": str(reason),
+        "detail": str(detail),
+    }
+
+    FAILED_ORDERS.append(failed)
+
+    if len(FAILED_ORDERS) > 20:
+        FAILED_ORDERS.pop(0)
 
 
 def get_lzt_links() -> str:
@@ -417,7 +432,7 @@ async def itemsatis_webhook(request: Request):
     product_name = get_product_name(data)
     buyer = get_buyer(data)
 
-    if order_id in PROCESSED_ORDERS and order_id != "Bilinmiyor":
+    if order_id in send telegrem and order_id != "Bilinmiyor":
         send_telegram(
             f"""
 Aynı Itemsatış siparişi tekrar geldi.
@@ -496,6 +511,15 @@ Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
 """
             )
 
+
+add_failed_order(
+    order_id,
+    advert_id,
+    product_name,
+    "Instagram linki bulunamadı",
+    "Müşteri link alanı bot tarafından algılanamadı."
+)
+            
             return {"ok": False, "error": "instagram_link_not_found"}
 
         normalized_link = normalize_link_for_check(customer_link)
@@ -531,6 +555,16 @@ Hata: {balance_data.get("error")}
 """
             )
 
+add_failed_order(
+    order_id,
+    advert_id,
+    product_name,
+    "SMM bakiye alınamadı",
+    balance_data.get("error", "")
+)
+
+return {"ok": False, "error": "balance_failed"}
+            
             return {"ok": False, "error": "balance_failed"}
 
         balance = balance_data.get("balance", "Bilinmiyor")
@@ -556,6 +590,14 @@ Bakiye: {balance} {currency}
 """
             )
 
+add_failed_order(
+    order_id,
+    advert_id,
+    product_name,
+    "SMM panel sipariş hatası",
+    smm_result.get("error", smm_result)
+)
+            
             return {
                 "ok": False,
                 "error": "smm_panel_error",
@@ -672,6 +714,28 @@ Bakiye: {balance} {currency}
         )
 
         return {"ok": True, "balance": balance, "currency": currency}
+
+        if text == "/failed":
+        if not FAILED_ORDERS:
+            send_telegram("Başarısız sipariş kaydı yok.")
+            return {"ok": True}
+
+        lines = ["Başarısız Siparişler:\n"]
+
+        for item in FAILED_ORDERS[-10:]:
+            lines.append(
+                f"""
+Sipariş ID: {item["order_id"]}
+Advert ID: {item["advert_id"]}
+Ürün: {item["product_name"]}
+Sebep: {item["reason"]}
+Detay: {item["detail"]}
+"""
+            )
+
+        send_telegram("\n".join(lines))
+        return {"ok": True}
+
 
     send_telegram("Bilinmeyen komut. Komutları görmek için: /help")
     return {"ok": True}
