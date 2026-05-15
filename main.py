@@ -432,7 +432,7 @@ async def itemsatis_webhook(request: Request):
     product_name = get_product_name(data)
     buyer = get_buyer(data)
 
-    if order_id in send telegrem and order_id != "Bilinmiyor":
+    if order_id in PROCESSED_ORDERS and order_id != "Bilinmiyor":
         send_telegram(
             f"""
 Aynı Itemsatış siparişi tekrar geldi.
