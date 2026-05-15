@@ -464,7 +464,10 @@ def test_head():
 def my_ip():
     r = requests.get("https://api.ipify.org?format=json", timeout=30)
     return r.json()
-
+    
+@app.head("/check-orders")
+def check_orders_head():
+    return {"ok": True}
 
 @app.get("/check-orders")
 def check_orders():
