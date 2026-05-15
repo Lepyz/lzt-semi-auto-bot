@@ -494,7 +494,7 @@ Hesabı manuel kontrol edip satın al.
             "advert_id": advert_id,
         }
 
-        if advert_id == INSTAGRAM_ADVERT_ID:
+    if advert_id == INSTAGRAM_ADVERT_ID:
         customer_link = find_instagram_link(data)
 
         if not customer_link:
