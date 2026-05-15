@@ -497,7 +497,7 @@ Hesabı manuel kontrol edip satın al.
     if advert_id == INSTAGRAM_ADVERT_ID:
         customer_link = find_instagram_link(data)
 
-        if not customer_link:
+               if not customer_link:
             send_telegram(
                 f"""
 Instagram siparişi geldi ama müşteri linki bulunamadı.
@@ -511,17 +511,16 @@ Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
 """
             )
 
+            add_failed_order(
+                order_id,
+                advert_id,
+                product_name,
+                "Instagram linki bulunamadı",
+                "Müşteri link alanı bot tarafından algılanamadı."
+            )
 
-add_failed_order(
-    order_id,
-    advert_id,
-    product_name,
-    "Instagram linki bulunamadı",
-    "Müşteri link alanı bot tarafından algılanamadı."
-)
-            
             return {"ok": False, "error": "instagram_link_not_found"}
-
+                   
         normalized_link = normalize_link_for_check(customer_link)
 
         if normalized_link in PROCESSED_LINKS:
