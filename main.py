@@ -494,10 +494,10 @@ Hesabı manuel kontrol edip satın al.
             "advert_id": advert_id,
         }
 
-    if advert_id == INSTAGRAM_ADVERT_ID:
+        if advert_id == INSTAGRAM_ADVERT_ID:
         customer_link = find_instagram_link(data)
 
-               if not customer_link:
+        if not customer_link:
             send_telegram(
                 f"""
 Instagram siparişi geldi ama müşteri linki bulunamadı.
@@ -520,7 +520,7 @@ Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
             )
 
             return {"ok": False, "error": "instagram_link_not_found"}
-                   
+
         normalized_link = normalize_link_for_check(customer_link)
 
         if normalized_link in PROCESSED_LINKS:
