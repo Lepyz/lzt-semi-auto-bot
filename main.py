@@ -35,7 +35,7 @@ SMM_SERVICE_MAP = {
         "api_url": MEDYABAYIM_API_URL,
         "api_key": MEDYABAYIM_API_KEY,
         "service_id": MEDYABAYIM_100_TURK_SERVICE_ID,
-        "quantity": 100,
+        "quantity": 90,
     },
 }
 
