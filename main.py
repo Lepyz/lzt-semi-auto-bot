@@ -13,14 +13,37 @@ SMM_API_URL = os.getenv("SMM_API_URL", "https://smmrush.com/api/v2")
 SMM_API_KEY = os.getenv("SMM_API_KEY", "")
 INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
 
+MEDYABAYIM_API_URL = os.getenv("MEDYABAYIM_API_URL", "https://medyabayim.com/api/v2")
+MEDYABAYIM_API_KEY = os.getenv("MEDYABAYIM_API_KEY", "")
+MEDYABAYIM_100_TURK_SERVICE_ID = os.getenv("MEDYABAYIM_100_TURK_SERVICE_ID", "13743")
+
 CS2_ADVERT_ID = "5282114"
-INSTAGRAM_ADVERT_ID = "5098093"
+
+SMM_SERVICE_MAP = {
+    "5098093": {
+        "name": "Instagram 1000 Normal Takipçi",
+        "panel": "smmrush",
+        "api_url": SMM_API_URL,
+        "api_key": SMM_API_KEY,
+        "service_id": INSTAGRAM_1000_SERVICE_ID,
+        "quantity": 1000,
+    },
+    "5191839": {
+        "name": "Instagram 100 Türk Takipçi",
+        "panel": "medyabayim",
+        "api_url": MEDYABAYIM_API_URL,
+        "api_key": MEDYABAYIM_API_KEY,
+        "service_id": MEDYABAYIM_100_TURK_SERVICE_ID,
+        "quantity": 100,
+    },
+}
 
 PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
 FAILED_ORDERS = []
+PENDING_ORDERS = []
 
-SMM_HEADERS = {
+HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json,text/plain,*/*",
 }
@@ -67,11 +90,9 @@ def send_telegram(text: str):
         print("BOT_TOKEN veya CHAT_ID eksik", flush=True)
         return
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     try:
         r = requests.post(
-            url,
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={
                 "chat_id": CHAT_ID,
                 "text": text,
@@ -86,18 +107,33 @@ def send_telegram(text: str):
 
 
 def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
-    failed = {
-        "order_id": str(order_id),
-        "advert_id": str(advert_id),
-        "product_name": str(product_name),
-        "reason": str(reason),
-        "detail": str(detail),
-    }
-
-    FAILED_ORDERS.append(failed)
+    FAILED_ORDERS.append(
+        {
+            "order_id": str(order_id),
+            "advert_id": str(advert_id),
+            "product_name": str(product_name),
+            "reason": str(reason),
+            "detail": str(detail),
+        }
+    )
 
     if len(FAILED_ORDERS) > 20:
         FAILED_ORDERS.pop(0)
+
+
+def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
+    PENDING_ORDERS.append(
+        {
+            "itemsatis_order_id": str(order_id),
+            "advert_id": str(advert_id),
+            "product_name": str(product_name),
+            "panel": str(panel),
+            "api_url": str(api_url),
+            "api_key": str(api_key),
+            "smm_order_id": str(smm_order_id),
+            "link": str(link),
+        }
+    )
 
 
 def get_lzt_links() -> str:
@@ -280,7 +316,6 @@ def find_instagram_link(data: dict) -> str:
 
     for path in priority_paths:
         value = get_nested(data, path)
-
         if isinstance(value, str) and value.strip():
             if "instagram.com" in value.lower() or value.strip().startswith("@"):
                 return normalize_instagram_link(value)
@@ -305,74 +340,88 @@ def find_instagram_link(data: dict) -> str:
     return ""
 
 
-def get_smm_balance():
-    if not SMM_API_URL or not SMM_API_KEY:
-        return {"error": "SMM_API_URL veya SMM_API_KEY eksik"}
-
-    payload = {
-        "key": SMM_API_KEY,
-        "action": "balance",
-    }
+def panel_balance(api_url, api_key):
+    if not api_url or not api_key:
+        return {"error": "API URL veya API KEY eksik"}
 
     try:
         r = requests.post(
-            SMM_API_URL,
-            data=payload,
-            headers=SMM_HEADERS,
+            api_url,
+            data={
+                "key": api_key,
+                "action": "balance",
+            },
+            headers=HEADERS,
             timeout=30,
         )
 
-        print("SMM BALANCE STATUS:", r.status_code, flush=True)
-        print("SMM BALANCE RESPONSE:", r.text[:500], flush=True)
+        print("BALANCE STATUS:", r.status_code, flush=True)
+        print("BALANCE RESPONSE:", r.text[:500], flush=True)
 
         try:
             return r.json()
         except Exception:
-            return {
-                "error": "SMM panel JSON cevap vermedi",
-                "raw": r.text[:300],
-            }
+            return {"error": "Panel JSON cevap vermedi", "raw": r.text[:300]}
 
     except Exception as e:
         return {"error": str(e)}
 
 
-def create_smm_order(link: str, quantity: int = 1000):
-    if not SMM_API_URL or not SMM_API_KEY:
-        return {"error": "SMM_API_URL veya SMM_API_KEY eksik"}
-
-    payload = {
-        "key": SMM_API_KEY,
-        "action": "add",
-        "service": INSTAGRAM_1000_SERVICE_ID,
-        "link": link,
-        "quantity": quantity,
-    }
+def create_panel_order(api_url, api_key, service_id, link, quantity):
+    if not api_url or not api_key:
+        return {"error": "API URL veya API KEY eksik"}
 
     try:
         r = requests.post(
-            SMM_API_URL,
-            data=payload,
-            headers=SMM_HEADERS,
+            api_url,
+            data={
+                "key": api_key,
+                "action": "add",
+                "service": service_id,
+                "link": link,
+                "quantity": quantity,
+            },
+            headers=HEADERS,
             timeout=30,
         )
 
-        print("SMM ORDER STATUS:", r.status_code, flush=True)
-        print("SMM ORDER RESPONSE:", r.text[:500], flush=True)
+        print("ORDER STATUS:", r.status_code, flush=True)
+        print("ORDER RESPONSE:", r.text[:500], flush=True)
 
         try:
             return r.json()
         except Exception:
-            return {
-                "error": "SMM panel JSON cevap vermedi",
-                "raw": r.text[:300],
-            }
+            return {"error": "Panel JSON cevap vermedi", "raw": r.text[:300]}
 
     except Exception as e:
         return {"error": str(e)}
 
 
-def check_low_balance(balance, currency):
+def check_panel_order_status(api_url, api_key, order_id):
+    try:
+        r = requests.post(
+            api_url,
+            data={
+                "key": api_key,
+                "action": "status",
+                "order": order_id,
+            },
+            headers=HEADERS,
+            timeout=30,
+        )
+
+        print("STATUS CHECK:", r.status_code, r.text[:500], flush=True)
+
+        try:
+            return r.json()
+        except Exception:
+            return {"error": "Status JSON cevap vermedi", "raw": r.text[:300]}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_low_balance(balance, currency, panel_name="Panel"):
     try:
         numeric_balance = float(balance)
 
@@ -384,7 +433,7 @@ def check_low_balance(balance, currency):
         if balance_tl <= 100:
             send_telegram(
                 f"""
-SMM panel bakiyesi 100 TL altına düştü.
+{panel_name} bakiyesi 100 TL altına düştü.
 
 Kalan Bakiye: {balance} {currency}
 
@@ -415,6 +464,49 @@ def test_head():
 def my_ip():
     r = requests.get("https://api.ipify.org?format=json", timeout=30)
     return r.json()
+
+
+@app.get("/check-orders")
+def check_orders():
+    completed_indexes = []
+
+    for index, item in enumerate(PENDING_ORDERS):
+        status_data = check_panel_order_status(
+            item["api_url"],
+            item["api_key"],
+            item["smm_order_id"],
+        )
+
+        if "error" in status_data:
+            print("STATUS ERROR:", status_data, flush=True)
+            continue
+
+        status = str(status_data.get("status", "")).lower()
+
+        if status in ["completed", "complete", "tamamlandı"]:
+            send_telegram(
+                f"""
+Instagram siparişi tamamlandı.
+
+Ürün: {item["product_name"]}
+Panel: {item["panel"]}
+Itemsatış Sipariş ID: {item["itemsatis_order_id"]}
+SMM Sipariş ID: {item["smm_order_id"]}
+Link: {item["link"]}
+
+Müşteriye değerlendirme mesajı gönderebilirsin.
+"""
+            )
+            completed_indexes.append(index)
+
+    for index in reversed(completed_indexes):
+        PENDING_ORDERS.pop(index)
+
+    return {
+        "ok": True,
+        "pending_count": len(PENDING_ORDERS),
+        "completed_count": len(completed_indexes),
+    }
 
 
 @app.post("/itemsatis-webhook")
@@ -495,7 +587,9 @@ Hesabı manuel kontrol edip satın al.
             "advert_id": advert_id,
         }
 
-    if advert_id == INSTAGRAM_ADVERT_ID:
+    if advert_id in SMM_SERVICE_MAP:
+        service = SMM_SERVICE_MAP[advert_id]
+
         customer_link = find_instagram_link(data)
 
         if not customer_link:
@@ -517,20 +611,22 @@ Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
                 advert_id,
                 product_name,
                 "Instagram linki bulunamadı",
-                "Müşteri link alanı bot tarafından algılanamadı."
+                "Müşteri link alanı bot tarafından algılanamadı.",
             )
 
             return {"ok": False, "error": "instagram_link_not_found"}
 
         normalized_link = normalize_link_for_check(customer_link)
+        duplicate_key = f"{advert_id}:{normalized_link}"
 
-        if normalized_link in PROCESSED_LINKS:
+        if duplicate_key in PROCESSED_LINKS:
             send_telegram(
                 f"""
-Aynı Instagram linki tekrar geldi.
+Aynı Instagram linki aynı ilana tekrar geldi.
 
 Itemsatış Sipariş ID: {order_id}
 Advert ID: {advert_id}
+Ürün: {service["name"]}
 Link: {customer_link}
 
 Bu sipariş panele tekrar girilmedi.
@@ -539,16 +635,17 @@ Bu sipariş panele tekrar girilmedi.
 
             return {"ignored": True, "reason": "duplicate_link"}
 
-        balance_data = get_smm_balance()
+        balance_data = panel_balance(service["api_url"], service["api_key"])
 
         if "error" in balance_data:
             send_telegram(
                 f"""
-Instagram siparişi geldi ama SMM bakiye alınamadığı için panele girilmedi.
+Instagram siparişi geldi ama panel bakiyesi alınamadığı için panele girilmedi.
 
 Itemsatış Sipariş ID: {order_id}
 Advert ID: {advert_id}
-Ürün: {product_name}
+Ürün: {service["name"]}
+Panel: {service["panel"]}
 Link: {customer_link}
 
 Hata: {balance_data.get("error")}
@@ -558,9 +655,9 @@ Hata: {balance_data.get("error")}
             add_failed_order(
                 order_id,
                 advert_id,
-                product_name,
-                "SMM bakiye alınamadı",
-                balance_data.get("error", "")
+                service["name"],
+                "Panel bakiyesi alınamadı",
+                balance_data.get("error", ""),
             )
 
             return {"ok": False, "error": "balance_failed"}
@@ -568,18 +665,25 @@ Hata: {balance_data.get("error")}
         balance = balance_data.get("balance", "Bilinmiyor")
         currency = balance_data.get("currency", "")
 
-        check_low_balance(balance, currency)
+        check_low_balance(balance, currency, service["panel"])
 
-        smm_result = create_smm_order(customer_link, 1000)
+        smm_result = create_panel_order(
+            service["api_url"],
+            service["api_key"],
+            service["service_id"],
+            customer_link,
+            service["quantity"],
+        )
 
         if "error" in smm_result:
             send_telegram(
                 f"""
-Instagram 1000 takipçi siparişi panele girilemedi.
+Instagram siparişi panele girilemedi.
 
 Itemsatış Sipariş ID: {order_id}
 Advert ID: {advert_id}
-Ürün: {product_name}
+Ürün: {service["name"]}
+Panel: {service["panel"]}
 Müşteri: {buyer}
 Link: {customer_link}
 
@@ -591,37 +695,46 @@ Bakiye: {balance} {currency}
             add_failed_order(
                 order_id,
                 advert_id,
-                product_name,
-                "SMM panel sipariş hatası",
-                smm_result.get("error", smm_result)
+                service["name"],
+                "Panel sipariş hatası",
+                smm_result.get("error", smm_result),
             )
 
             return {
                 "ok": False,
-                "error": "smm_panel_error",
+                "error": "panel_order_error",
                 "detail": smm_result,
             }
 
         smm_order_id = smm_result.get("order", "Bilinmiyor")
 
-        PROCESSED_LINKS.add(normalized_link)
+        PROCESSED_LINKS.add(duplicate_key)
         PROCESSED_ORDERS.add(order_id)
 
-        print(
-            f"ORDER MAP | ITEMSATIS_ID={order_id} | ADVERT_ID={advert_id} | SMM_ORDER_ID={smm_order_id} | LINK={customer_link}",
-            flush=True,
-        )
+        if smm_order_id != "Bilinmiyor":
+            add_pending_order(
+                order_id,
+                advert_id,
+                service["name"],
+                service["panel"],
+                service["api_url"],
+                service["api_key"],
+                smm_order_id,
+                customer_link,
+            )
 
         send_telegram(
             f"""
-Instagram 1000 takipçi siparişi panele girildi.
+Instagram siparişi panele girildi.
 
+Ürün: {service["name"]}
+Panel: {service["panel"]}
 Itemsatış Sipariş ID: {order_id}
 Advert ID: {advert_id}
 SMM Sipariş ID: {smm_order_id}
-Ürün: {product_name}
 Müşteri: {buyer}
 Link: {customer_link}
+Adet: {service["quantity"]}
 
 Bakiye: {balance} {currency}
 """
@@ -629,11 +742,13 @@ Bakiye: {balance} {currency}
 
         return {
             "ok": True,
-            "type": "instagram_1000",
+            "type": "instagram_smm",
             "itemsatis_order_id": order_id,
             "advert_id": advert_id,
+            "panel": service["panel"],
             "smm_order_id": smm_order_id,
             "instagram_link": customer_link,
+            "quantity": service["quantity"],
             "balance": balance,
             "currency": currency,
         }
@@ -667,10 +782,12 @@ async def telegram_webhook(request: Request):
             """
 Bot komutları:
 
-/balance - SMM panel bakiyesini gösterir
+/balance - Ana panel bakiyesini gösterir
+/medyabalance - MedyaBayim bakiyesini gösterir
 /status - Bot durumunu gösterir
 /health - Genel sistem durumunu gösterir
 /failed - Başarısız siparişleri gösterir
+/pending - Takip edilen siparişleri gösterir
 /help - Komutları gösterir
 """
         )
@@ -684,44 +801,58 @@ Bot aktif çalışıyor.
 Render: Aktif
 Telegram: Aktif
 Itemsatış Webhook: Aktif
-SMMRush: /balance ile kontrol edilebilir
+SMM Paneller: Aktif
 """
         )
         return {"ok": True}
 
     if text == "/balance":
-        balance_data = get_smm_balance()
+        balance_data = panel_balance(SMM_API_URL, SMM_API_KEY)
 
         if "error" in balance_data:
-            send_telegram(
-                f"""
-SMM bakiye alınamadı.
-
-Hata: {balance_data.get("error")}
-"""
-            )
-            return {"ok": False, "error": balance_data.get("error")}
-
-        balance = balance_data.get("balance", "Bilinmiyor")
-        currency = balance_data.get("currency", "")
+            send_telegram(f"SMMRush bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
+            return {"ok": False}
 
         send_telegram(
             f"""
-SMM Panel Bakiyesi:
+SMMRush Panel Bakiyesi:
 
-Bakiye: {balance} {currency}
+Bakiye: {balance_data.get("balance", "Bilinmiyor")} {balance_data.get("currency", "")}
 """
         )
+        return {"ok": True}
 
-        return {"ok": True, "balance": balance, "currency": currency}
-
-    if text == "/health":
-        balance_data = get_smm_balance()
+    if text == "/medyabalance":
+        balance_data = panel_balance(MEDYABAYIM_API_URL, MEDYABAYIM_API_KEY)
 
         if "error" in balance_data:
-            balance_text = f"SMM: Hatalı\nHata: {balance_data.get('error')}"
-        else:
-            balance_text = f"SMM: Aktif\nBakiye: {balance_data.get('balance')} {balance_data.get('currency', '')}"
+            send_telegram(f"MedyaBayim bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
+            return {"ok": False}
+
+        send_telegram(
+            f"""
+MedyaBayim Panel Bakiyesi:
+
+Bakiye: {balance_data.get("balance", "Bilinmiyor")} {balance_data.get("currency", "")}
+"""
+        )
+        return {"ok": True}
+
+    if text == "/health":
+        main_balance = panel_balance(SMM_API_URL, SMM_API_KEY)
+        medya_balance = panel_balance(MEDYABAYIM_API_URL, MEDYABAYIM_API_KEY)
+
+        main_text = (
+            f"SMMRush: Hatalı - {main_balance.get('error')}"
+            if "error" in main_balance
+            else f"SMMRush: Aktif - {main_balance.get('balance')} {main_balance.get('currency', '')}"
+        )
+
+        medya_text = (
+            f"MedyaBayim: Hatalı - {medya_balance.get('error')}"
+            if "error" in medya_balance
+            else f"MedyaBayim: Aktif - {medya_balance.get('balance')} {medya_balance.get('currency', '')}"
+        )
 
         send_telegram(
             f"""
@@ -730,11 +861,13 @@ Sistem Durumu
 Bot: Aktif
 Telegram: Aktif
 Render: Aktif
-{balance_text}
+{main_text}
+{medya_text}
+
 Başarısız sipariş kaydı: {len(FAILED_ORDERS)}
+Takip edilen sipariş: {len(PENDING_ORDERS)}
 """
         )
-
         return {"ok": True}
 
     if text == "/failed":
@@ -752,6 +885,27 @@ Advert ID: {item["advert_id"]}
 Ürün: {item["product_name"]}
 Sebep: {item["reason"]}
 Detay: {item["detail"]}
+"""
+            )
+
+        send_telegram("\n".join(lines))
+        return {"ok": True}
+
+    if text == "/pending":
+        if not PENDING_ORDERS:
+            send_telegram("Takip edilen sipariş yok.")
+            return {"ok": True}
+
+        lines = ["Takip Edilen Siparişler:\n"]
+
+        for item in PENDING_ORDERS[-10:]:
+            lines.append(
+                f"""
+Ürün: {item["product_name"]}
+Panel: {item["panel"]}
+Itemsatış ID: {item["itemsatis_order_id"]}
+SMM ID: {item["smm_order_id"]}
+Link: {item["link"]}
 """
             )
 
