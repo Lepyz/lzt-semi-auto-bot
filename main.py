@@ -84,6 +84,7 @@ def send_telegram(text: str):
     except Exception as e:
         print("TELEGRAM ERROR:", str(e), flush=True)
 
+
 def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
     failed = {
         "order_id": str(order_id),
@@ -294,8 +295,7 @@ def find_instagram_link(data: dict) -> str:
     )
 
     if match:
-        link = match.group(0)
-        return normalize_instagram_link(link)
+        return normalize_instagram_link(match.group(0))
 
     for text in all_strings:
         text = text.strip()
@@ -404,6 +404,7 @@ def home():
 @app.get("/test")
 def test_message():
     return {"ok": True}
+
 
 @app.head("/test")
 def test_head():
@@ -554,16 +555,14 @@ Hata: {balance_data.get("error")}
 """
             )
 
-add_failed_order(
-    order_id,
-    advert_id,
-    product_name,
-    "SMM bakiye alınamadı",
-    balance_data.get("error", "")
-)
+            add_failed_order(
+                order_id,
+                advert_id,
+                product_name,
+                "SMM bakiye alınamadı",
+                balance_data.get("error", "")
+            )
 
-return {"ok": False, "error": "balance_failed"}
-            
             return {"ok": False, "error": "balance_failed"}
 
         balance = balance_data.get("balance", "Bilinmiyor")
@@ -589,14 +588,14 @@ Bakiye: {balance} {currency}
 """
             )
 
-add_failed_order(
-    order_id,
-    advert_id,
-    product_name,
-    "SMM panel sipariş hatası",
-    smm_result.get("error", smm_result)
-)
-            
+            add_failed_order(
+                order_id,
+                advert_id,
+                product_name,
+                "SMM panel sipariş hatası",
+                smm_result.get("error", smm_result)
+            )
+
             return {
                 "ok": False,
                 "error": "smm_panel_error",
@@ -670,6 +669,8 @@ Bot komutları:
 
 /balance - SMM panel bakiyesini gösterir
 /status - Bot durumunu gösterir
+/health - Genel sistem durumunu gösterir
+/failed - Başarısız siparişleri gösterir
 /help - Komutları gösterir
 """
         )
@@ -714,7 +715,29 @@ Bakiye: {balance} {currency}
 
         return {"ok": True, "balance": balance, "currency": currency}
 
-        if text == "/failed":
+    if text == "/health":
+        balance_data = get_smm_balance()
+
+        if "error" in balance_data:
+            balance_text = f"SMM: Hatalı\nHata: {balance_data.get('error')}"
+        else:
+            balance_text = f"SMM: Aktif\nBakiye: {balance_data.get('balance')} {balance_data.get('currency', '')}"
+
+        send_telegram(
+            f"""
+Sistem Durumu
+
+Bot: Aktif
+Telegram: Aktif
+Render: Aktif
+{balance_text}
+Başarısız sipariş kaydı: {len(FAILED_ORDERS)}
+"""
+        )
+
+        return {"ok": True}
+
+    if text == "/failed":
         if not FAILED_ORDERS:
             send_telegram("Başarısız sipariş kaydı yok.")
             return {"ok": True}
@@ -734,7 +757,6 @@ Detay: {item["detail"]}
 
         send_telegram("\n".join(lines))
         return {"ok": True}
-
 
     send_telegram("Bilinmeyen komut. Komutları görmek için: /help")
     return {"ok": True}
