@@ -49,6 +49,7 @@ FAILED_ORDERS = []
 PENDING_ORDERS = []
 DAILY_STATS = {}
 LAST_DAILY_REPORT_DATE = ""
+SERVICE_PRICE_CACHE = {}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -121,6 +122,7 @@ def load_state():
     global PENDING_ORDERS
     global DAILY_STATS
     global LAST_DAILY_REPORT_DATE
+    global SERVICE_PRICE_CACHE
 
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
@@ -128,6 +130,7 @@ def load_state():
     PENDING_ORDERS = redis_get_json("pending_orders", [])
     DAILY_STATS = redis_get_json("daily_stats", {})
     LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
+    SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
 
 
 def save_state():
@@ -137,6 +140,7 @@ def save_state():
     redis_set_json("pending_orders", PENDING_ORDERS)
     redis_set_json("daily_stats", DAILY_STATS)
     redis_set_json("last_daily_report_date", LAST_DAILY_REPORT_DATE)
+    redis_set_json("service_price_cache", SERVICE_PRICE_CACHE)
 
 
 def normalize_text(text: str) -> str:
@@ -513,7 +517,32 @@ def check_panel_order_status(api_url, api_key, order_id):
 
     except Exception as e:
         return {"error": str(e)}
+        
+def get_panel_services(api_url, api_key):
+    if not api_url or not api_key:
+        return {"error": "API URL veya API KEY eksik"}
 
+    try:
+        r = requests.post(
+            api_url,
+            data={
+                "key": api_key,
+                "action": "services",
+            },
+            headers=HEADERS,
+            timeout=30,
+        )
+
+        print("SERVICES STATUS:", r.status_code, flush=True)
+        print("SERVICES RESPONSE:", r.text[:500], flush=True)
+
+        try:
+            return r.json()
+        except Exception:
+            return {"error": "Services JSON cevap vermedi", "raw": r.text[:300]}
+
+    except Exception as e:
+        return {"error": str(e)}
 
 def check_low_balance(balance, currency, panel_name="Panel"):
     try:
@@ -569,6 +598,7 @@ def check_orders_head():
 
 
 @app.get("/check-orders")
+
 def check_orders():
     completed_indexes = []
     changed = False
@@ -682,6 +712,73 @@ def daily_report():
     save_state()
 
     return {"ok": True, "sent": True}
+
+@app.head("/check-services")
+def check_services_head():
+    return check_services()
+
+
+@app.get("/check-services")
+def check_services():
+    global SERVICE_PRICE_CACHE
+
+    changed_count = 0
+
+    for advert_id, service in SMM_SERVICE_MAP.items():
+        services_data = get_panel_services(service["api_url"], service["api_key"])
+
+        if isinstance(services_data, dict) and "error" in services_data:
+            print("SERVICE CHECK ERROR:", services_data, flush=True)
+            continue
+
+        target_service = None
+
+        for item in services_data:
+            if str(item.get("service")) == str(service["service_id"]):
+                target_service = item
+                break
+
+        if not target_service:
+            continue
+
+        current_rate = str(target_service.get("rate", ""))
+        cache_key = f'{service["panel"]}:{service["service_id"]}'
+
+        old_rate = SERVICE_PRICE_CACHE.get(cache_key)
+
+        if old_rate is None:
+            SERVICE_PRICE_CACHE[cache_key] = current_rate
+            save_state()
+            continue
+
+        if str(old_rate) != str(current_rate):
+            send_telegram(
+                f"""
+Servis fiyatı değişti.
+
+Ürün: {service["name"]}
+Panel: {service["panel"]}
+Servis ID: {service["service_id"]}
+
+Eski fiyat: {old_rate}
+Yeni fiyat: {current_rate}
+
+İlan fiyatını ve kâr marjını kontrol et.
+"""
+            )
+
+            SERVICE_PRICE_CACHE[cache_key] = current_rate
+            changed_count += 1
+
+    if changed_count:
+        save_state()
+
+    return {
+        "ok": True,
+        "changed_count": changed_count,
+        "tracked_services": len(SMM_SERVICE_MAP),
+    }
+
 
 
 @app.post("/itemsatis-webhook")
