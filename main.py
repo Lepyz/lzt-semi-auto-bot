@@ -50,6 +50,11 @@ PENDING_ORDERS = []
 DAILY_STATS = {}
 LAST_DAILY_REPORT_DATE = ""
 SERVICE_PRICE_CACHE = {}
+WEEKLY_STATS = {}
+MONTHLY_STATS = {}
+
+LAST_WEEKLY_REPORT_DATE = ""
+LAST_MONTHLY_REPORT_DATE = ""
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -123,6 +128,10 @@ def load_state():
     global DAILY_STATS
     global LAST_DAILY_REPORT_DATE
     global SERVICE_PRICE_CACHE
+    global WEEKLY_STATS
+    global MONTHLY_STATS
+    global LAST_WEEKLY_REPORT_DATE
+    global LAST_MONTHLY_REPORT_DATE
 
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
@@ -131,6 +140,11 @@ def load_state():
     DAILY_STATS = redis_get_json("daily_stats", {})
     LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
+    WEEKLY_STATS = redis_get_json("weekly_stats", {})
+    MONTHLY_STATS = redis_get_json("monthly_stats", {})
+    
+    LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
+    LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
 
 
 def save_state():
@@ -141,6 +155,11 @@ def save_state():
     redis_set_json("daily_stats", DAILY_STATS)
     redis_set_json("last_daily_report_date", LAST_DAILY_REPORT_DATE)
     redis_set_json("service_price_cache", SERVICE_PRICE_CACHE)
+    redis_set_json("weekly_stats", WEEKLY_STATS)
+    redis_set_json("monthly_stats", MONTHLY_STATS)
+
+    redis_set_json("last_weekly_report_date", LAST_WEEKLY_REPORT_DATE)
+    redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
 
 
 def normalize_text(text: str) -> str:
@@ -198,7 +217,14 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
 
 
 def add_daily_stat(product_name: str):
+    global DAILY_STATS
+    global WEEKLY_STATS
+    global MONTHLY_STATS
+
     DAILY_STATS[product_name] = DAILY_STATS.get(product_name, 0) + 1
+    WEEKLY_STATS[product_name] = WEEKLY_STATS.get(product_name, 0) + 1
+    MONTHLY_STATS[product_name] = MONTHLY_STATS.get(product_name, 0) + 1
+
     save_state()
 
 
@@ -829,6 +855,9 @@ Müşteri: {buyer}
         "question_created",
         "advert_updated",
     }
+
+    if product_name:
+        add_daily_stat(product_name)
 
     if event in ignored_events:
         print("IGNORED EVENT:", event, flush=True)
