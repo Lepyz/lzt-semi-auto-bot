@@ -52,7 +52,6 @@ LAST_DAILY_REPORT_DATE = ""
 SERVICE_PRICE_CACHE = {}
 WEEKLY_STATS = {}
 MONTHLY_STATS = {}
-
 LAST_WEEKLY_REPORT_DATE = ""
 LAST_MONTHLY_REPORT_DATE = ""
 
@@ -121,17 +120,9 @@ def redis_set_json(key, value):
 
 
 def load_state():
-    global PROCESSED_ORDERS
-    global PROCESSED_LINKS
-    global FAILED_ORDERS
-    global PENDING_ORDERS
-    global DAILY_STATS
-    global LAST_DAILY_REPORT_DATE
-    global SERVICE_PRICE_CACHE
-    global WEEKLY_STATS
-    global MONTHLY_STATS
-    global LAST_WEEKLY_REPORT_DATE
-    global LAST_MONTHLY_REPORT_DATE
+    global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
+    global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
+    global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
 
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
@@ -142,7 +133,6 @@ def load_state():
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
     WEEKLY_STATS = redis_get_json("weekly_stats", {})
     MONTHLY_STATS = redis_get_json("monthly_stats", {})
-    
     LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
     LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
 
@@ -157,7 +147,6 @@ def save_state():
     redis_set_json("service_price_cache", SERVICE_PRICE_CACHE)
     redis_set_json("weekly_stats", WEEKLY_STATS)
     redis_set_json("monthly_stats", MONTHLY_STATS)
-
     redis_set_json("last_weekly_report_date", LAST_WEEKLY_REPORT_DATE)
     redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
 
@@ -198,6 +187,12 @@ def normalize_link_for_check(link: str) -> str:
     )
 
 
+def make_order_key(order_id, advert_id, buyer, link=""):
+    if order_id and str(order_id) != "Bilinmiyor":
+        return f"order:{order_id}"
+    return f"fallback:{advert_id}:{buyer}:{normalize_link_for_check(link)}"
+
+
 def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
     FAILED_ORDERS.append(
         {
@@ -217,9 +212,7 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
 
 
 def add_daily_stat(product_name: str):
-    global DAILY_STATS
-    global WEEKLY_STATS
-    global MONTHLY_STATS
+    global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS
 
     DAILY_STATS[product_name] = DAILY_STATS.get(product_name, 0) + 1
     WEEKLY_STATS[product_name] = WEEKLY_STATS.get(product_name, 0) + 1
@@ -230,6 +223,9 @@ def add_daily_stat(product_name: str):
 
 def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
     if not smm_order_id or str(smm_order_id) == "Bilinmiyor":
+        return
+
+    if any(str(item.get("smm_order_id")) == str(smm_order_id) for item in PENDING_ORDERS):
         return
 
     PENDING_ORDERS.append(
@@ -287,15 +283,9 @@ def get_event(data: dict) -> str:
     return normalize_text(
         get_nested(
             data,
-            "event",
-            "type",
-            "action",
-            "details.event",
-            "details.type",
-            "details.action",
-            "data.event",
-            "data.type",
-            "data.action",
+            "event", "type", "action",
+            "details.event", "details.type", "details.action",
+            "data.event", "data.type", "data.action",
         )
     )
 
@@ -304,16 +294,9 @@ def get_order_id(data: dict) -> str:
     return str(
         get_nested(
             data,
-            "order_id",
-            "id",
-            "purchaseId",
-            "purchase_id",
-            "data.order_id",
-            "data.id",
-            "data.purchaseId",
-            "details.order_id",
-            "details.id",
-            "details.purchaseId",
+            "order_id", "id", "purchaseId", "purchase_id",
+            "data.order_id", "data.id", "data.purchaseId",
+            "details.order_id", "details.id", "details.purchaseId",
         )
         or "Bilinmiyor"
     )
@@ -323,12 +306,8 @@ def get_advert_id(data: dict) -> str:
     return str(
         get_nested(
             data,
-            "advert.id",
-            "details.advert.id",
-            "data.advert.id",
-            "advert_id",
-            "details.advert_id",
-            "data.advert_id",
+            "advert.id", "details.advert.id", "data.advert.id",
+            "advert_id", "details.advert_id", "data.advert_id",
         )
         or ""
     )
@@ -338,21 +317,11 @@ def get_product_name(data: dict) -> str:
     return str(
         get_nested(
             data,
-            "product_name",
-            "product",
-            "advert.title",
-            "advert.name",
-            "details.advert.title",
-            "details.advert.name",
-            "data.advert.title",
-            "data.advert.name",
-            "details.product_name",
-            "details.product",
-            "data.product_name",
-            "data.product",
-            "title",
-            "details.title",
-            "data.title",
+            "product_name", "product", "advert.title", "advert.name",
+            "details.advert.title", "details.advert.name",
+            "data.advert.title", "data.advert.name",
+            "details.product_name", "details.product",
+            "data.product_name", "data.product", "title", "details.title", "data.title",
         )
         or ""
     ).strip()
@@ -361,20 +330,11 @@ def get_product_name(data: dict) -> str:
 def get_buyer(data: dict) -> str:
     buyer = get_nested(
         data,
-        "buyer",
-        "buyer.username",
-        "username",
-        "customer",
-        "customer.username",
-        "customer.name",
-        "details.customer.username",
-        "details.customer.name",
-        "details.customer",
-        "data.customer.username",
-        "data.customer.name",
-        "data.customer",
-        "details.buyer.username",
-        "details.buyer",
+        "buyer", "buyer.username", "username", "customer",
+        "customer.username", "customer.name",
+        "details.customer.username", "details.customer.name", "details.customer",
+        "data.customer.username", "data.customer.name", "data.customer",
+        "details.buyer.username", "details.buyer",
     )
 
     if isinstance(buyer, dict):
@@ -404,34 +364,12 @@ def find_instagram_link(data: dict) -> str:
         "post_datas.Profil Linki",
         "details.post_datas.Profil Linki",
         "data.post_datas.Profil Linki",
-        "url",
-        "link",
-        "instagram",
-        "instagram_link",
-        "profile_link",
-        "account_link",
-        "note",
-        "message",
-        "content",
-        "description",
-        "order_note",
-        "customer_note",
-        "details.url",
-        "details.link",
-        "details.instagram",
-        "details.instagram_link",
-        "details.note",
-        "details.message",
-        "details.content",
-        "details.description",
-        "data.url",
-        "data.link",
-        "data.instagram",
-        "data.instagram_link",
-        "data.note",
-        "data.message",
-        "data.content",
-        "data.description",
+        "url", "link", "instagram", "instagram_link", "profile_link", "account_link",
+        "note", "message", "content", "description", "order_note", "customer_note",
+        "details.url", "details.link", "details.instagram", "details.instagram_link",
+        "details.note", "details.message", "details.content", "details.description",
+        "data.url", "data.link", "data.instagram", "data.instagram_link",
+        "data.note", "data.message", "data.content", "data.description",
     ]
 
     for path in priority_paths:
@@ -468,10 +406,7 @@ def panel_balance(api_url, api_key):
     try:
         r = requests.post(
             api_url,
-            data={
-                "key": api_key,
-                "action": "balance",
-            },
+            data={"key": api_key, "action": "balance"},
             headers=HEADERS,
             timeout=30,
         )
@@ -525,11 +460,7 @@ def check_panel_order_status(api_url, api_key, order_id):
     try:
         r = requests.post(
             api_url,
-            data={
-                "key": api_key,
-                "action": "status",
-                "order": order_id,
-            },
+            data={"key": api_key, "action": "status", "order": order_id},
             headers=HEADERS,
             timeout=30,
         )
@@ -543,7 +474,8 @@ def check_panel_order_status(api_url, api_key, order_id):
 
     except Exception as e:
         return {"error": str(e)}
-        
+
+
 def get_panel_services(api_url, api_key):
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
@@ -551,10 +483,7 @@ def get_panel_services(api_url, api_key):
     try:
         r = requests.post(
             api_url,
-            data={
-                "key": api_key,
-                "action": "services",
-            },
+            data={"key": api_key, "action": "services"},
             headers=HEADERS,
             timeout=30,
         )
@@ -569,6 +498,7 @@ def get_panel_services(api_url, api_key):
 
     except Exception as e:
         return {"error": str(e)}
+
 
 def check_low_balance(balance, currency, panel_name="Panel"):
     try:
@@ -624,7 +554,6 @@ def check_orders_head():
 
 
 @app.get("/check-orders")
-
 def check_orders():
     completed_indexes = []
     changed = False
@@ -704,8 +633,7 @@ def daily_report_head():
 
 @app.get("/daily-report")
 def daily_report():
-    global LAST_DAILY_REPORT_DATE
-    global DAILY_STATS
+    global LAST_DAILY_REPORT_DATE, DAILY_STATS
 
     now = now_tr()
     today = now.strftime("%Y-%m-%d")
@@ -717,7 +645,6 @@ def daily_report():
         return {"ok": True, "message": "Bugünün raporu zaten gönderildi"}
 
     lines = ["Günlük Satış Özeti\n"]
-
     total = 0
 
     if DAILY_STATS:
@@ -739,6 +666,7 @@ def daily_report():
 
     return {"ok": True, "sent": True}
 
+
 @app.head("/weekly-report")
 def weekly_report_head():
     return weekly_report()
@@ -746,8 +674,7 @@ def weekly_report_head():
 
 @app.get("/weekly-report")
 def weekly_report():
-    global LAST_WEEKLY_REPORT_DATE
-    global WEEKLY_STATS
+    global LAST_WEEKLY_REPORT_DATE, WEEKLY_STATS
 
     now = now_tr()
     today = now.strftime("%Y-%m-%d")
@@ -759,7 +686,6 @@ def weekly_report():
         return {"ok": True, "message": "Bu haftanın raporu zaten gönderildi"}
 
     lines = ["Haftalık Satış Raporu\n"]
-
     total = 0
 
     if WEEKLY_STATS:
@@ -794,8 +720,7 @@ def monthly_report_head():
 
 @app.get("/monthly-report")
 def monthly_report():
-    global LAST_MONTHLY_REPORT_DATE
-    global MONTHLY_STATS
+    global LAST_MONTHLY_REPORT_DATE, MONTHLY_STATS
 
     now = now_tr()
     today = now.strftime("%Y-%m-%d")
@@ -807,7 +732,6 @@ def monthly_report():
         return {"ok": True, "message": "Bu ayın raporu zaten gönderildi"}
 
     lines = ["Aylık Satış Raporu\n"]
-
     total = 0
 
     if MONTHLY_STATS:
@@ -833,6 +757,7 @@ def monthly_report():
     save_state()
 
     return {"ok": True, "sent": True}
+
 
 @app.head("/check-services")
 def check_services_head():
@@ -864,7 +789,6 @@ def check_services():
 
         current_rate = str(target_service.get("rate", ""))
         cache_key = f'{service["panel"]}:{service["service_id"]}'
-
         old_rate = SERVICE_PRICE_CACHE.get(cache_key)
 
         if old_rate is None:
@@ -901,7 +825,6 @@ Yeni fiyat: {current_rate}
     }
 
 
-
 @app.post("/itemsatis-webhook")
 async def itemsatis_webhook(request: Request):
     try:
@@ -918,18 +841,17 @@ async def itemsatis_webhook(request: Request):
     product_name = get_product_name(data)
     buyer = get_buyer(data)
 
-    if order_id in PROCESSED_ORDERS and order_id != "Bilinmiyor":
-        send_telegram(
-            f"""
-Aynı Itemsatış siparişi tekrar geldi.
+    ignored_events = {
+        "review_received",
+        "review_created",
+        "message_created",
+        "question_created",
+        "advert_updated",
+    }
 
-Sipariş ID: {order_id}
-Advert ID: {advert_id or "Yok"}
-
-Tekrar işlem yapılmadı.
-"""
-        )
-        return {"ignored": True, "reason": "duplicate_order"}
+    if event in ignored_events:
+        print("IGNORED EVENT:", event, flush=True)
+        return {"ignored": True, "event": event}
 
     send_telegram(
         f"""
@@ -943,23 +865,13 @@ Müşteri: {buyer}
 """
     )
 
-    ignored_events = {
-        "review_received",
-        "review_created",
-        "message_created",
-        "question_created",
-        "advert_updated",
-    }
-
-    if product_name:
-        add_daily_stat(product_name)
-
-    if event in ignored_events:
-        print("IGNORED EVENT:", event, flush=True)
-        return {"ignored": True, "event": event}
-
     if advert_id == CS2_ADVERT_ID:
-        PROCESSED_ORDERS.add(order_id)
+        order_key = make_order_key(order_id, advert_id, buyer)
+
+        if order_key in PROCESSED_ORDERS:
+            return {"ignored": True, "reason": "duplicate_cs2_order"}
+
+        PROCESSED_ORDERS.add(order_key)
         save_state()
 
         send_telegram(
@@ -986,10 +898,17 @@ Hesabı manuel kontrol edip satın al.
 
     if advert_id in SMM_SERVICE_MAP:
         service = SMM_SERVICE_MAP[advert_id]
-
         customer_link = find_instagram_link(data)
 
         if not customer_link:
+            add_failed_order(
+                order_id,
+                advert_id,
+                service["name"],
+                "Instagram linki bulunamadı",
+                "Müşteri link alanı bot tarafından algılanamadı.",
+            )
+
             send_telegram(
                 f"""
 Instagram siparişi geldi ama müşteri linki bulunamadı.
@@ -1003,20 +922,27 @@ Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
 """
             )
 
-            add_failed_order(
-                order_id,
-                advert_id,
-                service["name"],
-                "Instagram linki bulunamadı",
-                "Müşteri link alanı bot tarafından algılanamadı.",
-            )
-
             return {"ok": False, "error": "instagram_link_not_found"}
 
         normalized_link = normalize_link_for_check(customer_link)
-        duplicate_key = f"{advert_id}:{normalized_link}"
+        duplicate_link_key = f"{advert_id}:{normalized_link}"
+        order_key = make_order_key(order_id, advert_id, buyer, customer_link)
 
-        if duplicate_key in PROCESSED_LINKS:
+        if order_key in PROCESSED_ORDERS:
+            send_telegram(
+                f"""
+Aynı Itemsatış siparişi tekrar geldi.
+
+Sipariş ID: {order_id}
+Advert ID: {advert_id}
+Ürün: {service["name"]}
+
+Tekrar işlem yapılmadı.
+"""
+            )
+            return {"ignored": True, "reason": "duplicate_order"}
+
+        if duplicate_link_key in PROCESSED_LINKS:
             send_telegram(
                 f"""
 Aynı Instagram linki aynı ilana tekrar geldi.
@@ -1029,12 +955,19 @@ Link: {customer_link}
 Bu sipariş panele tekrar girilmedi.
 """
             )
-
             return {"ignored": True, "reason": "duplicate_link"}
 
         balance_data = panel_balance(service["api_url"], service["api_key"])
 
         if "error" in balance_data:
+            add_failed_order(
+                order_id,
+                advert_id,
+                service["name"],
+                "Panel bakiyesi alınamadı",
+                balance_data.get("error", ""),
+            )
+
             send_telegram(
                 f"""
 Instagram siparişi geldi ama panel bakiyesi alınamadığı için panele girilmedi.
@@ -1047,14 +980,6 @@ Link: {customer_link}
 
 Hata: {balance_data.get("error")}
 """
-            )
-
-            add_failed_order(
-                order_id,
-                advert_id,
-                service["name"],
-                "Panel bakiyesi alınamadı",
-                balance_data.get("error", ""),
             )
 
             return {"ok": False, "error": "balance_failed"}
@@ -1073,6 +998,14 @@ Hata: {balance_data.get("error")}
         )
 
         if "error" in smm_result:
+            add_failed_order(
+                order_id,
+                advert_id,
+                service["name"],
+                "Panel sipariş hatası",
+                smm_result.get("error", smm_result),
+            )
+
             send_telegram(
                 f"""
 Instagram siparişi panele girilemedi.
@@ -1089,14 +1022,6 @@ Bakiye: {balance} {currency}
 """
             )
 
-            add_failed_order(
-                order_id,
-                advert_id,
-                service["name"],
-                "Panel sipariş hatası",
-                smm_result.get("error", smm_result),
-            )
-
             return {
                 "ok": False,
                 "error": "panel_order_error",
@@ -1105,8 +1030,9 @@ Bakiye: {balance} {currency}
 
         smm_order_id = smm_result.get("order", "Bilinmiyor")
 
-        PROCESSED_LINKS.add(duplicate_key)
-        PROCESSED_ORDERS.add(order_id)
+        PROCESSED_LINKS.add(duplicate_link_key)
+        PROCESSED_ORDERS.add(order_key)
+
         add_daily_stat(service["name"])
 
         add_pending_order(
