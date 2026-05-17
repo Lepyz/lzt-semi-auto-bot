@@ -2,7 +2,7 @@ import os
 import re
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -489,7 +489,7 @@ def my_ip():
 
 @app.head("/check-orders")
 def check_orders_head():
-    return {"ok": True}
+    return check_orders()
 
 
 @app.get("/check-orders")
@@ -537,7 +537,7 @@ Müşteriye değerlendirme mesajı gönderebilirsin.
 
 @app.head("/daily-report")
 def daily_report_head():
-    return {"ok": True}
+    return daily_report()
 
 
 @app.get("/daily-report")
@@ -545,7 +545,7 @@ def daily_report():
     global LAST_DAILY_REPORT_DATE
     global DAILY_STATS
 
-    now = datetime.now()
+    now = datetime.utcnow() + timedelta(hours=3)
     today = now.strftime("%Y-%m-%d")
 
     if now.hour != 0:
