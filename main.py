@@ -1,9 +1,9 @@
 import os
 import re
 import json
+import time
 import requests
 from datetime import datetime, timedelta
-import time
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -18,6 +18,7 @@ INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
 MEDYABAYIM_API_URL = os.getenv("MEDYABAYIM_API_URL", "https://medyabayim.com/api/v2")
 MEDYABAYIM_API_KEY = os.getenv("MEDYABAYIM_API_KEY", "")
 MEDYABAYIM_100_TURK_SERVICE_ID = os.getenv("MEDYABAYIM_100_TURK_SERVICE_ID", "13743")
+
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
@@ -46,7 +47,6 @@ PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
 FAILED_ORDERS = []
 PENDING_ORDERS = []
-
 DAILY_STATS = {}
 LAST_DAILY_REPORT_DATE = ""
 
@@ -54,6 +54,10 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json,text/plain,*/*",
 }
+
+
+def now_tr():
+    return datetime.utcnow() + timedelta(hours=3)
 
 
 def send_telegram(text: str):
@@ -75,6 +79,64 @@ def send_telegram(text: str):
         print("TELEGRAM RESPONSE:", r.status_code, r.text[:500], flush=True)
     except Exception as e:
         print("TELEGRAM ERROR:", str(e), flush=True)
+
+
+def redis_request(command):
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+
+    try:
+        r = requests.post(
+            UPSTASH_REDIS_REST_URL,
+            headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+            json=command,
+            timeout=20,
+        )
+        return r.json()
+    except Exception as e:
+        print("REDIS ERROR:", str(e), flush=True)
+        return None
+
+
+def redis_get_json(key, default):
+    result = redis_request(["GET", key])
+
+    try:
+        value = result.get("result") if result else None
+        if not value:
+            return default
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def redis_set_json(key, value):
+    redis_request(["SET", key, json.dumps(value, ensure_ascii=False)])
+
+
+def load_state():
+    global PROCESSED_ORDERS
+    global PROCESSED_LINKS
+    global FAILED_ORDERS
+    global PENDING_ORDERS
+    global DAILY_STATS
+    global LAST_DAILY_REPORT_DATE
+
+    PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
+    PROCESSED_LINKS = set(redis_get_json("processed_links", []))
+    FAILED_ORDERS = redis_get_json("failed_orders", [])
+    PENDING_ORDERS = redis_get_json("pending_orders", [])
+    DAILY_STATS = redis_get_json("daily_stats", {})
+    LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
+
+
+def save_state():
+    redis_set_json("processed_orders", list(PROCESSED_ORDERS))
+    redis_set_json("processed_links", list(PROCESSED_LINKS))
+    redis_set_json("failed_orders", FAILED_ORDERS)
+    redis_set_json("pending_orders", PENDING_ORDERS)
+    redis_set_json("daily_stats", DAILY_STATS)
+    redis_set_json("last_daily_report_date", LAST_DAILY_REPORT_DATE)
 
 
 def normalize_text(text: str) -> str:
@@ -121,17 +183,19 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
             "product_name": str(product_name),
             "reason": str(reason),
             "detail": str(detail),
+            "created_at": int(time.time()),
         }
     )
 
     if len(FAILED_ORDERS) > 20:
         FAILED_ORDERS.pop(0)
+
     save_state()
 
 
 def add_daily_stat(product_name: str):
     DAILY_STATS[product_name] = DAILY_STATS.get(product_name, 0) + 1
-save_state()
+    save_state()
 
 
 def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
@@ -152,7 +216,9 @@ def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key
             "delay_alert_sent": False,
         }
     )
+
     save_state()
+
 
 def get_lzt_links() -> str:
     return """
@@ -472,7 +538,9 @@ Lütfen panel bakiyesini kontrol et.
     except Exception as e:
         print("BALANCE CHECK ERROR:", str(e), flush=True)
 
+
 load_state()
+
 
 @app.get("/")
 def home():
@@ -503,6 +571,7 @@ def check_orders_head():
 @app.get("/check-orders")
 def check_orders():
     completed_indexes = []
+    changed = False
 
     for index, item in enumerate(PENDING_ORDERS):
         status_data = check_panel_order_status(
@@ -516,6 +585,31 @@ def check_orders():
             continue
 
         status = str(status_data.get("status", "")).lower()
+
+        created_at = int(item.get("created_at", 0))
+        delay_alert_sent = bool(item.get("delay_alert_sent", False))
+
+        if created_at and not delay_alert_sent:
+            waited_seconds = int(time.time()) - created_at
+
+            if waited_seconds >= 5400:
+                send_telegram(
+                    f"""
+Sipariş gecikti.
+
+Ürün: {item["product_name"]}
+Panel: {item["panel"]}
+Itemsatış Sipariş ID: {item["itemsatis_order_id"]}
+SMM Sipariş ID: {item["smm_order_id"]}
+Link: {item["link"]}
+
+Bekleme süresi: 1 saat 30 dakika geçti.
+Paneli kontrol et.
+"""
+                )
+
+                item["delay_alert_sent"] = True
+                changed = True
 
         if status in ["completed", "complete", "tamamlandı"]:
             send_telegram(
@@ -532,9 +626,13 @@ Müşteriye değerlendirme mesajı gönderebilirsin.
 """
             )
             completed_indexes.append(index)
+            changed = True
 
     for index in reversed(completed_indexes):
         PENDING_ORDERS.pop(index)
+
+    if changed:
+        save_state()
 
     return {
         "ok": True,
@@ -553,7 +651,7 @@ def daily_report():
     global LAST_DAILY_REPORT_DATE
     global DAILY_STATS
 
-    now = datetime.utcnow() + timedelta(hours=3)
+    now = now_tr()
     today = now.strftime("%Y-%m-%d")
 
     if now.hour != 0:
@@ -581,6 +679,7 @@ def daily_report():
 
     LAST_DAILY_REPORT_DATE = today
     DAILY_STATS = {}
+    save_state()
 
     return {"ok": True, "sent": True}
 
@@ -640,6 +739,7 @@ Müşteri: {buyer}
 
     if advert_id == CS2_ADVERT_ID:
         PROCESSED_ORDERS.add(order_id)
+        save_state()
 
         send_telegram(
             f"""
@@ -799,6 +899,8 @@ Bakiye: {balance} {currency}
             customer_link,
         )
 
+        save_state()
+
         send_telegram(
             f"""
 Instagram siparişi panele girildi.
@@ -879,6 +981,7 @@ Render: Aktif
 Telegram: Aktif
 Itemsatış Webhook: Aktif
 SMM Paneller: Aktif
+Redis: Aktif
 """
         )
         return {"ok": True}
@@ -931,6 +1034,8 @@ Bakiye: {balance_data.get("balance", "Bilinmiyor")} {balance_data.get("currency"
             else f"MedyaBayim: Aktif - {medya_balance.get('balance')} {medya_balance.get('currency', '')}"
         )
 
+        redis_text = "Redis: Aktif" if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN else "Redis: Eksik"
+
         send_telegram(
             f"""
 Sistem Durumu
@@ -938,6 +1043,7 @@ Sistem Durumu
 Bot: Aktif
 Telegram: Aktif
 Render: Aktif
+{redis_text}
 {main_text}
 {medya_text}
 
@@ -976,12 +1082,16 @@ Detay: {item["detail"]}
         lines = ["Takip Edilen Siparişler:\n"]
 
         for item in PENDING_ORDERS[-10:]:
+            created_at = int(item.get("created_at", 0))
+            waited_minutes = int((time.time() - created_at) / 60) if created_at else 0
+
             lines.append(
                 f"""
 Ürün: {item["product_name"]}
 Panel: {item["panel"]}
 Itemsatış ID: {item["itemsatis_order_id"]}
 SMM ID: {item["smm_order_id"]}
+Bekleme: {waited_minutes} dakika
 Link: {item["link"]}
 """
             )
