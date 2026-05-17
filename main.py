@@ -3,6 +3,7 @@ import re
 import json
 import requests
 from datetime import datetime, timedelta
+import time
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -17,6 +18,8 @@ INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
 MEDYABAYIM_API_URL = os.getenv("MEDYABAYIM_API_URL", "https://medyabayim.com/api/v2")
 MEDYABAYIM_API_KEY = os.getenv("MEDYABAYIM_API_KEY", "")
 MEDYABAYIM_100_TURK_SERVICE_ID = os.getenv("MEDYABAYIM_100_TURK_SERVICE_ID", "13743")
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 CS2_ADVERT_ID = "5282114"
 
@@ -123,10 +126,12 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
 
     if len(FAILED_ORDERS) > 20:
         FAILED_ORDERS.pop(0)
+    save_state()
 
 
 def add_daily_stat(product_name: str):
     DAILY_STATS[product_name] = DAILY_STATS.get(product_name, 0) + 1
+save_state()
 
 
 def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
@@ -143,9 +148,11 @@ def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key
             "api_key": str(api_key),
             "smm_order_id": str(smm_order_id),
             "link": str(link),
+            "created_at": int(time.time()),
+            "delay_alert_sent": False,
         }
     )
-
+    save_state()
 
 def get_lzt_links() -> str:
     return """
@@ -465,6 +472,7 @@ Lütfen panel bakiyesini kontrol et.
     except Exception as e:
         print("BALANCE CHECK ERROR:", str(e), flush=True)
 
+load_state()
 
 @app.get("/")
 def home():
