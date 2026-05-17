@@ -739,6 +739,101 @@ def daily_report():
 
     return {"ok": True, "sent": True}
 
+@app.head("/weekly-report")
+def weekly_report_head():
+    return weekly_report()
+
+
+@app.get("/weekly-report")
+def weekly_report():
+    global LAST_WEEKLY_REPORT_DATE
+    global WEEKLY_STATS
+
+    now = now_tr()
+    today = now.strftime("%Y-%m-%d")
+
+    if now.weekday() != 0 or now.hour != 0:
+        return {"ok": True, "message": "Haftalık rapor saati değil"}
+
+    if LAST_WEEKLY_REPORT_DATE == today:
+        return {"ok": True, "message": "Bu haftanın raporu zaten gönderildi"}
+
+    lines = ["Haftalık Satış Raporu\n"]
+
+    total = 0
+
+    if WEEKLY_STATS:
+        sorted_items = sorted(WEEKLY_STATS.items(), key=lambda x: x[1], reverse=True)
+
+        for product_name, count in sorted_items:
+            lines.append(f"{product_name}: {count}")
+            total += count
+
+        top_product, top_count = sorted_items[0]
+        lines.append(f"\nEn çok satan: {top_product} ({top_count})")
+    else:
+        lines.append("Bu hafta kayıtlı sipariş yok.")
+
+    lines.append(f"\nToplam sipariş: {total}")
+    lines.append(f"Başarısız sipariş kaydı: {len(FAILED_ORDERS)}")
+    lines.append(f"Bekleyen sipariş: {len(PENDING_ORDERS)}")
+
+    send_telegram("\n".join(lines))
+
+    LAST_WEEKLY_REPORT_DATE = today
+    WEEKLY_STATS = {}
+    save_state()
+
+    return {"ok": True, "sent": True}
+
+
+@app.head("/monthly-report")
+def monthly_report_head():
+    return monthly_report()
+
+
+@app.get("/monthly-report")
+def monthly_report():
+    global LAST_MONTHLY_REPORT_DATE
+    global MONTHLY_STATS
+
+    now = now_tr()
+    today = now.strftime("%Y-%m-%d")
+
+    if now.day != 1 or now.hour != 0:
+        return {"ok": True, "message": "Aylık rapor saati değil"}
+
+    if LAST_MONTHLY_REPORT_DATE == today:
+        return {"ok": True, "message": "Bu ayın raporu zaten gönderildi"}
+
+    lines = ["Aylık Satış Raporu\n"]
+
+    total = 0
+
+    if MONTHLY_STATS:
+        sorted_items = sorted(MONTHLY_STATS.items(), key=lambda x: x[1], reverse=True)
+
+        for product_name, count in sorted_items:
+            lines.append(f"{product_name}: {count}")
+            total += count
+
+        top_product, top_count = sorted_items[0]
+        lines.append(f"\nEn çok satan: {top_product} ({top_count})")
+    else:
+        lines.append("Bu ay kayıtlı sipariş yok.")
+
+    lines.append(f"\nToplam sipariş: {total}")
+    lines.append(f"Başarısız sipariş kaydı: {len(FAILED_ORDERS)}")
+    lines.append(f"Bekleyen sipariş: {len(PENDING_ORDERS)}")
+
+    send_telegram("\n".join(lines))
+
+    LAST_MONTHLY_REPORT_DATE = today
+    MONTHLY_STATS = {}
+    save_state()
+
+    return {"ok": True, "sent": True}
+
 @app.head("/check-services")
 def check_services_head():
     return check_services()
