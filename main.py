@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import hashlib
 import requests
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -199,6 +200,20 @@ def make_order_key(order_id, advert_id, buyer, link=""):
     return f"fallback:{advert_id}:{buyer}:{normalize_link_for_check(link)}"
 
 
+def make_sale_key(data: dict, order_id, advert_id, buyer, product_name, price, link=""):
+    if order_id and str(order_id) != "Bilinmiyor":
+        return f"sale_order:{order_id}"
+
+    try:
+        raw = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        raw = str(data)
+
+    fingerprint = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    safe_link = normalize_link_for_check(link)
+    return f"sale_fallback:{advert_id}:{buyer}:{product_name}:{price}:{safe_link}:{fingerprint}"
+
+
 def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
     FAILED_ORDERS.append(
         {
@@ -267,10 +282,10 @@ def add_daily_stat(product_name: str, price: float = 0):
     save_state()
 
 
-def record_itemsatis_sale(order_id, advert_id, buyer, product_name, price, link="") -> bool:
+def record_itemsatis_sale(data: dict, order_id, advert_id, buyer, product_name, price, link="") -> bool:
     global RECORDED_SALES
 
-    sale_key = make_order_key(order_id, advert_id, buyer, link)
+    sale_key = make_sale_key(data, order_id, advert_id, buyer, product_name, price, link)
 
     if sale_key in RECORDED_SALES:
         return False
@@ -332,6 +347,29 @@ def build_sales_report(title: str, stats: dict, empty_text: str):
     lines.append(f"Bekleyen SMM Sipariş: {len(PENDING_ORDERS)}")
 
     return "\n".join(lines)
+
+
+def reset_sales_stats(scope: str = "daily"):
+    global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS, RECORDED_SALES
+
+    scope = str(scope or "daily").lower().strip()
+
+    if scope == "daily":
+        DAILY_STATS = {}
+    elif scope == "weekly":
+        WEEKLY_STATS = {}
+    elif scope == "monthly":
+        MONTHLY_STATS = {}
+    elif scope == "all":
+        DAILY_STATS = {}
+        WEEKLY_STATS = {}
+        MONTHLY_STATS = {}
+        RECORDED_SALES = set()
+    else:
+        return False
+
+    save_state()
+    return True
 
 
 def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
@@ -940,6 +978,7 @@ async def itemsatis_webhook(request: Request):
     )
 
     record_itemsatis_sale(
+        data=data,
         order_id=order_id,
         advert_id=advert_id,
         buyer=buyer,
@@ -1208,6 +1247,11 @@ Bot komutları:
 /failed - Başarısız siparişleri gösterir
 /pending - Takip edilen siparişleri gösterir
 /report - Bugünkü sipariş özetini gösterir
+/week-report - Haftalık sipariş özetini gösterir
+/month-report - Aylık sipariş özetini gösterir
+/report-all - Bugün + hafta + ay özetini gösterir
+/reset-report - Bugünkü raporu sıfırlar
+/reset-all-reports - Tüm raporları ve kayıtlı satış anahtarlarını sıfırlar
 /help - Komutları gösterir
 """
         )
@@ -1348,6 +1392,66 @@ Link: {item["link"]}
         )
 
         send_telegram(report_text)
+        return {"ok": True}
+
+    if text == "/week-report":
+        report_text = build_sales_report(
+            "Haftalık Sipariş Özeti",
+            WEEKLY_STATS,
+            "Bu hafta kayıtlı sipariş yok.",
+        )
+
+        send_telegram(report_text)
+        return {"ok": True}
+
+    if text == "/month-report":
+        report_text = build_sales_report(
+            "Aylık Sipariş Özeti",
+            MONTHLY_STATS,
+            "Bu ay kayıtlı sipariş yok.",
+        )
+
+        send_telegram(report_text)
+        return {"ok": True}
+
+    if text == "/report-all":
+        daily_text = build_sales_report(
+            "Bugünkü Sipariş Özeti",
+            DAILY_STATS,
+            "Bugün kayıtlı sipariş yok.",
+        )
+        weekly_text = build_sales_report(
+            "Haftalık Sipariş Özeti",
+            WEEKLY_STATS,
+            "Bu hafta kayıtlı sipariş yok.",
+        )
+        monthly_text = build_sales_report(
+            "Aylık Sipariş Özeti",
+            MONTHLY_STATS,
+            "Bu ay kayıtlı sipariş yok.",
+        )
+
+        send_telegram(daily_text + "\n\n--------------------\n\n" + weekly_text + "\n\n--------------------\n\n" + monthly_text)
+        return {"ok": True}
+
+    if text == "/reset-report":
+        reset_sales_stats("daily")
+        send_telegram("Bugünkü rapor sıfırlandı.")
+        return {"ok": True}
+
+    if text == "/reset-week-report":
+        reset_sales_stats("weekly")
+        send_telegram("Haftalık rapor sıfırlandı.")
+        return {"ok": True}
+
+    if text == "/reset-month-report":
+        reset_sales_stats("monthly")
+        send_telegram("Aylık rapor sıfırlandı.")
+        return {"ok": True}
+
+    if text == "/reset-all-reports":
+        reset_sales_stats("all")
+        send_telegram("Tüm raporlar ve kayıtlı satış anahtarları sıfırlandı.")
         return {"ok": True}
 
     send_telegram("Bilinmeyen komut. Komutları görmek için: /help")
