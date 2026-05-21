@@ -187,6 +187,10 @@ HEADERS = {
     "Accept": "application/json,text/plain,*/*",
 }
 
+FAILED_PANEL_STATUSES = {"cancelled", "canceled", "partial", "fail", "failed", "refunded"}
+COMPLETED_PANEL_STATUSES = {"completed", "complete", "tamamlandı"}
+SLOW_API_THRESHOLD_SECONDS = float(os.getenv("SLOW_API_THRESHOLD_SECONDS", "8"))
+
 
 def now_tr():
     return datetime.utcnow() + timedelta(hours=3)
@@ -453,7 +457,8 @@ def make_sale_key(data, order_id, advert_id, buyer, product_name, price, link=""
     return f"sale_fallback:{advert_id}:{buyer}:{product_name}:{price}:{safe_link}:{fingerprint}"
 
 
-def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
+def add_failed_order(order_id, advert_id, product_name, reason, detail="", **extra):
+    """Başarısız siparişi kaydeder. Retry için güvenli alanlar extra ile eklenebilir."""
     entry = {
         "order_id": str(order_id),
         "advert_id": str(advert_id),
@@ -462,10 +467,24 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
         "detail": str(detail),
         "created_at": int(time.time()),
     }
+
+    for key, value in extra.items():
+        if value not in [None, ""]:
+            entry[key] = value
+
     FAILED_ORDERS.append(entry)
-    if len(FAILED_ORDERS) > 20:
+    if len(FAILED_ORDERS) > 50:
         FAILED_ORDERS.pop(0)
-    log("error", "order_failed", order_id=order_id, reason=reason, product=product_name)
+
+    log(
+        "error",
+        "order_failed",
+        order_id=order_id,
+        reason=reason,
+        product=product_name,
+        smm_order_id=extra.get("smm_order_id", ""),
+        panel=extra.get("panel", ""),
+    )
     save_state()
 
 
@@ -614,7 +633,20 @@ def reset_sales_stats(scope: str = "daily"):
     return True
 
 
-def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
+def add_pending_order(
+    order_id,
+    advert_id,
+    product_name,
+    panel,
+    api_url,
+    api_key,
+    smm_order_id,
+    link,
+    service_id="",
+    quantity="",
+    platform="",
+    panel_key="",
+):
     if not smm_order_id or str(smm_order_id) == "Bilinmiyor":
         return
     if any(str(item.get("smm_order_id")) == str(smm_order_id) for item in PENDING_ORDERS):
@@ -624,13 +656,17 @@ def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key
         "advert_id": str(advert_id),
         "product_name": str(product_name),
         "panel": str(panel),
+        "panel_key": str(panel_key),
         "api_url": str(api_url),
         "api_key": str(api_key),
+        "service_id": str(service_id),
+        "quantity": int(quantity or 0) if str(quantity or "").isdigit() else quantity,
+        "platform": str(platform),
         "smm_order_id": str(smm_order_id),
         "link": str(link),
         "created_at": int(time.time()),
         "delay_alert_sent": False,
-        "cancelled": False,  # YENİ
+        "cancelled": False,
     })
     log("info", "order_queued", order_id=order_id, smm_order_id=smm_order_id, product=product_name)
     save_state()
@@ -1167,58 +1203,77 @@ def handle_panel_balance_command(text: str):
     )
 
 
-def panel_balance(api_url, api_key):
+def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="", timeout=30):
+    """Panel API çağrılarını tek yerden yapar, süreyi ölçer ve yavaş çağrıları loglar."""
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
+
+    payload = {"key": api_key, "action": action}
+    if extra_data:
+        payload.update(extra_data)
+
+    started = time.perf_counter()
     try:
-        r = requests.post(api_url, data={"key": api_key, "action": "balance"}, headers=HEADERS, timeout=30)
+        r = requests.post(api_url, data=payload, headers=HEADERS, timeout=timeout)
+        elapsed = time.perf_counter() - started
+        level = "warning" if elapsed >= SLOW_API_THRESHOLD_SECONDS else "info"
+        log(
+            level,
+            "panel_api_performance",
+            panel=panel_name or api_url,
+            action=action,
+            duration=f"{elapsed:.2f}s",
+            status_code=r.status_code,
+        )
         try:
-            return r.json()
+            result = r.json()
         except Exception:
-            return {"error": "Panel JSON cevap vermedi", "raw": r.text[:300]}
+            return {"error": f"Panel {action} JSON cevap vermedi", "raw": r.text[:300], "duration": elapsed}
+
+        if isinstance(result, dict):
+            result.setdefault("_duration", elapsed)
+        return result
     except Exception as e:
-        return {"error": str(e)}
+        elapsed = time.perf_counter() - started
+        log(
+            "error",
+            "panel_api_error",
+            panel=panel_name or api_url,
+            action=action,
+            duration=f"{elapsed:.2f}s",
+            error=str(e),
+        )
+        return {"error": str(e), "duration": elapsed}
 
 
-def create_panel_order(api_url, api_key, service_id, link, quantity):
-    if not api_url or not api_key:
-        return {"error": "API URL veya API KEY eksik"}
-    try:
-        r = requests.post(api_url, data={"key": api_key, "action": "add", "service": service_id,
-                                          "link": link, "quantity": quantity}, headers=HEADERS, timeout=30)
-        try:
-            return r.json()
-        except Exception:
-            return {"error": "Panel JSON cevap vermedi", "raw": r.text[:300]}
-    except Exception as e:
-        return {"error": str(e)}
+def panel_balance(api_url, api_key, panel_name=""):
+    return _panel_api_request(api_url, api_key, "balance", panel_name=panel_name)
 
 
-def check_panel_order_status(api_url, api_key, order_id):
-    if not api_url or not api_key or not order_id:
-        return {"error": "Status için bilgi eksik"}
-    try:
-        r = requests.post(api_url, data={"key": api_key, "action": "status", "order": order_id},
-                          headers=HEADERS, timeout=30)
-        try:
-            return r.json()
-        except Exception:
-            return {"error": "Status JSON cevap vermedi", "raw": r.text[:300]}
-    except Exception as e:
-        return {"error": str(e)}
+def create_panel_order(api_url, api_key, service_id, link, quantity, panel_name=""):
+    return _panel_api_request(
+        api_url,
+        api_key,
+        "add",
+        extra_data={"service": service_id, "link": link, "quantity": quantity},
+        panel_name=panel_name,
+    )
 
 
-def get_panel_services(api_url, api_key):
-    if not api_url or not api_key:
-        return {"error": "API URL veya API KEY eksik"}
-    try:
-        r = requests.post(api_url, data={"key": api_key, "action": "services"}, headers=HEADERS, timeout=30)
-        try:
-            return r.json()
-        except Exception:
-            return {"error": "Services JSON cevap vermedi", "raw": r.text[:300]}
-    except Exception as e:
-        return {"error": str(e)}
+def check_panel_order_status(api_url, api_key, order_id, panel_name=""):
+    if not order_id:
+        return {"error": "Status için order ID eksik"}
+    return _panel_api_request(
+        api_url,
+        api_key,
+        "status",
+        extra_data={"order": order_id},
+        panel_name=panel_name,
+    )
+
+
+def get_panel_services(api_url, api_key, panel_name=""):
+    return _panel_api_request(api_url, api_key, "services", panel_name=panel_name)
 
 
 def check_low_balance(balance, currency, panel_name="Panel"):
@@ -1309,6 +1364,7 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
 <div class="toolbar">
   <a href="/"><button type="button">Dashboard</button></a>
   <a href="/admin/pending-orders"><button type="button">Bekleyen Siparişler</button></a>
+  <a href="/admin/failed-orders"><button type="button">Başarısız Siparişler</button></a>
   <form method="post" action="/admin/update-services" style="display:inline;">
     <button class="green" type="submit">Servis Fiyatlarını Kontrol Et</button>
   </form>
@@ -1516,6 +1572,134 @@ def admin_cancel_order(smm_order_id: str = Form(...), user: str = Depends(get_cu
             return RedirectResponse("/admin/pending-orders", status_code=303)
 
     raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
+
+
+ADMIN_FAILED_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boostera Başarısız Siparişler</title>
+<style>
+body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
+.container { max-width:1180px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
+h1 { margin:0 0 8px; } .muted { color:#8a8fa3; font-size:13px; margin-bottom:18px; }
+a { color:#a78bfa; text-decoration:none; }
+button { padding:8px 12px; border-radius:8px; border:none; background:#7c3aed; color:#fff; cursor:pointer; font-weight:700; }
+button.retry { background:#16a34a; }
+table { width:100%; border-collapse:collapse; margin-top:20px; }
+th, td { padding:12px; border-bottom:1px solid #242436; text-align:left; font-size:14px; vertical-align:top; }
+th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+.badge { padding:4px 8px; border-radius:99px; font-size:12px; font-weight:700; background:#3f1d1d; color:#fca5a5; }
+@media (max-width: 900px) { table { display:block; overflow-x:auto; white-space:nowrap; } }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Başarısız Siparişler</h1>
+<div class="muted">Retry butonu aynı linki tekrar panele gönderir. Sadece panel durumunu kontrol ettikten sonra kullan.</div>
+<p><a href="/admin">← Admin Paneline Dön</a></p>
+<table>
+<thead><tr><th>Ürün</th><th>Itemsatış</th><th>SMM ID</th><th>Panel</th><th>Sebep</th><th>Link</th><th>İşlem</th></tr></thead>
+<tbody>
+{% for order in failed_orders %}
+<tr>
+<td>{{ order.product_name }}</td>
+<td>{{ order.order_id }}</td>
+<td>{{ order.smm_order_id or '-' }}</td>
+<td>{{ order.panel or '-' }}</td>
+<td><span class="badge">{{ order.reason }}</span><br><small>{{ order.detail }}</small></td>
+<td>{% if order.link %}<a href="{{ order.link }}" target="_blank">Link</a>{% else %}-{% endif %}</td>
+<td>
+{% if order.retryable and order.link and not order.retried %}
+<form method="post" action="/admin/retry-order" onsubmit="return confirm('Bu işlem aynı linki tekrar panele gönderir. Devam edilsin mi?')">
+<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id }}">
+<button class="retry" type="submit">Retry</button>
+</form>
+{% elif order.retried %}Tekrar denendi{% else %}-{% endif %}
+</td>
+</tr>
+{% else %}
+<tr><td colspan="7" style="text-align:center;color:#8a8fa3;">Başarısız sipariş yok.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/failed-orders", response_class=HTMLResponse)
+def admin_failed_orders(user: str = Depends(get_current_admin)):
+    template = Template(ADMIN_FAILED_HTML)
+    html = template.render(failed_orders=list(reversed(FAILED_ORDERS[-50:])))
+    return HTMLResponse(content=html)
+
+
+@app.post("/admin/retry-order")
+def admin_retry_order(smm_order_id: str = Form(...), user: str = Depends(get_current_admin)):
+    target = None
+    for item in reversed(FAILED_ORDERS):
+        if str(item.get("smm_order_id", "")) == str(smm_order_id) and item.get("retryable"):
+            target = item
+            break
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Retry yapılabilir başarısız sipariş bulunamadı")
+
+    if target.get("retried"):
+        raise HTTPException(status_code=400, detail="Bu sipariş daha önce tekrar denendi")
+
+    advert_id = str(target.get("advert_id", ""))
+    all_services = get_all_services(include_inactive=True)
+    raw_service = all_services.get(advert_id)
+    if not raw_service:
+        raise HTTPException(status_code=400, detail="Bu ilan için servis ayarı bulunamadı")
+
+    service = get_service_config(raw_service)
+    if not service.get("api_url") or not service.get("api_key"):
+        raise HTTPException(status_code=400, detail="Panel bilgileri eksik")
+
+    smm_result = create_panel_order(
+        service["api_url"],
+        service["api_key"],
+        service["service_id"],
+        target.get("link", ""),
+        service["quantity"],
+        service.get("panel", ""),
+    )
+
+    if "error" in smm_result:
+        log("error", "retry_order_failed", smm_order_id=smm_order_id, error=smm_result.get("error"))
+        send_telegram(f"Retry başarısız.\n\nSMM ID: {smm_order_id}\nHata: {smm_result.get('error')}")
+        raise HTTPException(status_code=400, detail=smm_result.get("error"))
+
+    new_smm_order_id = smm_result.get("order", "Bilinmiyor")
+    add_pending_order(
+        target.get("order_id", "Bilinmiyor"),
+        advert_id,
+        target.get("product_name", "Bilinmeyen Ürün"),
+        service["panel"],
+        service["api_url"],
+        service["api_key"],
+        new_smm_order_id,
+        target.get("link", ""),
+        service_id=service.get("service_id", ""),
+        quantity=service.get("quantity", ""),
+        platform=service.get("platform", ""),
+        panel_key=service.get("panel_key", ""),
+    )
+    target["retried"] = True
+    target["retry_smm_order_id"] = str(new_smm_order_id)
+    save_state()
+
+    send_telegram(
+        f"Retry başlatıldı.\n\nÜrün: {target.get('product_name', 'Bilinmiyor')}\nPanel: {service['panel']}\n"
+        f"Eski SMM ID: {smm_order_id}\nYeni SMM ID: {new_smm_order_id}"
+    )
+    return RedirectResponse("/admin/failed-orders", status_code=303)
 
 
 # ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
@@ -1891,7 +2075,7 @@ async function loadFailed() {
     <div class="order-row">
       <div>
         <div>${o.product_name}</div>
-        <div class="order-detail">${o.reason}</div>
+        <div class="order-detail">${o.reason}${o.smm_order_id ? ' · SMM #' + o.smm_order_id : ''}${o.panel ? ' · ' + o.panel : ''}</div>
       </div>
       <span class="badge failed">hata</span>
     </div>`).join('');
@@ -2005,6 +2189,7 @@ def check_orders_head():
 def check_orders():
     completed_indexes = []
     changed = False
+    failed_count = 0
 
     for index, item in enumerate(PENDING_ORDERS):
         if item.get("cancelled"):
@@ -2012,37 +2197,86 @@ def check_orders():
             changed = True
             continue
 
-        status_data = check_panel_order_status(item["api_url"], item["api_key"], item["smm_order_id"])
+        status_data = check_panel_order_status(
+            item.get("api_url", ""),
+            item.get("api_key", ""),
+            item.get("smm_order_id", ""),
+            item.get("panel", ""),
+        )
 
         if "error" in status_data:
-            log("error", "status_check_error", smm_order_id=item["smm_order_id"], error=status_data)
+            log(
+                "error",
+                "status_check_error",
+                smm_order_id=item.get("smm_order_id"),
+                panel=item.get("panel", ""),
+                error=status_data,
+            )
             continue
 
-        status = str(status_data.get("status", "")).lower()
-        created_at = int(item.get("created_at", 0))
+        status = str(status_data.get("status", "")).lower().strip()
+        created_at = int(item.get("created_at", 0) or 0)
         delay_alert_sent = bool(item.get("delay_alert_sent", False))
+
+        if status in FAILED_PANEL_STATUSES:
+            failed_count += 1
+            log(
+                "warning",
+                "order_failed_panel_status",
+                smm_order_id=item.get("smm_order_id"),
+                status=status,
+                product=item.get("product_name"),
+                panel=item.get("panel", ""),
+            )
+            add_failed_order(
+                item.get("itemsatis_order_id", "Bilinmiyor"),
+                item.get("advert_id", ""),
+                item.get("product_name", "Bilinmeyen Ürün"),
+                f"Panel durumu: {status}",
+                detail=json.dumps(status_data, ensure_ascii=False)[:500],
+                smm_order_id=item.get("smm_order_id", ""),
+                link=item.get("link", ""),
+                panel=item.get("panel", ""),
+                panel_key=item.get("panel_key", ""),
+                service_id=item.get("service_id", ""),
+                quantity=item.get("quantity", ""),
+                platform=item.get("platform", ""),
+                retryable=True,
+            )
+            send_telegram(
+                f"⚠️ SMM sipariş sorunlu duruma düştü.\n\n"
+                f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
+                f"Panel: {item.get('panel', 'Bilinmiyor')}\n"
+                f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\n"
+                f"SMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
+                f"Durum: {status}\n"
+                f"Link: {item.get('link', '')}\n\n"
+                f"Admin panelden kontrol et. Otomatik tekrar sipariş verilmedi."
+            )
+            completed_indexes.append(index)
+            changed = True
+            continue
 
         if created_at and not delay_alert_sent:
             waited_seconds = int(time.time()) - created_at
             if waited_seconds >= 5400:
-                log("warning", "order_delayed", smm_order_id=item["smm_order_id"], waited_minutes=waited_seconds//60)
+                log("warning", "order_delayed", smm_order_id=item.get("smm_order_id"), waited_minutes=waited_seconds//60)
                 send_telegram(
-                    f"Sipariş gecikti.\n\nÜrün: {item['product_name']}\nPanel: {item['panel']}\n"
-                    f"Itemsatış ID: {item['itemsatis_order_id']}\nSMM ID: {item['smm_order_id']}\n"
-                    f"Link: {item['link']}\n\n1 saat 30 dakika geçti. Paneli kontrol et."
+                    f"Sipariş gecikti.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
+                    f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
+                    f"Link: {item.get('link', '')}\n\n1 saat 30 dakika geçti. Paneli kontrol et."
                 )
                 item["delay_alert_sent"] = True
                 changed = True
 
-        if status in ["completed", "complete", "tamamlandı"]:
-            log("success", "order_completed", smm_order_id=item["smm_order_id"], product=item["product_name"])
+        if status in COMPLETED_PANEL_STATUSES:
+            log("success", "order_completed", smm_order_id=item.get("smm_order_id"), product=item.get("product_name"))
             send_telegram(
-                f"SMM siparişi tamamlandı.\n\nÜrün: {item['product_name']}\nPanel: {item['panel']}\n"
-                f"Itemsatış ID: {item['itemsatis_order_id']}\nSMM ID: {item['smm_order_id']}\nLink: {item['link']}\n\n"
+                f"SMM siparişi tamamlandı.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
+                f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\nLink: {item.get('link', '')}\n\n"
                 f"Müşteriye değerlendirme mesajı gönderildi."
             )
-            # YENİ: Müşteriye otomatik bildirim
-            notify_customer_order_completed(item["itemsatis_order_id"], item["product_name"], item["link"])
+            notify_customer_order_completed(item.get("itemsatis_order_id", ""), item.get("product_name", ""), item.get("link", ""))
             completed_indexes.append(index)
             changed = True
 
@@ -2052,7 +2286,7 @@ def check_orders():
     if changed:
         save_state()
 
-    return {"ok": True, "pending_count": len(PENDING_ORDERS), "completed_count": len(completed_indexes)}
+    return {"ok": True, "pending_count": len(PENDING_ORDERS), "completed_count": len(completed_indexes), "failed_count": failed_count}
 
 
 # ─── YENİ: /cancel KOMUTU (Telegram'dan SMM siparişini iptal et) ──────────────
@@ -2174,7 +2408,7 @@ def check_services():
             log("warning", "service_panel_missing", advert_id=advert_id, panel=service.get("panel_key"))
             continue
 
-        services_data = get_panel_services(service["api_url"], service["api_key"])
+        services_data = get_panel_services(service["api_url"], service["api_key"], service.get("panel", ""))
         if isinstance(services_data, dict) and "error" in services_data:
             continue
         target_service = None
@@ -2280,7 +2514,7 @@ async def itemsatis_webhook(request: Request):
             send_telegram(f"Panel bilgileri eksik.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPanel: {service['panel']}\n\nRender Environment ayarlarını kontrol et.")
             return {"ok": False, "error": "panel_config_missing"}
 
-        balance_data = panel_balance(service["api_url"], service["api_key"])
+        balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
 
         if "error" in balance_data:
             add_failed_order(order_id, advert_id, service_name, "Panel bakiyesi alınamadı", balance_data.get("error"))
@@ -2293,7 +2527,7 @@ async def itemsatis_webhook(request: Request):
         check_low_balance(balance, currency, service["panel"])
 
         smm_result = create_panel_order(service["api_url"], service["api_key"],
-                                        service["service_id"], customer_link, service["quantity"])
+                                        service["service_id"], customer_link, service["quantity"], service.get("panel", ""))
 
         if "error" in smm_result:
             add_failed_order(order_id, advert_id, service_name, "Panel sipariş hatası", smm_result.get("error"))
@@ -2305,8 +2539,20 @@ async def itemsatis_webhook(request: Request):
 
         PROCESSED_LINKS.add(duplicate_link_key)
         PROCESSED_ORDERS.add(order_key)
-        add_pending_order(order_id, advert_id, service_name, service["panel"],
-                          service["api_url"], service["api_key"], smm_order_id, customer_link)
+        add_pending_order(
+            order_id,
+            advert_id,
+            service_name,
+            service["panel"],
+            service["api_url"],
+            service["api_key"],
+            smm_order_id,
+            customer_link,
+            service_id=service.get("service_id", ""),
+            quantity=service.get("quantity", ""),
+            platform=service.get("platform", ""),
+            panel_key=service.get("panel_key", ""),
+        )
         save_state()
 
         # YENİ: Müşteriye sipariş başladı bildirimi
@@ -2417,7 +2663,14 @@ async def telegram_webhook(request: Request):
             return {"ok": True}
         lines = ["Başarısız Siparişler:\n"]
         for item in FAILED_ORDERS[-10:]:
-            lines.append(f"ID: {item['order_id']}\nÜrün: {item['product_name']}\nSebep: {item['reason']}\n")
+            lines.append(
+                f"ID: {item.get('order_id', 'Bilinmiyor')}\n"
+                f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
+                f"Panel: {item.get('panel', '-')}\n"
+                f"SMM ID: {item.get('smm_order_id', '-')}\n"
+                f"Sebep: {item.get('reason', '-')}\n"
+                f"Retry: {'Uygun' if item.get('retryable') and not item.get('retried') else 'Yok'}\n"
+            )
         send_telegram("\n".join(lines))
         return {"ok": True}
 
