@@ -5,7 +5,21 @@ import time
 import hashlib
 import requests
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import structlog
+from structlog import get_logger
+
+# ─── STRUCTLOG SETUP ───────────────────────────────────────────────────────────
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.add_log_level,
+        structlog.processors.JSONRenderer(),
+    ]
+)
+logger = get_logger()
 
 app = FastAPI()
 
@@ -26,6 +40,10 @@ MEDYABAYIM_100_TURK_SERVICE_ID = os.getenv("MEDYABAYIM_100_TURK_SERVICE_ID", "13
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
+# Itemsatış API - müşteri mesajı göndermek için
+ITEMSATIS_API_KEY = os.getenv("ITEMSATIS_API_KEY", "")
+ITEMSATIS_API_URL = "https://itemsatis.com/api"
+
 CS2_ADVERT_ID = "5282114"
 
 SMM_SERVICE_MAP = {
@@ -36,6 +54,7 @@ SMM_SERVICE_MAP = {
         "api_key": SMM_API_KEY,
         "service_id": INSTAGRAM_1000_SERVICE_ID,
         "quantity": 1000,
+        "platform": "instagram",
     },
     "5191839": {
         "name": "Instagram 100 Türk Takipçi",
@@ -44,8 +63,21 @@ SMM_SERVICE_MAP = {
         "api_key": MEDYABAYIM_API_KEY,
         "service_id": MEDYABAYIM_100_TURK_SERVICE_ID,
         "quantity": 90,
+        "platform": "instagram",
     },
+
+    # Yeni ilan ekleme örneği:
+    # "ITEMSATIS_ILAN_ID": {
+    #     "name": "TikTok Fenomen Paket",
+    #     "panel": "SMMRush",
+    #     "api_url": SMM_API_URL,
+    #     "api_key": SMM_API_KEY,
+    #     "service_id": "PANEL_SERVIS_ID",
+    #     "quantity": 1000,
+    #     "platform": "tiktok",
+    # },
 }
+
 
 PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
@@ -59,6 +91,10 @@ MONTHLY_STATS = {}
 LAST_WEEKLY_REPORT_DATE = ""
 LAST_MONTHLY_REPORT_DATE = ""
 
+# ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
+LOG_HISTORY = []
+MAX_LOG_HISTORY = 200
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json,text/plain,*/*",
@@ -69,9 +105,36 @@ def now_tr():
     return datetime.utcnow() + timedelta(hours=3)
 
 
+# ─── YENİ: GELİŞMİŞ LOGLAMA ──────────────────────────────────────────────────
+def log(level: str, event: str, **kwargs):
+    """
+    Hem structlog ile JSON log yazar hem de dashboard için hafızada tutar.
+    level: info | warning | error | success
+    """
+    entry = {
+        "ts": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "level": level,
+        "event": event,
+        **kwargs,
+    }
+
+    # Structlog
+    log_fn = getattr(logger, level if level != "success" else "info", logger.info)
+    log_fn(event, **kwargs)
+
+    # Dashboard geçmişi
+    LOG_HISTORY.append(entry)
+    if len(LOG_HISTORY) > MAX_LOG_HISTORY:
+        LOG_HISTORY.pop(0)
+
+    # Redis'e de kaydet (son 200)
+    redis_set_json("log_history", LOG_HISTORY[-MAX_LOG_HISTORY:])
+
+
+# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN veya CHAT_ID eksik", flush=True)
+        log("warning", "telegram_skip", reason="BOT_TOKEN veya CHAT_ID eksik")
         return
 
     try:
@@ -85,11 +148,77 @@ def send_telegram(text: str):
             },
             timeout=30,
         )
-        print("TELEGRAM RESPONSE:", r.status_code, r.text[:500], flush=True)
+        log("info", "telegram_sent", status=r.status_code)
     except Exception as e:
-        print("TELEGRAM ERROR:", str(e), flush=True)
+        log("error", "telegram_error", error=str(e))
 
 
+# ─── YENİ: MÜŞTERİ BİLDİRİM SİSTEMİ ─────────────────────────────────────────
+def send_itemsatis_message(order_id: str, message: str) -> bool:
+    """
+    Itemsatış siparişine müşteriye mesaj gönderir.
+    Itemsatış API'nin mesaj endpoint'ini kullanır.
+    """
+    if not ITEMSATIS_API_KEY:
+        log("warning", "customer_notify_skip", reason="ITEMSATIS_API_KEY eksik", order_id=order_id)
+        return False
+
+    try:
+        r = requests.post(
+            f"{ITEMSATIS_API_URL}/orders/{order_id}/message",
+            headers={
+                "Authorization": f"Bearer {ITEMSATIS_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"message": message},
+            timeout=30,
+        )
+
+        if r.status_code == 200:
+            log("success", "customer_notified", order_id=order_id)
+            return True
+        else:
+            log("warning", "customer_notify_failed", order_id=order_id, status=r.status_code, response=r.text[:200])
+            return False
+
+    except Exception as e:
+        log("error", "customer_notify_error", order_id=order_id, error=str(e))
+        return False
+
+
+def notify_customer_order_started(order_id: str, product_name: str, link: str):
+    """Sipariş panele girilince müşteriye bildirim gönder."""
+    message = (
+        f"Merhaba! '{product_name}' siparişiniz alındı ve işleme girdi.\n\n"
+        f"Hesabınız: {link}\n\n"
+        f"Takipçiler genellikle 0-24 saat içinde gelmeye başlar. "
+        f"Herhangi bir sorun olursa bize ulaşabilirsiniz. Teşekkürler! 🙏"
+    )
+    return send_itemsatis_message(order_id, message)
+
+
+def notify_customer_order_completed(order_id: str, product_name: str, link: str):
+    """Sipariş tamamlanınca müşteriye bildirim gönder."""
+    message = (
+        f"Merhaba! '{product_name}' siparişiniz tamamlandı! 🎉\n\n"
+        f"Hesabınız: {link}\n\n"
+        f"Memnun kaldıysanız değerlendirme bırakırsanız çok seviniriz. "
+        f"Tekrar alışveriş için görüşmek üzere! 😊"
+    )
+    return send_itemsatis_message(order_id, message)
+
+
+def notify_customer_order_failed(order_id: str, product_name: str):
+    """Sipariş başarısız olunca müşteriye bildirim gönder."""
+    message = (
+        f"Merhaba! '{product_name}' siparişinizde teknik bir sorun yaşandı. "
+        f"En kısa sürede çözüp siparişinizi işleme alacağız. "
+        f"Rahatsızlık için özür dileriz. 🙏"
+    )
+    return send_itemsatis_message(order_id, message)
+
+
+# ─── REDIS ────────────────────────────────────────────────────────────────────
 def redis_request(command):
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
@@ -103,13 +232,12 @@ def redis_request(command):
         )
         return r.json()
     except Exception as e:
-        print("REDIS ERROR:", str(e), flush=True)
+        log("error", "redis_error", error=str(e))
         return None
 
 
 def redis_get_json(key, default):
     result = redis_request(["GET", key])
-
     try:
         value = result.get("result") if result else None
         if not value:
@@ -127,7 +255,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES
+    global RECORDED_SALES, LOG_HISTORY
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -141,6 +269,9 @@ def load_state():
     MONTHLY_STATS = redis_get_json("monthly_stats", {})
     LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
     LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
+    LOG_HISTORY = redis_get_json("log_history", [])
+
+    log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
 
 def save_state():
@@ -158,34 +289,49 @@ def save_state():
     redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
 
 
+# ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
 def normalize_text(text: str) -> str:
     return str(text or "").lower().strip()
 
 
 def normalize_instagram_link(link: str) -> str:
     link = str(link or "").strip()
-
     if not link:
         return ""
-
     if link.startswith("@"):
         link = f"https://www.instagram.com/{link[1:]}"
-
     if not link.startswith("http"):
         if "instagram.com" not in link:
             link = f"https://www.instagram.com/{link.lstrip('@')}"
         else:
             link = "https://" + link
 
+    # Sadece Instagram için soru işaretinden sonrasını temizle.
+    # YouTube/TikTok/X gibi platformlarda ?v= veya benzeri kısımlar linkin parçası olabilir.
     link = link.split("?")[0]
     link = link.rstrip("/")
-
     return link
 
 
-def normalize_link_for_check(link: str) -> str:
+def normalize_panel_link(link: str, platform: str = "") -> str:
+    link = str(link or "").strip()
+    platform = normalize_text(platform)
+
+    if not link:
+        return ""
+
+    if platform == "instagram":
+        return normalize_instagram_link(link)
+
+    # Instagram dışındaki tüm platformlarda linki panele aynen gönder.
+    return link
+
+
+def normalize_link_for_check(link: str, platform: str = "") -> str:
+    platform = normalize_text(platform)
+    check_link = normalize_panel_link(link, platform)
     return (
-        normalize_instagram_link(link)
+        check_link
         .lower()
         .replace("https://", "")
         .replace("http://", "")
@@ -194,41 +340,37 @@ def normalize_link_for_check(link: str) -> str:
     )
 
 
-def make_order_key(order_id, advert_id, buyer, link=""):
+def make_order_key(order_id, advert_id, buyer, link="", platform=""):
     if order_id and str(order_id) != "Bilinmiyor":
         return f"order:{order_id}"
-    return f"fallback:{advert_id}:{buyer}:{normalize_link_for_check(link)}"
+    return f"fallback:{advert_id}:{buyer}:{normalize_link_for_check(link, platform)}"
 
 
-def make_sale_key(data: dict, order_id, advert_id, buyer, product_name, price, link=""):
+def make_sale_key(data, order_id, advert_id, buyer, product_name, price, link=""):
     if order_id and str(order_id) != "Bilinmiyor":
         return f"sale_order:{order_id}"
-
     try:
         raw = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
     except Exception:
         raw = str(data)
-
     fingerprint = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
     safe_link = normalize_link_for_check(link)
     return f"sale_fallback:{advert_id}:{buyer}:{product_name}:{price}:{safe_link}:{fingerprint}"
 
 
 def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
-    FAILED_ORDERS.append(
-        {
-            "order_id": str(order_id),
-            "advert_id": str(advert_id),
-            "product_name": str(product_name),
-            "reason": str(reason),
-            "detail": str(detail),
-            "created_at": int(time.time()),
-        }
-    )
-
+    entry = {
+        "order_id": str(order_id),
+        "advert_id": str(advert_id),
+        "product_name": str(product_name),
+        "reason": str(reason),
+        "detail": str(detail),
+        "created_at": int(time.time()),
+    }
+    FAILED_ORDERS.append(entry)
     if len(FAILED_ORDERS) > 20:
         FAILED_ORDERS.pop(0)
-
+    log("error", "order_failed", order_id=order_id, reason=reason, product=product_name)
     save_state()
 
 
@@ -236,13 +378,10 @@ def get_order_price(data: dict) -> float:
     value = get_nested(
         data,
         "price", "total", "amount", "total_price", "order_price",
-        "details.price", "details.total", "details.amount", "details.total_price", "details.order_price",
-        "data.price", "data.total", "data.amount", "data.total_price", "data.order_price",
+        "details.price", "details.total", "details.amount",
+        "data.price", "data.total", "data.amount",
         "payment.price", "payment.total", "payment.amount",
-        "details.payment.price", "details.payment.total", "details.payment.amount",
-        "data.payment.price", "data.payment.total", "data.payment.amount",
     )
-
     try:
         clean_value = str(value or "0")
         clean_value = clean_value.replace("TL", "").replace("₺", "").replace("TRY", "")
@@ -258,7 +397,6 @@ def normalize_stat_item(value):
             "count": int(value.get("count", 0) or 0),
             "gross": float(value.get("gross", 0) or 0),
         }
-
     try:
         return {"count": int(value or 0), "gross": 0.0}
     except Exception:
@@ -267,7 +405,6 @@ def normalize_stat_item(value):
 
 def add_daily_stat(product_name: str, price: float = 0):
     global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS
-
     product_name = str(product_name or "Bilinmeyen Ürün").strip() or "Bilinmeyen Ürün"
 
     def add_to(stats):
@@ -278,48 +415,38 @@ def add_daily_stat(product_name: str, price: float = 0):
     add_to(DAILY_STATS)
     add_to(WEEKLY_STATS)
     add_to(MONTHLY_STATS)
-
     save_state()
 
 
-def record_itemsatis_sale(data: dict, order_id, advert_id, buyer, product_name, price, link="") -> bool:
+def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price, link="") -> bool:
     global RECORDED_SALES
-
     sale_key = make_sale_key(data, order_id, advert_id, buyer, product_name, price, link)
-
     if sale_key in RECORDED_SALES:
         return False
-
     add_daily_stat(product_name, price)
     RECORDED_SALES.add(sale_key)
     save_state()
-
     return True
 
 
 def build_sales_report(title: str, stats: dict, empty_text: str):
     lines = [f"{title}\n"]
-
     total_count = 0
     gross_total = 0.0
 
     if stats:
         normalized_items = []
-
         for product_name, raw_value in stats.items():
             item = normalize_stat_item(raw_value)
             count = item["count"]
             gross = item["gross"]
-
             if count <= 0:
                 continue
-
             normalized_items.append((product_name, count, gross))
             total_count += count
             gross_total += gross
 
         normalized_items.sort(key=lambda x: x[1], reverse=True)
-
         if normalized_items:
             for product_name, count, gross in normalized_items:
                 if gross > 0:
@@ -333,9 +460,7 @@ def build_sales_report(title: str, stats: dict, empty_text: str):
 
     commission = gross_total * ITEMSATIS_COMMISSION_RATE
     net_total = gross_total - commission
-
     lines.append(f"\nToplam Sipariş: {total_count}")
-
     if gross_total > 0:
         lines.append(f"Brüt Kazanç: {gross_total:.2f} TL")
         lines.append(f"Itemsatış Komisyonu (%7): {commission:.2f} TL")
@@ -345,15 +470,12 @@ def build_sales_report(title: str, stats: dict, empty_text: str):
 
     lines.append(f"Başarısız Sipariş: {len(FAILED_ORDERS)}")
     lines.append(f"Bekleyen SMM Sipariş: {len(PENDING_ORDERS)}")
-
     return "\n".join(lines)
 
 
 def reset_sales_stats(scope: str = "daily"):
     global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS, RECORDED_SALES
-
     scope = str(scope or "daily").lower().strip()
-
     if scope == "daily":
         DAILY_STATS = {}
     elif scope == "weekly":
@@ -367,7 +489,6 @@ def reset_sales_stats(scope: str = "daily"):
         RECORDED_SALES = set()
     else:
         return False
-
     save_state()
     return True
 
@@ -375,25 +496,22 @@ def reset_sales_stats(scope: str = "daily"):
 def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
     if not smm_order_id or str(smm_order_id) == "Bilinmiyor":
         return
-
     if any(str(item.get("smm_order_id")) == str(smm_order_id) for item in PENDING_ORDERS):
         return
-
-    PENDING_ORDERS.append(
-        {
-            "itemsatis_order_id": str(order_id),
-            "advert_id": str(advert_id),
-            "product_name": str(product_name),
-            "panel": str(panel),
-            "api_url": str(api_url),
-            "api_key": str(api_key),
-            "smm_order_id": str(smm_order_id),
-            "link": str(link),
-            "created_at": int(time.time()),
-            "delay_alert_sent": False,
-        }
-    )
-
+    PENDING_ORDERS.append({
+        "itemsatis_order_id": str(order_id),
+        "advert_id": str(advert_id),
+        "product_name": str(product_name),
+        "panel": str(panel),
+        "api_url": str(api_url),
+        "api_key": str(api_key),
+        "smm_order_id": str(smm_order_id),
+        "link": str(link),
+        "created_at": int(time.time()),
+        "delay_alert_sent": False,
+        "cancelled": False,  # YENİ
+    })
+    log("info", "order_queued", order_id=order_id, smm_order_id=smm_order_id, product=product_name)
     save_state()
 
 
@@ -416,88 +534,47 @@ def get_nested(data: dict, *paths):
     for path in paths:
         current = data
         ok = True
-
         for key in path.split("."):
             if isinstance(current, dict) and key in current:
                 current = current[key]
             else:
                 ok = False
                 break
-
         if ok and current not in [None, ""]:
             return current
-
     return ""
 
 
 def get_event(data: dict) -> str:
-    return normalize_text(
-        get_nested(
-            data,
-            "event", "type", "action",
-            "details.event", "details.type", "details.action",
-            "data.event", "data.type", "data.action",
-        )
-    )
+    return normalize_text(get_nested(data, "event", "type", "action", "details.event", "data.event"))
 
 
 def get_order_id(data: dict) -> str:
-    return str(
-        get_nested(
-            data,
-            "order_id", "id", "purchaseId", "purchase_id",
-            "data.order_id", "data.id", "data.purchaseId",
-            "details.order_id", "details.id", "details.purchaseId",
-        )
-        or "Bilinmiyor"
-    )
+    return str(get_nested(data, "order_id", "id", "purchaseId", "purchase_id",
+                          "data.order_id", "data.id", "details.order_id") or "Bilinmiyor")
 
 
 def get_advert_id(data: dict) -> str:
-    return str(
-        get_nested(
-            data,
-            "advert.id", "details.advert.id", "data.advert.id",
-            "advert_id", "details.advert_id", "data.advert_id",
-        )
-        or ""
-    )
+    return str(get_nested(data, "advert.id", "details.advert.id", "data.advert.id",
+                          "advert_id", "details.advert_id", "data.advert_id") or "")
 
 
 def get_product_name(data: dict) -> str:
-    return str(
-        get_nested(
-            data,
-            "product_name", "product", "advert.title", "advert.name",
-            "details.advert.title", "details.advert.name",
-            "data.advert.title", "data.advert.name",
-            "details.product_name", "details.product",
-            "data.product_name", "data.product", "title", "details.title", "data.title",
-        )
-        or ""
-    ).strip()
+    return str(get_nested(data, "product_name", "product", "advert.title", "advert.name",
+                          "details.advert.title", "data.advert.title", "title") or "").strip()
 
 
 def get_buyer(data: dict) -> str:
-    buyer = get_nested(
-        data,
-        "buyer", "buyer.username", "username", "customer",
-        "customer.username", "customer.name",
-        "details.customer.username", "details.customer.name", "details.customer",
-        "data.customer.username", "data.customer.name", "data.customer",
-        "details.buyer.username", "details.buyer",
-    )
-
+    buyer = get_nested(data, "buyer", "buyer.username", "username", "customer",
+                       "customer.username", "details.customer.username", "data.customer.username")
     if isinstance(buyer, dict):
         return str(buyer.get("username") or buyer.get("name") or buyer.get("id") or "Bilinmiyor")
-
     return str(buyer or "Bilinmiyor")
 
 
 def collect_strings(obj, results=None):
     if results is None:
         results = []
-
     if isinstance(obj, dict):
         for value in obj.values():
             collect_strings(value, results)
@@ -506,70 +583,110 @@ def collect_strings(obj, results=None):
             collect_strings(value, results)
     elif isinstance(obj, str):
         results.append(obj)
-
     return results
 
 
-def find_instagram_link(data: dict) -> str:
+def find_order_link(data: dict, platform: str = "") -> str:
+    platform = normalize_text(platform)
+
     priority_paths = [
         "post_datas.Profil Linki",
+        "post_datas.Link",
+        "post_datas.Video Linki",
+        "post_datas.Gönderi Linki",
+        "post_datas.Kanal Linki",
         "details.post_datas.Profil Linki",
+        "details.post_datas.Link",
+        "details.post_datas.Video Linki",
+        "details.post_datas.Gönderi Linki",
+        "details.post_datas.Kanal Linki",
         "data.post_datas.Profil Linki",
-        "url", "link", "instagram", "instagram_link", "profile_link", "account_link",
+        "data.post_datas.Link",
+        "data.post_datas.Video Linki",
+        "data.post_datas.Gönderi Linki",
+        "data.post_datas.Kanal Linki",
+        "url", "link", "profile_link", "account_link", "video_link", "post_link",
+        "instagram", "instagram_link", "tiktok", "tiktok_link", "youtube", "youtube_link",
         "note", "message", "content", "description", "order_note", "customer_note",
-        "details.url", "details.link", "details.instagram", "details.instagram_link",
-        "details.note", "details.message", "details.content", "details.description",
-        "data.url", "data.link", "data.instagram", "data.instagram_link",
-        "data.note", "data.message", "data.content", "data.description",
+        "details.url", "details.link", "details.note", "details.message", "details.content", "details.description",
+        "data.url", "data.link", "data.note", "data.message", "data.content", "data.description",
     ]
+
+    platform_domains = {
+        "instagram": ["instagram.com"],
+        "tiktok": ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"],
+        "youtube": ["youtube.com", "youtu.be"],
+        "x": ["x.com", "twitter.com"],
+        "twitter": ["x.com", "twitter.com"],
+        "twitch": ["twitch.tv"],
+        "kick": ["kick.com"],
+        "facebook": ["facebook.com", "fb.watch"],
+        "telegram": ["t.me", "telegram.me"],
+    }
+
+    def looks_like_link(value: str) -> bool:
+        v = str(value or "").strip().lower()
+        if not v:
+            return False
+        if platform == "instagram" and v.startswith("@"):
+            return True
+        if v.startswith("http://") or v.startswith("https://"):
+            return True
+        domains = platform_domains.get(platform, [])
+        if domains and any(domain in v for domain in domains):
+            return True
+        if not domains and "." in v and " " not in v:
+            return True
+        return False
 
     for path in priority_paths:
         value = get_nested(data, path)
-
-        if isinstance(value, str) and value.strip():
-            if "instagram.com" in value.lower() or value.strip().startswith("@"):
-                return normalize_instagram_link(value)
+        if isinstance(value, str) and looks_like_link(value):
+            return normalize_panel_link(value, platform)
 
     all_strings = collect_strings(data)
     joined = "\n".join(all_strings)
 
-    match = re.search(
-        r"(https?://)?(www\.)?instagram\.com/[A-Za-z0-9._/\-?=&%]+",
-        joined,
-        re.IGNORECASE,
-    )
+    if platform == "instagram":
+        match = re.search(r"(https?://)?(www\.)?instagram\.com/[A-Za-z0-9._/\-?=&%]+", joined, re.IGNORECASE)
+        if match:
+            return normalize_panel_link(match.group(0), platform)
+        for text in all_strings:
+            text = text.strip()
+            if text.startswith("@") and len(text) > 2:
+                return normalize_panel_link(text, platform)
+        return ""
 
+    # Genel link yakalama: YouTube/TikTok vb. linklerin ? sonrasını KESMEZ.
+    match = re.search(r"https?://[^\s<>'\"]+", joined, re.IGNORECASE)
     if match:
-        return normalize_instagram_link(match.group(0))
+        return normalize_panel_link(match.group(0), platform)
 
-    for text in all_strings:
-        text = text.strip()
-        if text.startswith("@") and len(text) > 2:
-            return normalize_instagram_link(text)
+    domains = platform_domains.get(platform, [])
+    if domains:
+        domain_pattern = "|".join(re.escape(d) for d in domains)
+        match = re.search(rf"(?:www\.)?(?:{domain_pattern})/[^\s<>'\"]+", joined, re.IGNORECASE)
+        if match:
+            value = match.group(0)
+            if not value.startswith("http"):
+                value = "https://" + value
+            return normalize_panel_link(value, platform)
 
     return ""
 
 
+def find_instagram_link(data: dict) -> str:
+    return find_order_link(data, "instagram")
+
 def panel_balance(api_url, api_key):
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
-
     try:
-        r = requests.post(
-            api_url,
-            data={"key": api_key, "action": "balance"},
-            headers=HEADERS,
-            timeout=30,
-        )
-
-        print("BALANCE STATUS:", r.status_code, flush=True)
-        print("BALANCE RESPONSE:", r.text[:500], flush=True)
-
+        r = requests.post(api_url, data={"key": api_key, "action": "balance"}, headers=HEADERS, timeout=30)
         try:
             return r.json()
         except Exception:
             return {"error": "Panel JSON cevap vermedi", "raw": r.text[:300]}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -577,52 +694,27 @@ def panel_balance(api_url, api_key):
 def create_panel_order(api_url, api_key, service_id, link, quantity):
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
-
     try:
-        r = requests.post(
-            api_url,
-            data={
-                "key": api_key,
-                "action": "add",
-                "service": service_id,
-                "link": link,
-                "quantity": quantity,
-            },
-            headers=HEADERS,
-            timeout=30,
-        )
-
-        print("ORDER STATUS:", r.status_code, flush=True)
-        print("ORDER RESPONSE:", r.text[:500], flush=True)
-
+        r = requests.post(api_url, data={"key": api_key, "action": "add", "service": service_id,
+                                          "link": link, "quantity": quantity}, headers=HEADERS, timeout=30)
         try:
             return r.json()
         except Exception:
             return {"error": "Panel JSON cevap vermedi", "raw": r.text[:300]}
-
     except Exception as e:
         return {"error": str(e)}
 
 
 def check_panel_order_status(api_url, api_key, order_id):
     if not api_url or not api_key or not order_id:
-        return {"error": "Status için API bilgisi veya order ID eksik"}
-
+        return {"error": "Status için bilgi eksik"}
     try:
-        r = requests.post(
-            api_url,
-            data={"key": api_key, "action": "status", "order": order_id},
-            headers=HEADERS,
-            timeout=30,
-        )
-
-        print("STATUS CHECK:", r.status_code, r.text[:500], flush=True)
-
+        r = requests.post(api_url, data={"key": api_key, "action": "status", "order": order_id},
+                          headers=HEADERS, timeout=30)
         try:
             return r.json()
         except Exception:
             return {"error": "Status JSON cevap vermedi", "raw": r.text[:300]}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -630,23 +722,12 @@ def check_panel_order_status(api_url, api_key, order_id):
 def get_panel_services(api_url, api_key):
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
-
     try:
-        r = requests.post(
-            api_url,
-            data={"key": api_key, "action": "services"},
-            headers=HEADERS,
-            timeout=30,
-        )
-
-        print("SERVICES STATUS:", r.status_code, flush=True)
-        print("SERVICES RESPONSE:", r.text[:500], flush=True)
-
+        r = requests.post(api_url, data={"key": api_key, "action": "services"}, headers=HEADERS, timeout=30)
         try:
             return r.json()
         except Exception:
             return {"error": "Services JSON cevap vermedi", "raw": r.text[:300]}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -654,33 +735,413 @@ def get_panel_services(api_url, api_key):
 def check_low_balance(balance, currency, panel_name="Panel"):
     try:
         numeric_balance = float(balance)
-
-        if str(currency).upper() == "USD":
-            balance_tl = numeric_balance * 39
-        else:
-            balance_tl = numeric_balance
-
+        balance_tl = numeric_balance * 39 if str(currency).upper() == "USD" else numeric_balance
         if balance_tl <= 100:
-            send_telegram(
-                f"""
-{panel_name} bakiyesi 100 TL altına düştü.
-
-Kalan Bakiye: {balance} {currency}
-
-Lütfen panel bakiyesini kontrol et.
-"""
-            )
-
+            log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency)
+            send_telegram(f"{panel_name} bakiyesi 100 TL altına düştü.\n\nKalan: {balance} {currency}\n\nLütfen kontrol et.")
     except Exception as e:
-        print("BALANCE CHECK ERROR:", str(e), flush=True)
+        log("error", "balance_check_error", error=str(e))
 
 
 load_state()
 
 
-@app.get("/")
-def home():
-    return {"status": "bot çalışıyor"}
+# ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SMM Bot Dashboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #111118;
+    --border: #1e1e2e;
+    --accent: #7c3aed;
+    --accent2: #06b6d4;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --text: #e2e8f0;
+    --muted: #64748b;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    min-height: 100vh;
+  }
+
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 20px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(17,17,24,0.8);
+    backdrop-filter: blur(12px);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo {
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: -0.5px;
+  }
+
+  .logo span { color: var(--accent); }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+    animation: pulse 2s infinite;
+    display: inline-block;
+    margin-right: 8px;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .container { max-width: 1400px; margin: 0 auto; padding: 32px; }
+
+  .grid-4 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 28px;
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 28px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+
+  .stat-card {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--accent);
+  }
+
+  .stat-card.success::before { background: var(--success); }
+  .stat-card.warning::before { background: var(--warning); }
+  .stat-card.danger::before { background: var(--danger); }
+  .stat-card.cyan::before { background: var(--accent2); }
+
+  .stat-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    margin-bottom: 10px;
+  }
+
+  .stat-value {
+    font-size: 32px;
+    font-weight: 800;
+    letter-spacing: -1px;
+  }
+
+  .stat-sub {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 4px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .card-title {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .log-list {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    max-height: 380px;
+    overflow-y: auto;
+  }
+
+  .log-list::-webkit-scrollbar { width: 4px; }
+  .log-list::-webkit-scrollbar-track { background: transparent; }
+  .log-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .log-entry {
+    display: flex;
+    gap: 10px;
+    padding: 7px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    align-items: flex-start;
+  }
+
+  .log-ts { color: var(--muted); flex-shrink: 0; font-size: 11px; }
+
+  .log-level {
+    flex-shrink: 0;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .log-level.info { background: rgba(124,58,237,0.2); color: var(--accent); }
+  .log-level.success { background: rgba(16,185,129,0.2); color: var(--success); }
+  .log-level.warning { background: rgba(245,158,11,0.2); color: var(--warning); }
+  .log-level.error { background: rgba(239,68,68,0.2); color: var(--danger); }
+
+  .log-event { color: var(--text); flex: 1; }
+  .log-meta { color: var(--muted); font-size: 11px; word-break: break-all; }
+
+  .order-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 13px;
+  }
+
+  .order-row:last-child { border-bottom: none; }
+
+  .badge {
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+  }
+
+  .badge.pending { background: rgba(245,158,11,0.15); color: var(--warning); }
+  .badge.failed { background: rgba(239,68,68,0.15); color: var(--danger); }
+  .badge.ok { background: rgba(16,185,129,0.15); color: var(--success); }
+
+  .refresh-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    transition: all 0.2s;
+  }
+
+  .refresh-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px; }
+
+  .order-detail { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+
+  .last-updated {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">SMM<span>Bot</span> Dashboard</div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <span class="last-updated" id="lastUpdated">—</span>
+    <button class="refresh-btn" onclick="loadAll()">↻ Yenile</button>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- İSTATİSTİK KARTLARI -->
+  <div class="grid-4" id="statsGrid">
+    <div class="card stat-card success">
+      <div class="stat-label">Bugün Sipariş</div>
+      <div class="stat-value" id="todayCount">—</div>
+    </div>
+    <div class="card stat-card cyan">
+      <div class="stat-label">Bekleyen</div>
+      <div class="stat-value" id="pendingCount">—</div>
+    </div>
+    <div class="card stat-card danger">
+      <div class="stat-label">Başarısız</div>
+      <div class="stat-value" id="failedCount">—</div>
+    </div>
+    <div class="card stat-card warning">
+      <div class="stat-label">Bugün Brüt</div>
+      <div class="stat-value" id="todayGross">—</div>
+      <div class="stat-sub" id="todayNet">net —</div>
+    </div>
+  </div>
+
+  <!-- BEKLEYEN + BAŞARISIZ -->
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-title">Bekleyen Siparişler</div>
+      <div id="pendingList"><div class="empty">Yükleniyor...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Son Başarısız Siparişler</div>
+      <div id="failedList"><div class="empty">Yükleniyor...</div></div>
+    </div>
+  </div>
+
+  <!-- LOG GEÇMİŞİ -->
+  <div class="card">
+    <div class="card-title" style="display:flex;justify-content:space-between">
+      <span>Canlı Log</span>
+      <span id="logCount" style="color:var(--muted);font-size:11px"></span>
+    </div>
+    <div class="log-list" id="logList"><div class="empty">Yükleniyor...</div></div>
+  </div>
+
+</div>
+
+<script>
+async function loadAll() {
+  document.getElementById('lastUpdated').textContent = 'Güncelleniyor...';
+  await Promise.all([loadStats(), loadPending(), loadFailed(), loadLogs()]);
+  const now = new Date().toLocaleTimeString('tr-TR');
+  document.getElementById('lastUpdated').textContent = `Son güncelleme: ${now}`;
+}
+
+async function loadStats() {
+  const r = await fetch('/api/stats');
+  const d = await r.json();
+  document.getElementById('todayCount').textContent = d.today_count;
+  document.getElementById('pendingCount').textContent = d.pending_count;
+  document.getElementById('failedCount').textContent = d.failed_count;
+  document.getElementById('todayGross').textContent = d.today_gross.toFixed(0) + ' ₺';
+  document.getElementById('todayNet').textContent = 'net ' + d.today_net.toFixed(0) + ' ₺';
+}
+
+async function loadPending() {
+  const r = await fetch('/api/pending');
+  const d = await r.json();
+  const el = document.getElementById('pendingList');
+  if (!d.orders.length) { el.innerHTML = '<div class="empty">Bekleyen sipariş yok</div>'; return; }
+  el.innerHTML = d.orders.map(o => {
+    const mins = Math.floor((Date.now()/1000 - o.created_at) / 60);
+    return `<div class="order-row">
+      <div>
+        <div>${o.product_name}</div>
+        <div class="order-detail">${o.link} · ${o.panel} #${o.smm_order_id}</div>
+      </div>
+      <span class="badge pending">${mins}dk</span>
+    </div>`;
+  }).join('');
+}
+
+async function loadFailed() {
+  const r = await fetch('/api/failed');
+  const d = await r.json();
+  const el = document.getElementById('failedList');
+  if (!d.orders.length) { el.innerHTML = '<div class="empty">Başarısız sipariş yok</div>'; return; }
+  el.innerHTML = d.orders.slice(-8).reverse().map(o => `
+    <div class="order-row">
+      <div>
+        <div>${o.product_name}</div>
+        <div class="order-detail">${o.reason}</div>
+      </div>
+      <span class="badge failed">hata</span>
+    </div>`).join('');
+}
+
+async function loadLogs() {
+  const r = await fetch('/api/logs');
+  const d = await r.json();
+  document.getElementById('logCount').textContent = `${d.logs.length} kayıt`;
+  const el = document.getElementById('logList');
+  if (!d.logs.length) { el.innerHTML = '<div class="empty">Log yok</div>'; return; }
+  el.innerHTML = [...d.logs].reverse().map(l => {
+    const meta = Object.entries(l)
+      .filter(([k]) => !['ts','level','event'].includes(k))
+      .map(([k,v]) => `${k}=${v}`).join(' ');
+    return `<div class="log-entry">
+      <span class="log-ts">${l.ts.slice(11,19)}</span>
+      <span class="log-level ${l.level}">${l.level}</span>
+      <span class="log-event">${l.event} <span class="log-meta">${meta}</span></span>
+    </div>`;
+  }).join('');
+}
+
+loadAll();
+setInterval(loadAll, 30000);
+</script>
+</body>
+</html>
+"""
+
+
+# ─── API ENDPOINTS ────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD_HTML
+
+
+@app.get("/api/stats")
+def api_stats():
+    today_count = sum(normalize_stat_item(v)["count"] for v in DAILY_STATS.values())
+    today_gross = sum(normalize_stat_item(v)["gross"] for v in DAILY_STATS.values())
+    commission = today_gross * ITEMSATIS_COMMISSION_RATE
+    return {
+        "today_count": today_count,
+        "today_gross": today_gross,
+        "today_net": today_gross - commission,
+        "pending_count": len(PENDING_ORDERS),
+        "failed_count": len(FAILED_ORDERS),
+    }
+
+
+@app.get("/api/pending")
+def api_pending():
+    return {"orders": PENDING_ORDERS}
+
+
+@app.get("/api/failed")
+def api_failed():
+    return {"orders": FAILED_ORDERS}
+
+
+@app.get("/api/logs")
+def api_logs():
+    return {"logs": LOG_HISTORY}
 
 
 @app.get("/test")
@@ -710,57 +1171,42 @@ def check_orders():
     changed = False
 
     for index, item in enumerate(PENDING_ORDERS):
-        status_data = check_panel_order_status(
-            item["api_url"],
-            item["api_key"],
-            item["smm_order_id"],
-        )
+        if item.get("cancelled"):
+            completed_indexes.append(index)
+            changed = True
+            continue
+
+        status_data = check_panel_order_status(item["api_url"], item["api_key"], item["smm_order_id"])
 
         if "error" in status_data:
-            print("STATUS ERROR:", status_data, flush=True)
+            log("error", "status_check_error", smm_order_id=item["smm_order_id"], error=status_data)
             continue
 
         status = str(status_data.get("status", "")).lower()
-
         created_at = int(item.get("created_at", 0))
         delay_alert_sent = bool(item.get("delay_alert_sent", False))
 
         if created_at and not delay_alert_sent:
             waited_seconds = int(time.time()) - created_at
-
             if waited_seconds >= 5400:
+                log("warning", "order_delayed", smm_order_id=item["smm_order_id"], waited_minutes=waited_seconds//60)
                 send_telegram(
-                    f"""
-Sipariş gecikti.
-
-Ürün: {item["product_name"]}
-Panel: {item["panel"]}
-Itemsatış Sipariş ID: {item["itemsatis_order_id"]}
-SMM Sipariş ID: {item["smm_order_id"]}
-Link: {item["link"]}
-
-Bekleme süresi: 1 saat 30 dakika geçti.
-Paneli kontrol et.
-"""
+                    f"Sipariş gecikti.\n\nÜrün: {item['product_name']}\nPanel: {item['panel']}\n"
+                    f"Itemsatış ID: {item['itemsatis_order_id']}\nSMM ID: {item['smm_order_id']}\n"
+                    f"Link: {item['link']}\n\n1 saat 30 dakika geçti. Paneli kontrol et."
                 )
-
                 item["delay_alert_sent"] = True
                 changed = True
 
         if status in ["completed", "complete", "tamamlandı"]:
+            log("success", "order_completed", smm_order_id=item["smm_order_id"], product=item["product_name"])
             send_telegram(
-                f"""
-Instagram siparişi tamamlandı.
-
-Ürün: {item["product_name"]}
-Panel: {item["panel"]}
-Itemsatış Sipariş ID: {item["itemsatis_order_id"]}
-SMM Sipariş ID: {item["smm_order_id"]}
-Link: {item["link"]}
-
-Müşteriye değerlendirme mesajı gönderebilirsin.
-"""
+                f"SMM siparişi tamamlandı.\n\nÜrün: {item['product_name']}\nPanel: {item['panel']}\n"
+                f"Itemsatış ID: {item['itemsatis_order_id']}\nSMM ID: {item['smm_order_id']}\nLink: {item['link']}\n\n"
+                f"Müşteriye değerlendirme mesajı gönderildi."
             )
+            # YENİ: Müşteriye otomatik bildirim
+            notify_customer_order_completed(item["itemsatis_order_id"], item["product_name"], item["link"])
             completed_indexes.append(index)
             changed = True
 
@@ -770,11 +1216,44 @@ Müşteriye değerlendirme mesajı gönderebilirsin.
     if changed:
         save_state()
 
-    return {
-        "ok": True,
-        "pending_count": len(PENDING_ORDERS),
-        "completed_count": len(completed_indexes),
-    }
+    return {"ok": True, "pending_count": len(PENDING_ORDERS), "completed_count": len(completed_indexes)}
+
+
+# ─── YENİ: /cancel KOMUTU (Telegram'dan SMM siparişini iptal et) ──────────────
+def handle_cancel_command(text: str):
+    """
+    /cancel <smm_order_id> — bekleyen siparişi iptal eder.
+    Örnek: /cancel 12345
+    """
+    parts = text.strip().split()
+    if len(parts) < 2:
+        send_telegram(
+            "Kullanım: /cancel <smm_order_id>\n\n"
+            "Bekleyen siparişleri görmek için: /pending"
+        )
+        return
+
+    target_id = parts[1].strip()
+    found = False
+
+    for item in PENDING_ORDERS:
+        if str(item.get("smm_order_id")) == target_id:
+            item["cancelled"] = True
+            found = True
+            log("warning", "order_cancelled", smm_order_id=target_id, product=item["product_name"])
+            send_telegram(
+                f"Sipariş iptal edildi.\n\n"
+                f"SMM ID: {target_id}\n"
+                f"Ürün: {item['product_name']}\n"
+                f"Link: {item['link']}\n\n"
+                f"Not: Panel tarafında iptali ayrıca kontrol et."
+            )
+            break
+
+    if not found:
+        send_telegram(f"SMM sipariş bulunamadı: {target_id}\n\nMevcut siparişler için: /pending")
+
+    save_state()
 
 
 @app.head("/daily-report")
@@ -785,28 +1264,17 @@ def daily_report_head():
 @app.get("/daily-report")
 def daily_report():
     global LAST_DAILY_REPORT_DATE, DAILY_STATS
-
     now = now_tr()
     today = now.strftime("%Y-%m-%d")
-
     if now.hour != 0:
         return {"ok": True, "message": "Rapor saati değil"}
-
     if LAST_DAILY_REPORT_DATE == today:
         return {"ok": True, "message": "Bugünün raporu zaten gönderildi"}
-
-    report_text = build_sales_report(
-        "Günlük Satış Özeti",
-        DAILY_STATS,
-        "Bugün kayıtlı sipariş yok.",
-    )
-
+    report_text = build_sales_report("Günlük Satış Özeti", DAILY_STATS, "Bugün kayıtlı sipariş yok.")
     send_telegram(report_text)
-
     LAST_DAILY_REPORT_DATE = today
     DAILY_STATS = {}
     save_state()
-
     return {"ok": True, "sent": True}
 
 
@@ -818,28 +1286,17 @@ def weekly_report_head():
 @app.get("/weekly-report")
 def weekly_report():
     global LAST_WEEKLY_REPORT_DATE, WEEKLY_STATS
-
     now = now_tr()
     today = now.strftime("%Y-%m-%d")
-
     if now.weekday() != 0 or now.hour != 0:
         return {"ok": True, "message": "Haftalık rapor saati değil"}
-
     if LAST_WEEKLY_REPORT_DATE == today:
         return {"ok": True, "message": "Bu haftanın raporu zaten gönderildi"}
-
-    report_text = build_sales_report(
-        "Haftalık Satış Raporu",
-        WEEKLY_STATS,
-        "Bu hafta kayıtlı sipariş yok.",
-    )
-
+    report_text = build_sales_report("Haftalık Satış Raporu", WEEKLY_STATS, "Bu hafta kayıtlı sipariş yok.")
     send_telegram(report_text)
-
     LAST_WEEKLY_REPORT_DATE = today
     WEEKLY_STATS = {}
     save_state()
-
     return {"ok": True, "sent": True}
 
 
@@ -851,28 +1308,17 @@ def monthly_report_head():
 @app.get("/monthly-report")
 def monthly_report():
     global LAST_MONTHLY_REPORT_DATE, MONTHLY_STATS
-
     now = now_tr()
     today = now.strftime("%Y-%m-%d")
-
     if now.day != 1 or now.hour != 0:
         return {"ok": True, "message": "Aylık rapor saati değil"}
-
     if LAST_MONTHLY_REPORT_DATE == today:
         return {"ok": True, "message": "Bu ayın raporu zaten gönderildi"}
-
-    report_text = build_sales_report(
-        "Aylık Satış Raporu",
-        MONTHLY_STATS,
-        "Bu ay kayıtlı sipariş yok.",
-    )
-
+    report_text = build_sales_report("Aylık Satış Raporu", MONTHLY_STATS, "Bu ay kayıtlı sipariş yok.")
     send_telegram(report_text)
-
     LAST_MONTHLY_REPORT_DATE = today
     MONTHLY_STATS = {}
     save_state()
-
     return {"ok": True, "sent": True}
 
 
@@ -884,62 +1330,37 @@ def check_services_head():
 @app.get("/check-services")
 def check_services():
     global SERVICE_PRICE_CACHE
-
     changed_count = 0
-
     for advert_id, service in SMM_SERVICE_MAP.items():
         services_data = get_panel_services(service["api_url"], service["api_key"])
-
         if isinstance(services_data, dict) and "error" in services_data:
-            print("SERVICE CHECK ERROR:", services_data, flush=True)
             continue
-
         target_service = None
-
         for item in services_data:
             if str(item.get("service")) == str(service["service_id"]):
                 target_service = item
                 break
-
         if not target_service:
             continue
-
         current_rate = str(target_service.get("rate", ""))
         cache_key = f'{service["panel"]}:{service["service_id"]}'
         old_rate = SERVICE_PRICE_CACHE.get(cache_key)
-
         if old_rate is None:
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             save_state()
             continue
-
         if str(old_rate) != str(current_rate):
+            log("warning", "service_price_changed", panel=service["panel"], service_id=service["service_id"],
+                old=old_rate, new=current_rate)
             send_telegram(
-                f"""
-Servis fiyatı değişti.
-
-Ürün: {service["name"]}
-Panel: {service["panel"]}
-Servis ID: {service["service_id"]}
-
-Eski fiyat: {old_rate}
-Yeni fiyat: {current_rate}
-
-İlan fiyatını ve kâr marjını kontrol et.
-"""
+                f"Servis fiyatı değişti.\n\nÜrün: {service['name']}\nPanel: {service['panel']}\n"
+                f"Eski: {old_rate} → Yeni: {current_rate}\n\nİlan fiyatını kontrol et."
             )
-
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             changed_count += 1
-
     if changed_count:
         save_state()
-
-    return {
-        "ok": True,
-        "changed_count": changed_count,
-        "tracked_services": len(SMM_SERVICE_MAP),
-    }
+    return {"ok": True, "changed_count": changed_count}
 
 
 @app.post("/itemsatis-webhook")
@@ -950,7 +1371,7 @@ async def itemsatis_webhook(request: Request):
         body = await request.body()
         data = {"raw_body": body.decode("utf-8", errors="ignore")}
 
-    print("ITEMSATIS WEBHOOK DATA:", json.dumps(data, ensure_ascii=False), flush=True)
+    log("info", "webhook_received", raw=str(data)[:200])
 
     event = get_event(data)
     order_id = get_order_id(data)
@@ -959,16 +1380,9 @@ async def itemsatis_webhook(request: Request):
     buyer = get_buyer(data)
     price = get_order_price(data)
 
-    ignored_events = {
-        "review_received",
-        "review_created",
-        "message_created",
-        "question_created",
-        "advert_updated",
-    }
-
+    ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
     if event in ignored_events:
-        print("IGNORED EVENT:", event, flush=True)
+        log("info", "webhook_ignored", event=event)
         return {"ignored": True, "event": event}
 
     report_product_name = (
@@ -977,256 +1391,93 @@ async def itemsatis_webhook(request: Request):
         or ("CS2 5 Yıllık Hesap" if advert_id == CS2_ADVERT_ID else "Bilinmeyen Ürün")
     )
 
-    record_itemsatis_sale(
-        data=data,
-        order_id=order_id,
-        advert_id=advert_id,
-        buyer=buyer,
-        product_name=report_product_name,
-        price=price,
-    )
+    record_itemsatis_sale(data=data, order_id=order_id, advert_id=advert_id, buyer=buyer,
+                          product_name=report_product_name, price=price)
+
+    log("info", "sale_received", order_id=order_id, product=report_product_name, buyer=buyer, price=price)
 
     send_telegram(
-        f"""
-Itemsatış webhook geldi.
-
-Event: {event or "Yok"}
-Advert ID: {advert_id or "Yok"}
-Ürün: {report_product_name}
-Sipariş ID: {order_id}
-Müşteri: {buyer}
-Tutar: {price:.2f} TL
-"""
+        f"Itemsatış webhook geldi.\n\nEvent: {event or 'Yok'}\nAdvert ID: {advert_id or 'Yok'}\n"
+        f"Ürün: {report_product_name}\nSipariş ID: {order_id}\nMüşteri: {buyer}\nTutar: {price:.2f} TL"
     )
 
     if advert_id == CS2_ADVERT_ID:
         order_key = make_order_key(order_id, advert_id, buyer)
-
         if order_key in PROCESSED_ORDERS:
             return {"ignored": True, "reason": "duplicate_cs2_order"}
-
         PROCESSED_ORDERS.add(order_key)
         save_state()
-
-        send_telegram(
-            f"""
-Yeni CS2 5 yıllık hesap siparişi geldi.
-
-Sipariş ID: {order_id}
-Advert ID: {advert_id}
-Ürün: {product_name}
-Müşteri: {buyer}
-
-{get_lzt_links()}
-
-Hesabı manuel kontrol edip satın al.
-"""
-        )
-
-        return {
-            "ok": True,
-            "type": "cs2",
-            "order_id": order_id,
-            "advert_id": advert_id,
-        }
+        send_telegram(f"Yeni CS2 5 yıllık hesap siparişi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\n\n{get_lzt_links()}")
+        return {"ok": True, "type": "cs2", "order_id": order_id}
 
     if advert_id in SMM_SERVICE_MAP:
         service = SMM_SERVICE_MAP[advert_id]
-        customer_link = find_instagram_link(data)
+        platform = normalize_text(service.get("platform", "instagram"))
+        customer_link = find_order_link(data, platform)
 
         if not customer_link:
-            add_failed_order(
-                order_id,
-                advert_id,
-                service["name"],
-                "Instagram linki bulunamadı",
-                "Müşteri link alanı bot tarafından algılanamadı.",
-            )
+            add_failed_order(order_id, advert_id, service["name"], "Sipariş linki bulunamadı")
+            notify_customer_order_failed(order_id, service["name"])
+            send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service['name']}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
+            return {"ok": False, "error": "order_link_not_found"}
 
-            send_telegram(
-                f"""
-Instagram siparişi geldi ama müşteri linki bulunamadı.
-
-Itemsatış Sipariş ID: {order_id}
-Advert ID: {advert_id}
-Ürün: {service["name"]}
-Müşteri: {buyer}
-
-Render Logs içindeki ITEMSATIS WEBHOOK DATA kısmını kontrol et.
-"""
-            )
-
-            return {"ok": False, "error": "instagram_link_not_found"}
-
-        normalized_link = normalize_link_for_check(customer_link)
+        normalized_link = normalize_link_for_check(customer_link, platform)
         duplicate_link_key = f"{advert_id}:{normalized_link}"
-        order_key = make_order_key(order_id, advert_id, buyer, customer_link)
+        order_key = make_order_key(order_id, advert_id, buyer, customer_link, platform)
 
         if order_key in PROCESSED_ORDERS:
-            send_telegram(
-                f"""
-Aynı Itemsatış siparişi tekrar geldi.
-
-Sipariş ID: {order_id}
-Advert ID: {advert_id}
-Ürün: {service["name"]}
-
-Tekrar işlem yapılmadı.
-"""
-            )
             return {"ignored": True, "reason": "duplicate_order"}
 
         if duplicate_link_key in PROCESSED_LINKS:
-            send_telegram(
-                f"""
-Aynı Instagram linki aynı ilana tekrar geldi.
-
-Itemsatış Sipariş ID: {order_id}
-Advert ID: {advert_id}
-Ürün: {service["name"]}
-Link: {customer_link}
-
-Bu sipariş panele tekrar girilmedi.
-"""
-            )
             return {"ignored": True, "reason": "duplicate_link"}
 
         balance_data = panel_balance(service["api_url"], service["api_key"])
 
         if "error" in balance_data:
-            add_failed_order(
-                order_id,
-                advert_id,
-                service["name"],
-                "Panel bakiyesi alınamadı",
-                balance_data.get("error", ""),
-            )
-
-            send_telegram(
-                f"""
-Instagram siparişi geldi ama panel bakiyesi alınamadığı için panele girilmedi.
-
-Itemsatış Sipariş ID: {order_id}
-Advert ID: {advert_id}
-Ürün: {service["name"]}
-Panel: {service["panel"]}
-Link: {customer_link}
-
-Hata: {balance_data.get("error")}
-"""
-            )
-
+            add_failed_order(order_id, advert_id, service["name"], "Panel bakiyesi alınamadı", balance_data.get("error"))
+            notify_customer_order_failed(order_id, service["name"])
+            send_telegram(f"Panel bakiyesi alınamadı.\n\nSipariş ID: {order_id}\nHata: {balance_data.get('error')}")
             return {"ok": False, "error": "balance_failed"}
 
         balance = balance_data.get("balance", "Bilinmiyor")
         currency = balance_data.get("currency", "")
-
         check_low_balance(balance, currency, service["panel"])
 
-        smm_result = create_panel_order(
-            service["api_url"],
-            service["api_key"],
-            service["service_id"],
-            customer_link,
-            service["quantity"],
-        )
+        smm_result = create_panel_order(service["api_url"], service["api_key"],
+                                        service["service_id"], customer_link, service["quantity"])
 
         if "error" in smm_result:
-            add_failed_order(
-                order_id,
-                advert_id,
-                service["name"],
-                "Panel sipariş hatası",
-                smm_result.get("error", smm_result),
-            )
-
-            send_telegram(
-                f"""
-Instagram siparişi panele girilemedi.
-
-Itemsatış Sipariş ID: {order_id}
-Advert ID: {advert_id}
-Ürün: {service["name"]}
-Panel: {service["panel"]}
-Müşteri: {buyer}
-Link: {customer_link}
-
-Panel Hatası: {smm_result.get("error")}
-Bakiye: {balance} {currency}
-"""
-            )
-
-            return {
-                "ok": False,
-                "error": "panel_order_error",
-                "detail": smm_result,
-            }
+            add_failed_order(order_id, advert_id, service["name"], "Panel sipariş hatası", smm_result.get("error"))
+            notify_customer_order_failed(order_id, service["name"])
+            send_telegram(f"Panel siparişi başarısız.\n\nSipariş ID: {order_id}\nHata: {smm_result.get('error')}")
+            return {"ok": False, "error": "panel_order_error"}
 
         smm_order_id = smm_result.get("order", "Bilinmiyor")
 
         PROCESSED_LINKS.add(duplicate_link_key)
         PROCESSED_ORDERS.add(order_key)
-
-
-        add_pending_order(
-            order_id,
-            advert_id,
-            service["name"],
-            service["panel"],
-            service["api_url"],
-            service["api_key"],
-            smm_order_id,
-            customer_link,
-        )
-
+        add_pending_order(order_id, advert_id, service["name"], service["panel"],
+                          service["api_url"], service["api_key"], smm_order_id, customer_link)
         save_state()
 
+        # YENİ: Müşteriye sipariş başladı bildirimi
+        notify_customer_order_started(order_id, service["name"], customer_link)
+
         send_telegram(
-            f"""
-Instagram siparişi panele girildi.
-
-Ürün: {service["name"]}
-Panel: {service["panel"]}
-Itemsatış Sipariş ID: {order_id}
-Advert ID: {advert_id}
-SMM Sipariş ID: {smm_order_id}
-Müşteri: {buyer}
-Link: {customer_link}
-Adet: {service["quantity"]}
-
-Bakiye: {balance} {currency}
-"""
+            f"SMM siparişi panele girildi.\n\nÜrün: {service['name']}\nPanel: {service['panel']}\n"
+            f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
+            f"Adet: {service['quantity']}\nBakiye: {balance} {currency}"
         )
 
-        return {
-            "ok": True,
-            "type": "instagram_smm",
-            "itemsatis_order_id": order_id,
-            "advert_id": advert_id,
-            "panel": service["panel"],
-            "smm_order_id": smm_order_id,
-            "instagram_link": customer_link,
-            "quantity": service["quantity"],
-            "balance": balance,
-            "currency": currency,
-        }
+        return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
 
-    print("IGNORED PRODUCT:", product_name, "ADVERT ID:", advert_id, flush=True)
-
-    return {
-        "ignored": True,
-        "product": product_name,
-        "advert_id": advert_id,
-        "event": event,
-    }
+    log("info", "webhook_unmatched", advert_id=advert_id, product=product_name)
+    return {"ignored": True, "product": product_name, "advert_id": advert_id}
 
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
-
-    print("TELEGRAM WEBHOOK DATA:", json.dumps(data, ensure_ascii=False), flush=True)
-
     message = data.get("message", {})
     text = message.get("text", "").strip()
     chat = message.get("chat", {})
@@ -1235,208 +1486,107 @@ async def telegram_webhook(request: Request):
     if chat_id != str(CHAT_ID):
         return {"ignored": True, "reason": "unauthorized_chat"}
 
+    log("info", "telegram_command", command=text[:50])
+
     if text in ["/start", "/help"]:
         send_telegram(
-            """
-Bot komutları:
-
-/balance - SMMRush bakiyesini gösterir
-/medyabalance - MedyaBayim bakiyesini gösterir
-/status - Bot durumunu gösterir
-/health - Genel sistem durumunu gösterir
-/failed - Başarısız siparişleri gösterir
-/pending - Takip edilen siparişleri gösterir
-/report - Bugünkü sipariş özetini gösterir
-/week-report - Haftalık sipariş özetini gösterir
-/month-report - Aylık sipariş özetini gösterir
-/report-all - Bugün + hafta + ay özetini gösterir
-/reset-report - Bugünkü raporu sıfırlar
-/reset-all-reports - Tüm raporları ve kayıtlı satış anahtarlarını sıfırlar
-/help - Komutları gösterir
-"""
+            "Bot komutları:\n\n"
+            "/balance - SMMRush bakiyesi\n"
+            "/medyabalance - MedyaBayim bakiyesi\n"
+            "/status - Bot durumu\n"
+            "/health - Sistem durumu\n"
+            "/failed - Başarısız siparişler\n"
+            "/pending - Bekleyen siparişler\n"
+            "/cancel <smm_id> - Siparişi iptal et\n"
+            "/report - Bugünkü özet\n"
+            "/week-report - Haftalık özet\n"
+            "/month-report - Aylık özet\n"
+            "/report-all - Tüm özetler\n"
+            "/reset-report - Günlük raporu sıfırla\n"
+            "/reset-all-reports - Tüm raporları sıfırla\n"
+            "/help - Komutları gösterir"
         )
         return {"ok": True}
 
     if text == "/status":
-        send_telegram(
-            """
-Bot aktif çalışıyor.
-
-Render: Aktif
-Telegram: Aktif
-Itemsatış Webhook: Aktif
-SMM Paneller: Aktif
-Redis: Aktif
-"""
-        )
+        send_telegram("Bot aktif çalışıyor.\n\nRender: Aktif\nTelegram: Aktif\nItemsatış Webhook: Aktif")
         return {"ok": True}
 
     if text == "/balance":
         balance_data = panel_balance(SMM_API_URL, SMM_API_KEY)
-
         if "error" in balance_data:
-            send_telegram(f"SMMRush bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
-            return {"ok": False}
-
-        send_telegram(
-            f"""
-SMMRush Panel Bakiyesi:
-
-Bakiye: {balance_data.get("balance", "Bilinmiyor")} {balance_data.get("currency", "")}
-"""
-        )
+            send_telegram(f"SMMRush bakiye alınamadı.\nHata: {balance_data.get('error')}")
+        else:
+            send_telegram(f"SMMRush Bakiyesi:\n{balance_data.get('balance')} {balance_data.get('currency', '')}")
         return {"ok": True}
 
     if text == "/medyabalance":
         balance_data = panel_balance(MEDYABAYIM_API_URL, MEDYABAYIM_API_KEY)
-
         if "error" in balance_data:
-            send_telegram(f"MedyaBayim bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
-            return {"ok": False}
-
-        send_telegram(
-            f"""
-MedyaBayim Panel Bakiyesi:
-
-Bakiye: {balance_data.get("balance", "Bilinmiyor")} {balance_data.get("currency", "")}
-"""
-        )
+            send_telegram(f"MedyaBayim bakiye alınamadı.\nHata: {balance_data.get('error')}")
+        else:
+            send_telegram(f"MedyaBayim Bakiyesi:\n{balance_data.get('balance')} {balance_data.get('currency', '')}")
         return {"ok": True}
 
     if text == "/health":
-        main_balance = panel_balance(SMM_API_URL, SMM_API_KEY)
-        medya_balance = panel_balance(MEDYABAYIM_API_URL, MEDYABAYIM_API_KEY)
-
-        main_text = (
-            f"SMMRush: Hatalı - {main_balance.get('error')}"
-            if "error" in main_balance
-            else f"SMMRush: Aktif - {main_balance.get('balance')} {main_balance.get('currency', '')}"
-        )
-
-        medya_text = (
-            f"MedyaBayim: Hatalı - {medya_balance.get('error')}"
-            if "error" in medya_balance
-            else f"MedyaBayim: Aktif - {medya_balance.get('balance')} {medya_balance.get('currency', '')}"
-        )
-
-        redis_text = "Redis: Aktif" if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN else "Redis: Eksik"
-
-        send_telegram(
-            f"""
-Sistem Durumu
-
-Bot: Aktif
-Telegram: Aktif
-Render: Aktif
-{redis_text}
-{main_text}
-{medya_text}
-
-Başarısız sipariş kaydı: {len(FAILED_ORDERS)}
-Takip edilen sipariş: {len(PENDING_ORDERS)}
-"""
-        )
+        main_b = panel_balance(SMM_API_URL, SMM_API_KEY)
+        medya_b = panel_balance(MEDYABAYIM_API_URL, MEDYABAYIM_API_KEY)
+        main_t = f"SMMRush: Hatalı - {main_b.get('error')}" if "error" in main_b else f"SMMRush: Aktif - {main_b.get('balance')} {main_b.get('currency', '')}"
+        medya_t = f"MedyaBayim: Hatalı - {medya_b.get('error')}" if "error" in medya_b else f"MedyaBayim: Aktif - {medya_b.get('balance')} {medya_b.get('currency', '')}"
+        redis_t = "Redis: Aktif" if UPSTASH_REDIS_REST_URL else "Redis: Eksik"
+        send_telegram(f"Sistem Durumu\n\nBot: Aktif\n{redis_t}\n{main_t}\n{medya_t}\n\nBaşarısız: {len(FAILED_ORDERS)}\nBekleyen: {len(PENDING_ORDERS)}")
         return {"ok": True}
 
     if text == "/failed":
         if not FAILED_ORDERS:
-            send_telegram("Başarısız sipariş kaydı yok.")
+            send_telegram("Başarısız sipariş yok.")
             return {"ok": True}
-
         lines = ["Başarısız Siparişler:\n"]
-
         for item in FAILED_ORDERS[-10:]:
-            lines.append(
-                f"""
-Sipariş ID: {item["order_id"]}
-Advert ID: {item["advert_id"]}
-Ürün: {item["product_name"]}
-Sebep: {item["reason"]}
-Detay: {item["detail"]}
-"""
-            )
-
+            lines.append(f"ID: {item['order_id']}\nÜrün: {item['product_name']}\nSebep: {item['reason']}\n")
         send_telegram("\n".join(lines))
         return {"ok": True}
 
     if text == "/pending":
         if not PENDING_ORDERS:
-            send_telegram("Takip edilen sipariş yok.")
+            send_telegram("Bekleyen sipariş yok.")
             return {"ok": True}
-
-        lines = ["Takip Edilen Siparişler:\n"]
-
+        lines = ["Bekleyen Siparişler:\n"]
         for item in PENDING_ORDERS[-10:]:
             created_at = int(item.get("created_at", 0))
             waited_minutes = int((time.time() - created_at) / 60) if created_at else 0
-
-            lines.append(
-                f"""
-Ürün: {item["product_name"]}
-Panel: {item["panel"]}
-Itemsatış ID: {item["itemsatis_order_id"]}
-SMM ID: {item["smm_order_id"]}
-Bekleme: {waited_minutes} dakika
-Link: {item["link"]}
-"""
-            )
-
+            cancelled = " [İPTAL EDİLDİ]" if item.get("cancelled") else ""
+            lines.append(f"Ürün: {item['product_name']}{cancelled}\nSMM ID: {item['smm_order_id']}\nBekleme: {waited_minutes}dk\nLink: {item['link']}\n")
         send_telegram("\n".join(lines))
         return {"ok": True}
 
-    if text == "/report":
-        report_text = build_sales_report(
-            "Bugünkü Sipariş Özeti",
-            DAILY_STATS,
-            "Bugün kayıtlı sipariş yok.",
-        )
+    # YENİ: /cancel komutu
+    if text.startswith("/cancel"):
+        handle_cancel_command(text)
+        return {"ok": True}
 
-        send_telegram(report_text)
+    if text == "/report":
+        send_telegram(build_sales_report("Bugünkü Sipariş Özeti", DAILY_STATS, "Bugün sipariş yok."))
         return {"ok": True}
 
     if text == "/week-report":
-        report_text = build_sales_report(
-            "Haftalık Sipariş Özeti",
-            WEEKLY_STATS,
-            "Bu hafta kayıtlı sipariş yok.",
-        )
-
-        send_telegram(report_text)
+        send_telegram(build_sales_report("Haftalık Özet", WEEKLY_STATS, "Bu hafta sipariş yok."))
         return {"ok": True}
 
     if text == "/month-report":
-        report_text = build_sales_report(
-            "Aylık Sipariş Özeti",
-            MONTHLY_STATS,
-            "Bu ay kayıtlı sipariş yok.",
-        )
-
-        send_telegram(report_text)
+        send_telegram(build_sales_report("Aylık Özet", MONTHLY_STATS, "Bu ay sipariş yok."))
         return {"ok": True}
 
     if text == "/report-all":
-        daily_text = build_sales_report(
-            "Bugünkü Sipariş Özeti",
-            DAILY_STATS,
-            "Bugün kayıtlı sipariş yok.",
-        )
-        weekly_text = build_sales_report(
-            "Haftalık Sipariş Özeti",
-            WEEKLY_STATS,
-            "Bu hafta kayıtlı sipariş yok.",
-        )
-        monthly_text = build_sales_report(
-            "Aylık Sipariş Özeti",
-            MONTHLY_STATS,
-            "Bu ay kayıtlı sipariş yok.",
-        )
-
-        send_telegram(daily_text + "\n\n--------------------\n\n" + weekly_text + "\n\n--------------------\n\n" + monthly_text)
+        daily = build_sales_report("Bugünkü Özet", DAILY_STATS, "Bugün sipariş yok.")
+        weekly = build_sales_report("Haftalık Özet", WEEKLY_STATS, "Bu hafta sipariş yok.")
+        monthly = build_sales_report("Aylık Özet", MONTHLY_STATS, "Bu ay sipariş yok.")
+        send_telegram(daily + "\n\n---\n\n" + weekly + "\n\n---\n\n" + monthly)
         return {"ok": True}
 
     if text == "/reset-report":
         reset_sales_stats("daily")
-        send_telegram("Bugünkü rapor sıfırlandı.")
+        send_telegram("Günlük rapor sıfırlandı.")
         return {"ok": True}
 
     if text == "/reset-week-report":
@@ -1451,8 +1601,8 @@ Link: {item["link"]}
 
     if text == "/reset-all-reports":
         reset_sales_stats("all")
-        send_telegram("Tüm raporlar ve kayıtlı satış anahtarları sıfırlandı.")
+        send_telegram("Tüm raporlar sıfırlandı.")
         return {"ok": True}
 
-    send_telegram("Bilinmeyen komut. Komutları görmek için: /help")
+    send_telegram("Bilinmeyen komut. /help ile komutları gör.")
     return {"ok": True}
