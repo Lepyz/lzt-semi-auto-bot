@@ -31,11 +31,13 @@ RECORDED_SALES = set()
 
 SMM_API_URL = os.getenv("SMM_API_URL", "https://smmrush.com/api/v2")
 SMM_API_KEY = os.getenv("SMM_API_KEY", "")
-INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
-
 MEDYABAYIM_API_URL = os.getenv("MEDYABAYIM_API_URL", "https://medyabayim.com/api/v2")
 MEDYABAYIM_API_KEY = os.getenv("MEDYABAYIM_API_KEY", "")
-MEDYABAYIM_100_TURK_SERVICE_ID = os.getenv("MEDYABAYIM_100_TURK_SERVICE_ID", "13743")
+LIONFOLLOW_API_URL = os.getenv("LIONFOLLOW_API_URL", "https://lionfollow.com/api/v2")
+LIONFOLLOW_API_KEY = os.getenv("LIONFOLLOW_API_KEY", "")
+
+MORETHANPANEL_API_URL = os.getenv("MORETHANPANEL_API_URL", "https://morethanpanel.com/api/v2")
+MORETHANPANEL_API_KEY = os.getenv("MORETHANPANEL_API_KEY", "")
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
@@ -46,38 +48,95 @@ ITEMSATIS_API_URL = "https://itemsatis.com/api"
 
 CS2_ADVERT_ID = "5282114"
 
-SMM_SERVICE_MAP = {
-    "5098093": {
-        "name": "Instagram 1000 Normal Takipçi",
-        "panel": "SMMRush",
+PANEL_MAP = {
+    "smmrush": {
+        "name": "SMMRush",
         "api_url": SMM_API_URL,
         "api_key": SMM_API_KEY,
-        "service_id": INSTAGRAM_1000_SERVICE_ID,
+    },
+    "medyabayim": {
+        "name": "MedyaBayim",
+        "api_url": MEDYABAYIM_API_URL,
+        "api_key": MEDYABAYIM_API_KEY,
+    },
+    "lionfollow": {
+        "name": "LionFollow",
+        "api_url": LIONFOLLOW_API_URL,
+        "api_key": LIONFOLLOW_API_KEY,
+    },
+    "morethanpanel": {
+        "name": "MoreThanPanel",
+        "api_url": MORETHANPANEL_API_URL,
+        "api_key": MORETHANPANEL_API_KEY,
+    },
+
+    # 3-4 yeni panel eklemek için Render Environment içine şunları koy:
+    # PANEL3_NAME, PANEL3_API_URL, PANEL3_API_KEY
+    # PANEL4_NAME, PANEL4_API_URL, PANEL4_API_KEY
+    # PANEL5_NAME, PANEL5_API_URL, PANEL5_API_KEY
+    # PANEL6_NAME, PANEL6_API_URL, PANEL6_API_KEY
+    "panel3": {
+        "name": os.getenv("PANEL3_NAME", "Panel 3"),
+        "api_url": os.getenv("PANEL3_API_URL", ""),
+        "api_key": os.getenv("PANEL3_API_KEY", ""),
+    },
+    "panel4": {
+        "name": os.getenv("PANEL4_NAME", "Panel 4"),
+        "api_url": os.getenv("PANEL4_API_URL", ""),
+        "api_key": os.getenv("PANEL4_API_KEY", ""),
+    },
+    "panel5": {
+        "name": os.getenv("PANEL5_NAME", "Panel 5"),
+        "api_url": os.getenv("PANEL5_API_URL", ""),
+        "api_key": os.getenv("PANEL5_API_KEY", ""),
+    },
+    "panel6": {
+        "name": os.getenv("PANEL6_NAME", "Panel 6"),
+        "api_url": os.getenv("PANEL6_API_URL", ""),
+        "api_key": os.getenv("PANEL6_API_KEY", ""),
+    },
+}
+
+PANEL_ALIASES = {
+    "smmrush": "smmrush",
+    "smm": "smmrush",
+    "medyabayim": "medyabayim",
+    "medya": "medyabayim",
+    "lionfollow": "lionfollow",
+    "lion": "lionfollow",
+    "lf": "lionfollow",
+    "morethanpanel": "morethanpanel",
+    "morethan": "morethanpanel",
+    "mtp": "morethanpanel",
+    "panel3": "panel3",
+    "panel4": "panel4",
+    "panel5": "panel5",
+    "panel6": "panel6",
+}
+
+SMM_SERVICE_MAP = {
+    "5098093": {
+        "panel": "smmrush",
+        "service_id": "63",
         "quantity": 1000,
         "platform": "instagram",
     },
     "5191839": {
-        "name": "Instagram 100 Türk Takipçi",
-        "panel": "MedyaBayim",
-        "api_url": MEDYABAYIM_API_URL,
-        "api_key": MEDYABAYIM_API_KEY,
-        "service_id": MEDYABAYIM_100_TURK_SERVICE_ID,
+        "panel": "medyabayim",
+        "service_id": "13743",
         "quantity": 90,
         "platform": "instagram",
     },
 
-    # Yeni ilan ekleme örneği:
+    # Servisleri sonra buraya ekleyeceğiz.
+    # Örnek:
     # "ITEMSATIS_ILAN_ID": {
-    #     "name": "TikTok Fenomen Paket",
-    #     "panel": "SMMRush",
-    #     "api_url": SMM_API_URL,
-    #     "api_key": SMM_API_KEY,
+    #     "panel": "panel3",  # smmrush / medyabayim / panel3 / panel4 / panel5 / panel6
     #     "service_id": "PANEL_SERVIS_ID",
     #     "quantity": 1000,
     #     "platform": "tiktok",
     # },
 }
-
 
 PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
@@ -90,6 +149,8 @@ WEEKLY_STATS = {}
 MONTHLY_STATS = {}
 LAST_WEEKLY_REPORT_DATE = ""
 LAST_MONTHLY_REPORT_DATE = ""
+PRODUCT_NAME_CACHE = {}
+PANEL_SERVICE_NAME_CACHE = {}
 
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
 LOG_HISTORY = []
@@ -255,7 +316,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -270,6 +331,8 @@ def load_state():
     LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
     LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
     LOG_HISTORY = redis_get_json("log_history", [])
+    PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
+    PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
@@ -287,6 +350,8 @@ def save_state():
     redis_set_json("monthly_stats", MONTHLY_STATS)
     redis_set_json("last_weekly_report_date", LAST_WEEKLY_REPORT_DATE)
     redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
+    redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
+    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -560,8 +625,55 @@ def get_advert_id(data: dict) -> str:
 
 
 def get_product_name(data: dict) -> str:
-    return str(get_nested(data, "product_name", "product", "advert.title", "advert.name",
-                          "details.advert.title", "data.advert.title", "title") or "").strip()
+    """Itemsatış ilan adını mümkün olan tüm alanlardan yakalar."""
+    value = get_nested(
+        data,
+        "product_name", "product", "product.title", "product.name",
+        "title", "name",
+        "advert.title", "advert.name", "advert.subject",
+        "details.advert.title", "details.advert.name", "details.advert.subject",
+        "data.advert.title", "data.advert.name", "data.advert.subject",
+        "details.product_name", "details.product", "details.product.title", "details.product.name",
+        "data.product_name", "data.product", "data.product.title", "data.product.name",
+        "order.product_name", "order.product", "order.advert.title", "order.advert.name",
+        "purchase.product_name", "purchase.product", "purchase.advert.title", "purchase.advert.name",
+    )
+
+    if isinstance(value, dict):
+        value = value.get("title") or value.get("name") or value.get("subject") or ""
+
+    return str(value or "").strip()
+
+
+def cache_itemsatis_product_name(advert_id: str, product_name: str):
+    """Webhook ile gelen ilan adını kaydeder; raporlarda Itemsatış ilan adı kullanılmasını sağlar."""
+    global PRODUCT_NAME_CACHE
+    advert_id = str(advert_id or "").strip()
+    product_name = str(product_name or "").strip()
+    if advert_id and product_name:
+        PRODUCT_NAME_CACHE[advert_id] = product_name
+        redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
+    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+
+
+def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
+    """Günlük/haftalık/aylık rapor için sadece Itemsatış ilan adını önceliklendirir."""
+    product_name = str(product_name or "").strip()
+    if product_name:
+        cache_itemsatis_product_name(advert_id, product_name)
+        return product_name
+
+    cached_name = str(PRODUCT_NAME_CACHE.get(str(advert_id or ""), "")).strip()
+    if cached_name:
+        return cached_name
+
+    if str(advert_id or "") == CS2_ADVERT_ID:
+        return "CS2 5 Yıllık Hesap"
+
+    if advert_id:
+        return f"Itemsatış İlanı {advert_id}"
+
+    return "Bilinmeyen Ürün"
 
 
 def get_buyer(data: dict) -> str:
@@ -678,6 +790,179 @@ def find_order_link(data: dict, platform: str = "") -> str:
 def find_instagram_link(data: dict) -> str:
     return find_order_link(data, "instagram")
 
+def normalize_panel_key(panel_key: str) -> str:
+    key = normalize_text(panel_key).replace(" ", "").replace("-", "")
+    return PANEL_ALIASES.get(key, key)
+
+
+def get_panel_config(panel_key: str) -> dict:
+    key = normalize_panel_key(panel_key)
+    panel = PANEL_MAP.get(key, {})
+    return {
+        "key": key,
+        "name": panel.get("name", key or "Bilinmeyen Panel"),
+        "api_url": panel.get("api_url", ""),
+        "api_key": panel.get("api_key", ""),
+    }
+
+
+def get_service_config(service_or_advert_id) -> dict:
+    if isinstance(service_or_advert_id, str):
+        raw_service = SMM_SERVICE_MAP.get(service_or_advert_id, {})
+    else:
+        raw_service = service_or_advert_id or {}
+
+    service = dict(raw_service)
+    panel_key = normalize_panel_key(service.get("panel_key") or service.get("panel") or "")
+    panel = get_panel_config(panel_key)
+
+    service["panel_key"] = panel_key
+    service["panel"] = panel["name"]
+    service["api_url"] = service.get("api_url") or panel["api_url"]
+    service["api_key"] = service.get("api_key") or panel["api_key"]
+    service["platform"] = normalize_text(service.get("platform", "instagram")) or "general"
+    return service
+
+
+def get_service_name(service: dict, advert_id: str = "", product_name: str = "") -> str:
+    """Öncelik Itemsatış ilan adı. SMM_SERVICE_MAP içinde name zorunlu değil."""
+    name = str(product_name or "").strip()
+    if name:
+        return name
+    name = str((service or {}).get("name") or "").strip()
+    if name:
+        return name
+    if str(advert_id or "") == CS2_ADVERT_ID:
+        return "CS2 5 Yıllık Hesap"
+    if advert_id:
+        return f"Itemsatış İlanı {advert_id}"
+    return "Bilinmeyen Ürün"
+
+
+def extract_panel_service_name(service_item: dict) -> str:
+    """Panelin services cevabından servis adını yakalar."""
+    if not isinstance(service_item, dict):
+        return ""
+
+    for key in ["name", "service_name", "title", "service_title", "description"]:
+        value = service_item.get(key)
+        if value not in [None, ""]:
+            return str(value).strip()
+
+    return ""
+
+
+def make_panel_service_cache_key(panel_key: str, service_id: str) -> str:
+    return f"{normalize_panel_key(panel_key)}:{str(service_id or '').strip()}"
+
+
+def cache_panel_service_name(panel_key: str, service_id: str, service_name: str):
+    """Panel servis ID -> panel servis adı eşleşmesini Redis'e kaydeder."""
+    global PANEL_SERVICE_NAME_CACHE
+    service_name = str(service_name or "").strip()
+    service_id = str(service_id or "").strip()
+    if not service_id or not service_name:
+        return
+
+    cache_key = make_panel_service_cache_key(panel_key, service_id)
+    PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
+    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+
+
+def get_cached_panel_service_name(panel_key: str, service_id: str) -> str:
+    cache_key = make_panel_service_cache_key(panel_key, service_id)
+    return str(PANEL_SERVICE_NAME_CACHE.get(cache_key, "")).strip()
+
+
+def get_panel_service_display_name(service: dict, target_service: dict = None) -> str:
+    """Fiyat/servis kontrollerinde Itemsatış adı yerine paneldeki gerçek servis adını gösterir."""
+    panel_key = (service or {}).get("panel_key") or (service or {}).get("panel") or ""
+    service_id = str((service or {}).get("service_id") or "").strip()
+
+    panel_service_name = extract_panel_service_name(target_service or {})
+    if panel_service_name:
+        cache_panel_service_name(panel_key, service_id, panel_service_name)
+        return panel_service_name
+
+    cached_name = get_cached_panel_service_name(panel_key, service_id)
+    if cached_name:
+        return cached_name
+
+    if service_id:
+        return f"Panel Servisi {service_id}"
+
+    return "Bilinmeyen Panel Servisi"
+
+
+def is_panel_configured(panel_key: str) -> bool:
+    panel = get_panel_config(panel_key)
+    return bool(panel.get("api_url") and panel.get("api_key"))
+
+
+def panel_status_line(panel_key: str) -> str:
+    panel = get_panel_config(panel_key)
+    configured = "Aktif" if is_panel_configured(panel_key) else "Eksik"
+    api_url = panel.get("api_url") or "API URL yok"
+    return f"{panel['key']} | {panel['name']} | {configured} | {api_url}"
+
+
+def build_panels_list_text() -> str:
+    lines = ["Ekli Paneller:\n"]
+    for key in PANEL_MAP.keys():
+        lines.append(panel_status_line(key))
+    lines.append("\nBakiye için: /balance paneladi")
+    lines.append("Örnek: /balance lionfollow")
+    lines.append("Tüm bakiyeler: /balance-all")
+    return "\n".join(lines)
+
+
+def build_all_panel_balances_text() -> str:
+    lines = ["Panel Bakiyeleri:\n"]
+    for key in PANEL_MAP.keys():
+        panel = get_panel_config(key)
+        if not is_panel_configured(key):
+            lines.append(f"{panel['name']}: Eksik env")
+            continue
+        balance_data = panel_balance(panel["api_url"], panel["api_key"])
+        if "error" in balance_data:
+            lines.append(f"{panel['name']}: Hatalı - {balance_data.get('error')}")
+        else:
+            lines.append(f"{panel['name']}: {balance_data.get('balance', 'Bilinmiyor')} {balance_data.get('currency', '')}")
+    return "\n".join(lines)
+
+
+def handle_panel_balance_command(text: str):
+    parts = text.strip().split(maxsplit=1)
+    panel_key = "all" if len(parts) == 1 else parts[1].strip()
+
+    if normalize_text(panel_key) in ["all", "hepsi", "tümü", "tum"]:
+        send_telegram(build_all_panel_balances_text())
+        return
+
+    panel = get_panel_config(panel_key)
+    if panel["key"] not in PANEL_MAP:
+        send_telegram(f"Panel bulunamadı: {panel_key}\n\nPanelleri görmek için: /panels")
+        return
+
+    if not is_panel_configured(panel["key"]):
+        send_telegram(
+            f"{panel['name']} panel bilgileri eksik.\n\n"
+            f"Render Environment içine API URL ve API KEY eklenmeli.\n"
+            f"Panelleri görmek için: /panels"
+        )
+        return
+
+    balance_data = panel_balance(panel["api_url"], panel["api_key"])
+    if "error" in balance_data:
+        send_telegram(f"{panel['name']} bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
+        return
+
+    send_telegram(
+        f"{panel['name']} Bakiyesi:\n\n"
+        f"Bakiye: {balance_data.get('balance', 'Bilinmiyor')} {balance_data.get('currency', '')}"
+    )
+
+
 def panel_balance(api_url, api_key):
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
@@ -752,7 +1037,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SMM Bot Dashboard</title>
+<title>Boostera SMM Dashboard</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
 
@@ -980,7 +1265,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 
 <header>
-  <div class="logo">SMM<span>Bot</span> Dashboard</div>
+  <div class="logo">Boostera <span>SMM</span></div>
   <div style="display:flex;align-items:center;gap:16px">
     <span class="last-updated" id="lastUpdated">—</span>
     <button class="refresh-btn" onclick="loadAll()">↻ Yenile</button>
@@ -1331,7 +1616,13 @@ def check_services_head():
 def check_services():
     global SERVICE_PRICE_CACHE
     changed_count = 0
-    for advert_id, service in SMM_SERVICE_MAP.items():
+    for advert_id, raw_service in SMM_SERVICE_MAP.items():
+        service = get_service_config(raw_service)
+
+        if not service.get("api_url") or not service.get("api_key"):
+            log("warning", "service_panel_missing", advert_id=advert_id, panel=service.get("panel_key"))
+            continue
+
         services_data = get_panel_services(service["api_url"], service["api_key"])
         if isinstance(services_data, dict) and "error" in services_data:
             continue
@@ -1342,19 +1633,23 @@ def check_services():
                 break
         if not target_service:
             continue
+
+        panel_service_name = get_panel_service_display_name(service, target_service)
         current_rate = str(target_service.get("rate", ""))
-        cache_key = f'{service["panel"]}:{service["service_id"]}'
+        cache_key = f'{service["panel_key"]}:{service["service_id"]}'
         old_rate = SERVICE_PRICE_CACHE.get(cache_key)
         if old_rate is None:
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             save_state()
             continue
         if str(old_rate) != str(current_rate):
+            panel_service_name = get_panel_service_display_name(service, target_service)
             log("warning", "service_price_changed", panel=service["panel"], service_id=service["service_id"],
-                old=old_rate, new=current_rate)
+                service_name=panel_service_name, old=old_rate, new=current_rate)
             send_telegram(
-                f"Servis fiyatı değişti.\n\nÜrün: {service['name']}\nPanel: {service['panel']}\n"
-                f"Eski: {old_rate} → Yeni: {current_rate}\n\nİlan fiyatını kontrol et."
+                f"Servis fiyatı değişti.\n\nPanel Servisi: {panel_service_name}\nPanel: {service['panel']}\n"
+                f"Servis ID: {service['service_id']}\nEski: {old_rate} → Yeni: {current_rate}\n\n"
+                f"Bu servis ID'sini kullanan Itemsatış ilanlarını kontrol et."
             )
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             changed_count += 1
@@ -1385,11 +1680,7 @@ async def itemsatis_webhook(request: Request):
         log("info", "webhook_ignored", event=event)
         return {"ignored": True, "event": event}
 
-    report_product_name = (
-        product_name
-        or SMM_SERVICE_MAP.get(advert_id, {}).get("name")
-        or ("CS2 5 Yıllık Hesap" if advert_id == CS2_ADVERT_ID else "Bilinmeyen Ürün")
-    )
+    report_product_name = get_itemsatis_report_name(advert_id, product_name)
 
     record_itemsatis_sale(data=data, order_id=order_id, advert_id=advert_id, buyer=buyer,
                           product_name=report_product_name, price=price)
@@ -1411,14 +1702,15 @@ async def itemsatis_webhook(request: Request):
         return {"ok": True, "type": "cs2", "order_id": order_id}
 
     if advert_id in SMM_SERVICE_MAP:
-        service = SMM_SERVICE_MAP[advert_id]
+        service = get_service_config(SMM_SERVICE_MAP[advert_id])
+        service_name = get_itemsatis_report_name(advert_id, product_name)
         platform = normalize_text(service.get("platform", "instagram"))
         customer_link = find_order_link(data, platform)
 
         if not customer_link:
-            add_failed_order(order_id, advert_id, service["name"], "Sipariş linki bulunamadı")
-            notify_customer_order_failed(order_id, service["name"])
-            send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service['name']}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
+            add_failed_order(order_id, advert_id, service_name, "Sipariş linki bulunamadı")
+            notify_customer_order_failed(order_id, service_name)
+            send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
             return {"ok": False, "error": "order_link_not_found"}
 
         normalized_link = normalize_link_for_check(customer_link, platform)
@@ -1431,11 +1723,16 @@ async def itemsatis_webhook(request: Request):
         if duplicate_link_key in PROCESSED_LINKS:
             return {"ignored": True, "reason": "duplicate_link"}
 
+        if not service.get("api_url") or not service.get("api_key"):
+            add_failed_order(order_id, advert_id, service_name, "Panel bilgileri eksik", service.get("panel_key", ""))
+            send_telegram(f"Panel bilgileri eksik.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPanel: {service['panel']}\n\nRender Environment ayarlarını kontrol et.")
+            return {"ok": False, "error": "panel_config_missing"}
+
         balance_data = panel_balance(service["api_url"], service["api_key"])
 
         if "error" in balance_data:
-            add_failed_order(order_id, advert_id, service["name"], "Panel bakiyesi alınamadı", balance_data.get("error"))
-            notify_customer_order_failed(order_id, service["name"])
+            add_failed_order(order_id, advert_id, service_name, "Panel bakiyesi alınamadı", balance_data.get("error"))
+            notify_customer_order_failed(order_id, service_name)
             send_telegram(f"Panel bakiyesi alınamadı.\n\nSipariş ID: {order_id}\nHata: {balance_data.get('error')}")
             return {"ok": False, "error": "balance_failed"}
 
@@ -1447,8 +1744,8 @@ async def itemsatis_webhook(request: Request):
                                         service["service_id"], customer_link, service["quantity"])
 
         if "error" in smm_result:
-            add_failed_order(order_id, advert_id, service["name"], "Panel sipariş hatası", smm_result.get("error"))
-            notify_customer_order_failed(order_id, service["name"])
+            add_failed_order(order_id, advert_id, service_name, "Panel sipariş hatası", smm_result.get("error"))
+            notify_customer_order_failed(order_id, service_name)
             send_telegram(f"Panel siparişi başarısız.\n\nSipariş ID: {order_id}\nHata: {smm_result.get('error')}")
             return {"ok": False, "error": "panel_order_error"}
 
@@ -1456,15 +1753,15 @@ async def itemsatis_webhook(request: Request):
 
         PROCESSED_LINKS.add(duplicate_link_key)
         PROCESSED_ORDERS.add(order_key)
-        add_pending_order(order_id, advert_id, service["name"], service["panel"],
+        add_pending_order(order_id, advert_id, service_name, service["panel"],
                           service["api_url"], service["api_key"], smm_order_id, customer_link)
         save_state()
 
         # YENİ: Müşteriye sipariş başladı bildirimi
-        notify_customer_order_started(order_id, service["name"], customer_link)
+        notify_customer_order_started(order_id, service_name, customer_link)
 
         send_telegram(
-            f"SMM siparişi panele girildi.\n\nÜrün: {service['name']}\nPanel: {service['panel']}\n"
+            f"SMM siparişi panele girildi.\n\nÜrün: {service_name}\nPanel: {service['panel']}\n"
             f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
             f"Adet: {service['quantity']}\nBakiye: {balance} {currency}"
         )
@@ -1491,7 +1788,10 @@ async def telegram_webhook(request: Request):
     if text in ["/start", "/help"]:
         send_telegram(
             "Bot komutları:\n\n"
-            "/balance - SMMRush bakiyesi\n"
+            "/panels - Ekli panelleri göster\n"
+            "/balance - Tüm panel bakiyeleri\n"
+            "/balance paneladi - Seçili panel bakiyesi\n"
+            "/balance-all - Tüm panel bakiyeleri\n"
             "/medyabalance - MedyaBayim bakiyesi\n"
             "/status - Bot durumu\n"
             "/health - Sistem durumu\n"
@@ -1512,29 +1812,41 @@ async def telegram_webhook(request: Request):
         send_telegram("Bot aktif çalışıyor.\n\nRender: Aktif\nTelegram: Aktif\nItemsatış Webhook: Aktif")
         return {"ok": True}
 
-    if text == "/balance":
-        balance_data = panel_balance(SMM_API_URL, SMM_API_KEY)
-        if "error" in balance_data:
-            send_telegram(f"SMMRush bakiye alınamadı.\nHata: {balance_data.get('error')}")
-        else:
-            send_telegram(f"SMMRush Bakiyesi:\n{balance_data.get('balance')} {balance_data.get('currency', '')}")
+    if text == "/panels":
+        send_telegram(build_panels_list_text())
+        return {"ok": True}
+
+    if text == "/balance" or text.startswith("/balance "):
+        handle_panel_balance_command(text)
+        return {"ok": True}
+
+    if text == "/balance-all":
+        handle_panel_balance_command("/balance all")
         return {"ok": True}
 
     if text == "/medyabalance":
-        balance_data = panel_balance(MEDYABAYIM_API_URL, MEDYABAYIM_API_KEY)
-        if "error" in balance_data:
-            send_telegram(f"MedyaBayim bakiye alınamadı.\nHata: {balance_data.get('error')}")
-        else:
-            send_telegram(f"MedyaBayim Bakiyesi:\n{balance_data.get('balance')} {balance_data.get('currency', '')}")
+        handle_panel_balance_command("/balance medyabayim")
         return {"ok": True}
 
     if text == "/health":
-        main_b = panel_balance(SMM_API_URL, SMM_API_KEY)
-        medya_b = panel_balance(MEDYABAYIM_API_URL, MEDYABAYIM_API_KEY)
-        main_t = f"SMMRush: Hatalı - {main_b.get('error')}" if "error" in main_b else f"SMMRush: Aktif - {main_b.get('balance')} {main_b.get('currency', '')}"
-        medya_t = f"MedyaBayim: Hatalı - {medya_b.get('error')}" if "error" in medya_b else f"MedyaBayim: Aktif - {medya_b.get('balance')} {medya_b.get('currency', '')}"
         redis_t = "Redis: Aktif" if UPSTASH_REDIS_REST_URL else "Redis: Eksik"
-        send_telegram(f"Sistem Durumu\n\nBot: Aktif\n{redis_t}\n{main_t}\n{medya_t}\n\nBaşarısız: {len(FAILED_ORDERS)}\nBekleyen: {len(PENDING_ORDERS)}")
+        panel_lines = []
+        for key in PANEL_MAP.keys():
+            panel = get_panel_config(key)
+            if not is_panel_configured(key):
+                panel_lines.append(f"{panel['name']}: Eksik")
+                continue
+            balance_data = panel_balance(panel["api_url"], panel["api_key"])
+            if "error" in balance_data:
+                panel_lines.append(f"{panel['name']}: Hatalı - {balance_data.get('error')}")
+            else:
+                panel_lines.append(f"{panel['name']}: Aktif - {balance_data.get('balance')} {balance_data.get('currency', '')}")
+
+        panel_text = "\n".join(panel_lines)
+        send_telegram(
+            f"Sistem Durumu\n\nBot: Aktif\n{redis_t}\n{panel_text}\n\n"
+            f"Başarısız: {len(FAILED_ORDERS)}\nBekleyen: {len(PENDING_ORDERS)}"
+        )
         return {"ok": True}
 
     if text == "/failed":
