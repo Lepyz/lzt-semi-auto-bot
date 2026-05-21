@@ -1797,7 +1797,7 @@ async def telegram_webhook(request: Request):
             "/health - Sistem durumu\n"
             "/failed - Başarısız siparişler\n"
             "/pending - Bekleyen siparişler\n"
-            "/cancel <smm_id> - Siparişi iptal et\n"
+            "/cancel smm_id - Siparişi iptal et\n"
             "/report - Bugünkü özet\n"
             "/week-report - Haftalık özet\n"
             "/month-report - Aylık özet\n"
