@@ -46,6 +46,7 @@ security = HTTPBasic()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 
 ITEMSATIS_COMMISSION_RATE = 0.07
 RECORDED_SALES = set()
@@ -66,6 +67,7 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # Itemsatış API - müşteri mesajı göndermek için
 ITEMSATIS_API_KEY = os.getenv("ITEMSATIS_API_KEY", "")
 ITEMSATIS_API_URL = "https://itemsatis.com/api"
+CUSTOMER_NOTIFY_ENABLED = os.getenv("CUSTOMER_NOTIFY_ENABLED", "false").lower() == "true"
 
 CS2_ADVERT_ID = "5282114"
 
@@ -234,7 +236,6 @@ def send_telegram(text: str):
             json={
                 "chat_id": CHAT_ID,
                 "text": text,
-                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
             timeout=30,
@@ -250,8 +251,16 @@ def send_itemsatis_message(order_id: str, message: str) -> bool:
     Itemsatış siparişine müşteriye mesaj gönderir.
     Itemsatış API'nin mesaj endpoint'ini kullanır.
     """
+    if not CUSTOMER_NOTIFY_ENABLED:
+        log("info", "customer_notify_skip", reason="CUSTOMER_NOTIFY_ENABLED false", order_id=order_id)
+        return False
+
     if not ITEMSATIS_API_KEY:
         log("warning", "customer_notify_skip", reason="ITEMSATIS_API_KEY eksik", order_id=order_id)
+        return False
+
+    if not order_id or str(order_id) == "Bilinmiyor":
+        log("warning", "customer_notify_skip", reason="order_id geçersiz", order_id=order_id)
         return False
 
     try:
@@ -282,8 +291,8 @@ def notify_customer_order_started(order_id: str, product_name: str, link: str):
     message = (
         f"Merhaba! '{product_name}' siparişiniz alındı ve işleme girdi.\n\n"
         f"Hesabınız: {link}\n\n"
-        f"Takipçiler genellikle 0-24 saat içinde gelmeye başlar. "
-        f"Herhangi bir sorun olursa bize ulaşabilirsiniz. Teşekkürler! 🙏"
+        f"Siparişiniz genellikle 0-24 saat içinde tamamlanmaya başlar. "
+        f"Herhangi bir sorun olursa bize ulaşabilirsiniz. Teşekkürler."
     )
     return send_itemsatis_message(order_id, message)
 
@@ -294,7 +303,7 @@ def notify_customer_order_completed(order_id: str, product_name: str, link: str)
         f"Merhaba! '{product_name}' siparişiniz tamamlandı! 🎉\n\n"
         f"Hesabınız: {link}\n\n"
         f"Memnun kaldıysanız değerlendirme bırakırsanız çok seviniriz. "
-        f"Tekrar alışveriş için görüşmek üzere! 😊"
+        f"Tekrar alışveriş için görüşmek üzere."
     )
     return send_itemsatis_message(order_id, message)
 
@@ -304,7 +313,7 @@ def notify_customer_order_failed(order_id: str, product_name: str):
     message = (
         f"Merhaba! '{product_name}' siparişinizde teknik bir sorun yaşandı. "
         f"En kısa sürede çözüp siparişinizi işleme alacağız. "
-        f"Rahatsızlık için özür dileriz. 🙏"
+        f"Rahatsızlık için özür dileriz."
     )
     return send_itemsatis_message(order_id, message)
 
@@ -323,7 +332,10 @@ def redis_request(command):
         )
         return r.json()
     except Exception as e:
-        log("error", "redis_error", error=str(e))
+        try:
+            logger.error("redis_error", error=str(e))
+        except Exception:
+            print("REDIS ERROR:", str(e), flush=True)
         return None
 
 
@@ -342,6 +354,45 @@ def redis_set_json(key, value):
     redis_request(["SET", key, json.dumps(value, ensure_ascii=False)])
 
 
+
+def sanitize_pending_order(item: dict) -> dict:
+    """API cevaplarında ve Redis kayıtlarında panel API key sızmasını engeller."""
+    if not isinstance(item, dict):
+        return {}
+    clean = dict(item)
+    clean.pop("api_key", None)
+    return clean
+
+
+def sanitize_pending_orders_for_storage():
+    global PENDING_ORDERS
+    PENDING_ORDERS = [sanitize_pending_order(item) for item in PENDING_ORDERS if isinstance(item, dict)]
+
+
+def get_runtime_service_for_pending(item: dict) -> dict:
+    """Pending sipariş için panel API bilgilerini güvenli şekilde yeniden oluşturur."""
+    advert_id = str((item or {}).get("advert_id", ""))
+    raw_service = get_all_services(include_inactive=True).get(advert_id, {}) if advert_id else {}
+    service = get_service_config(raw_service) if raw_service else {}
+
+    if not service:
+        panel_key = (item or {}).get("panel_key") or (item or {}).get("panel")
+        panel = get_panel_config(panel_key)
+        service = {
+            "panel_key": panel.get("key", ""),
+            "panel": panel.get("name", (item or {}).get("panel", "")),
+            "api_url": panel.get("api_url", ""),
+            "api_key": panel.get("api_key", ""),
+            "service_id": (item or {}).get("service_id", ""),
+            "quantity": (item or {}).get("quantity", ""),
+            "platform": (item or {}).get("platform", ""),
+        }
+
+    # Eski kayıtlarda api_url duruyorsa ama api_key yoksa panelden tamamlanır.
+    if not service.get("api_url"):
+        service["api_url"] = (item or {}).get("api_url", "")
+    return service
+
 def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
@@ -353,6 +404,7 @@ def load_state():
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
     FAILED_ORDERS = redis_get_json("failed_orders", [])
     PENDING_ORDERS = redis_get_json("pending_orders", [])
+    sanitize_pending_orders_for_storage()
     DAILY_STATS = redis_get_json("daily_stats", {})
     LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
@@ -370,6 +422,7 @@ def load_state():
 
 
 def save_state():
+    sanitize_pending_orders_for_storage()
     redis_set_json("recorded_sales", list(RECORDED_SALES))
     redis_set_json("processed_orders", list(PROCESSED_ORDERS))
     redis_set_json("processed_links", list(PROCESSED_LINKS))
@@ -658,7 +711,6 @@ def add_pending_order(
         "panel": str(panel),
         "panel_key": str(panel_key),
         "api_url": str(api_url),
-        "api_key": str(api_key),
         "service_id": str(service_id),
         "quantity": int(quantity or 0) if str(quantity or "").isdigit() else quantity,
         "platform": str(platform),
@@ -1318,10 +1370,17 @@ load_state()
 
 # ─── ADMIN SERVİS YÖNETİM PANELİ ──────────────────────────────────────────────
 def get_current_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    if ADMIN_PASSWORD == "changeme":
-        log("warning", "admin_default_password")
+    if not ADMIN_PASSWORD or ADMIN_PASSWORD == "changeme":
+        log("error", "admin_locked", reason="ADMIN_PASSWORD güvenli ayarlanmamış")
+        raise HTTPException(
+            status_code=503,
+            detail="Admin panel kilitli. Render Environment içinde ADMIN_PASSWORD ayarla.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    correct_username = secrets.compare_digest(credentials.username or "", ADMIN_USERNAME)
     correct_password = secrets.compare_digest(credentials.password or "", ADMIN_PASSWORD)
-    if not correct_password:
+    if not (correct_username and correct_password):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
 
@@ -1371,13 +1430,13 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
 </div>
 
 <form class="grid" method="post" action="/admin/add-service">
-  <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir İlan ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
+  <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir İlan ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
   <select name="panel" required>
     {% for key, panel in panels.items() %}
-      <option value="{{ key }}">{{ panel.name }} ({{ key }})</option>
+      <option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>
     {% endfor %}
   </select>
-  <input name="service_id" placeholder="Panel Servis ID" pattern="^\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir Servis ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
+  <input name="service_id" placeholder="Panel Servis ID" pattern="^\\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir Servis ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
   <input name="quantity" type="number" min="1" max="1000000" placeholder="Adet" required oninvalid="this.setCustomValidity('Lütfen 1 ile 1.000.000 arasında bir adet giriniz')" oninput="setCustomValidity('')">
   <select name="platform" required>
     <option value="instagram">Instagram</option>
@@ -1404,17 +1463,17 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 <tbody>
 {% for advert_id, service in services.items() %}
 <tr>
-<td>{{ advert_id }}</td>
-<td>{{ service.panel }}</td>
-<td>{{ service.service_id }}</td>
-<td>{{ service.quantity }}</td>
-<td>{{ service.platform }}</td>
+<td>{{ advert_id|e }}</td>
+<td>{{ service.panel|e }}</td>
+<td>{{ service.service_id|e }}</td>
+<td>{{ service.quantity|e }}</td>
+<td>{{ service.platform|e }}</td>
 <td><span class="badge {{ 'active' if service.active else 'passive' }}">{{ 'Aktif' if service.active else 'Pasif' }}</span></td>
 <td>{{ service.source }}</td>
 <td class="actions">
   {% if service.source == 'dynamic' %}
-  <form method="post" action="/admin/toggle-service"><input type="hidden" name="advert_id" value="{{ advert_id }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
-  <form method="post" action="/admin/delete-service" onsubmit="return confirm('Silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id }}"><button class="delete" type="submit">Sil</button></form>
+  <form method="post" action="/admin/toggle-service"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
+  <form method="post" action="/admin/delete-service" onsubmit="return confirm('Silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="delete" type="submit">Sil</button></form>
   {% else %}
   Kod içi servis
   {% endif %}
@@ -1521,16 +1580,16 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
 <tbody>
 {% for order in pending_orders %}
 <tr>
-<td>{{ order.product_name }}</td>
-<td>{{ order.smm_order_id }}</td>
-<td><a href="{{ order.link }}" target="_blank">Link</a></td>
-<td>{{ order.panel }}</td>
+<td>{{ order.product_name|e }}</td>
+<td>{{ order.smm_order_id|e }}</td>
+<td><a href="{{ order.link|e }}" target="_blank">Link</a></td>
+<td>{{ order.panel|e }}</td>
 <td>{{ ((now_ts - order.created_at) // 60) }} dk</td>
 <td>{% if order.cancelled %}<span class="badge cancelled">İptal İşaretli</span>{% else %}<span class="badge active">Aktif</span>{% endif %}</td>
 <td>
 {% if not order.cancelled %}
 <form method="post" action="/admin/cancel-order" onsubmit="return confirm('Bu sipariş sadece bot takip listesinde iptal işaretlenecek. Devam edilsin mi?')">
-<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id }}">
+<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id|e }}">
 <button class="delete" type="submit">İptal İşaretle</button>
 </form>
 {% else %}-{% endif %}
@@ -1605,16 +1664,16 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
 <tbody>
 {% for order in failed_orders %}
 <tr>
-<td>{{ order.product_name }}</td>
+<td>{{ order.product_name|e }}</td>
 <td>{{ order.order_id }}</td>
 <td>{{ order.smm_order_id or '-' }}</td>
 <td>{{ order.panel or '-' }}</td>
-<td><span class="badge">{{ order.reason }}</span><br><small>{{ order.detail }}</small></td>
-<td>{% if order.link %}<a href="{{ order.link }}" target="_blank">Link</a>{% else %}-{% endif %}</td>
+<td><span class="badge">{{ order.reason|e }}</span><br><small>{{ order.detail|e }}</small></td>
+<td>{% if order.link %}<a href="{{ order.link|e }}" target="_blank">Link</a>{% else %}-{% endif %}</td>
 <td>
 {% if order.retryable and order.link and not order.retried %}
 <form method="post" action="/admin/retry-order" onsubmit="return confirm('Bu işlem aynı linki tekrar panele gönderir. Devam edilsin mi?')">
-<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id }}">
+<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id|e }}">
 <button class="retry" type="submit">Retry</button>
 </form>
 {% elif order.retried %}Tekrar denendi{% else %}-{% endif %}
@@ -1716,6 +1775,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   :root {
     --bg: #0a0a0f;
     --surface: #111118;
+    --surface2: #15151f;
     --border: #1e1e2e;
     --accent: #7c3aed;
     --accent2: #06b6d4;
@@ -1729,7 +1789,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
-    background: var(--bg);
+    background: radial-gradient(circle at top left, rgba(124,58,237,0.14), transparent 34%), var(--bg);
     color: var(--text);
     font-family: 'Syne', sans-serif;
     min-height: 100vh;
@@ -1741,7 +1801,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: rgba(17,17,24,0.8);
+    gap: 16px;
+    background: rgba(17,17,24,0.82);
     backdrop-filter: blur(12px);
     position: sticky;
     top: 0;
@@ -1749,35 +1810,75 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .logo {
-    font-size: 20px;
+    font-size: 22px;
     font-weight: 800;
     letter-spacing: -0.5px;
   }
 
   .logo span { color: var(--accent); }
+  .container { max-width: 1440px; margin: 0 auto; padding: 32px; }
 
-  .status-dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: var(--success);
-    box-shadow: 0 0 8px var(--success);
-    animation: pulse 2s infinite;
-    display: inline-block;
-    margin-right: 8px;
+  .top-actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .last-updated { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+
+  .refresh-btn, .link-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    transition: all 0.2s;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .refresh-btn:hover, .link-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .filters {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    align-items: center;
   }
 
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
+  .filter-box {
+    background: rgba(17,17,24,0.85);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
 
-  .container { max-width: 1400px; margin: 0 auto; padding: 32px; }
+  .filter-box label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  select {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+  }
 
   .grid-4 {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     gap: 16px;
-    margin-bottom: 28px;
+    margin-bottom: 24px;
   }
 
   .grid-2 {
@@ -1788,25 +1889,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .card {
-    background: var(--surface);
+    background: rgba(17,17,24,0.92);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 14px;
     padding: 20px;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.18);
   }
 
-  .stat-card {
-    position: relative;
-    overflow: hidden;
-  }
-
-  .stat-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    background: var(--accent);
-  }
-
+  .stat-card { position: relative; overflow: hidden; }
+  .stat-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); }
   .stat-card.success::before { background: var(--success); }
   .stat-card.warning::before { background: var(--warning); }
   .stat-card.danger::before { background: var(--danger); }
@@ -1821,18 +1912,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     margin-bottom: 10px;
   }
 
-  .stat-value {
-    font-size: 32px;
-    font-weight: 800;
-    letter-spacing: -1px;
-  }
-
-  .stat-sub {
-    font-size: 12px;
-    color: var(--muted);
-    margin-top: 4px;
-    font-family: 'JetBrains Mono', monospace;
-  }
+  .stat-value { font-size: 32px; font-weight: 800; letter-spacing: -1px; }
+  .stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
 
   .card-title {
     font-size: 13px;
@@ -1843,102 +1924,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     margin-bottom: 16px;
     padding-bottom: 12px;
     border-bottom: 1px solid var(--border);
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    align-items:center;
   }
 
-  .log-list {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    max-height: 380px;
-    overflow-y: auto;
-  }
+  .chart-wrap { height: 310px; }
+  .chart-wrap canvas { width: 100% !important; height: 100% !important; }
 
+  .log-list { font-family: 'JetBrains Mono', monospace; font-size: 12px; max-height: 380px; overflow-y: auto; }
   .log-list::-webkit-scrollbar { width: 4px; }
   .log-list::-webkit-scrollbar-track { background: transparent; }
   .log-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-  .log-entry {
-    display: flex;
-    gap: 10px;
-    padding: 7px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.03);
-    align-items: flex-start;
-  }
-
+  .log-entry { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.03); align-items: flex-start; }
   .log-ts { color: var(--muted); flex-shrink: 0; font-size: 11px; }
-
-  .log-level {
-    flex-shrink: 0;
-    font-size: 10px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-weight: 600;
-    text-transform: uppercase;
-  }
-
+  .log-level { flex-shrink: 0; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
   .log-level.info { background: rgba(124,58,237,0.2); color: var(--accent); }
   .log-level.success { background: rgba(16,185,129,0.2); color: var(--success); }
   .log-level.warning { background: rgba(245,158,11,0.2); color: var(--warning); }
   .log-level.error { background: rgba(239,68,68,0.2); color: var(--danger); }
-
   .log-event { color: var(--text); flex: 1; }
   .log-meta { color: var(--muted); font-size: 11px; word-break: break-all; }
 
-  .order-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.04);
-    font-size: 13px;
-  }
-
+  .order-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 13px; }
   .order-row:last-child { border-bottom: none; }
-
-  .badge {
-    font-size: 10px;
-    padding: 3px 8px;
-    border-radius: 20px;
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 600;
-  }
-
+  .badge { font-size: 10px; padding: 3px 8px; border-radius: 20px; font-family: 'JetBrains Mono', monospace; font-weight: 600; white-space:nowrap; }
   .badge.pending { background: rgba(245,158,11,0.15); color: var(--warning); }
   .badge.failed { background: rgba(239,68,68,0.15); color: var(--danger); }
-  .badge.ok { background: rgba(16,185,129,0.15); color: var(--success); }
-
-  .refresh-btn {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    padding: 8px 16px;
-    border-radius: 8px;
-    cursor: pointer;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    transition: all 0.2s;
-  }
-
-  .refresh-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-
   .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px; }
+  .order-detail { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; word-break: break-all; }
 
-  .order-detail { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
-
-  .last-updated {
-    font-size: 11px;
-    color: var(--muted);
-    font-family: 'JetBrains Mono', monospace;
-  }
+  @media (max-width: 1050px) { .grid-4 { grid-template-columns: repeat(2, 1fr); } .grid-2 { grid-template-columns: 1fr; } }
+  @media (max-width: 600px) { header { padding: 16px; align-items:flex-start; flex-direction:column; } .container { padding: 18px; } .grid-4 { grid-template-columns: 1fr; } .filter-box { width:100%; justify-content:space-between; } select { flex:1; } }
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo">Boostera <span>SMM</span></div>
-  <div style="display:flex;align-items:center;gap:16px">
+  <div class="top-actions">
+    <a class="link-btn" href="/admin">Admin</a>
     <span class="last-updated" id="lastUpdated">—</span>
     <button class="refresh-btn" onclick="loadAll()">↻ Yenile</button>
   </div>
@@ -1946,11 +1973,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="container">
 
-  <!-- İSTATİSTİK KARTLARI -->
+  <div class="filters">
+    <div class="filter-box">
+      <label for="dateFilter">Tarih</label>
+      <select id="dateFilter">
+        <option value="7">Son 7 Gün</option>
+        <option value="14">Son 14 Gün</option>
+        <option value="30" selected>Son 30 Gün</option>
+      </select>
+    </div>
+    <div class="filter-box">
+      <label for="viewType">Grafik</label>
+      <select id="viewType">
+        <option value="orders">Satış Sayısı</option>
+        <option value="gross">Brüt Gelir</option>
+        <option value="net">Net Gelir</option>
+      </select>
+    </div>
+  </div>
+
   <div class="grid-4" id="statsGrid">
     <div class="card stat-card success">
-      <div class="stat-label">Bugün Sipariş</div>
-      <div class="stat-value" id="todayCount">—</div>
+      <div class="stat-label">Seçili Süre Sipariş</div>
+      <div class="stat-value" id="rangeOrders">—</div>
+      <div class="stat-sub" id="todayCount">bugün —</div>
+    </div>
+    <div class="card stat-card warning">
+      <div class="stat-label">Seçili Süre Brüt</div>
+      <div class="stat-value" id="rangeGross">—</div>
+      <div class="stat-sub" id="rangeNet">net —</div>
     </div>
     <div class="card stat-card cyan">
       <div class="stat-label">Bekleyen</div>
@@ -1960,34 +2011,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat-label">Başarısız</div>
       <div class="stat-value" id="failedCount">—</div>
     </div>
-    <div class="card stat-card warning">
-      <div class="stat-label">Bugün Brüt</div>
-      <div class="stat-value" id="todayGross">—</div>
-      <div class="stat-sub" id="todayNet">net —</div>
-    </div>
   </div>
 
-  <!-- SATIŞ GRAFİĞİ -->
   <div class="card" style="margin-bottom:28px;">
-    <div class="card-title">Son 7 Gün Satış Grafiği</div>
-    <canvas id="dailySalesChart" height="90"></canvas>
+    <div class="card-title">
+      <span id="chartTitle">Satış Grafiği</span>
+      <span id="chartSummary" style="font-size:11px;color:var(--muted)"></span>
+    </div>
+    <div class="chart-wrap"><canvas id="mainChart"></canvas></div>
   </div>
 
-  <!-- BEKLEYEN + BAŞARISIZ -->
   <div class="grid-2">
     <div class="card">
-      <div class="card-title">Bekleyen Siparişler</div>
+      <div class="card-title">Bekleyen Siparişler <a class="link-btn" href="/admin/pending-orders" style="padding:5px 9px">Yönet</a></div>
       <div id="pendingList"><div class="empty">Yükleniyor...</div></div>
     </div>
     <div class="card">
-      <div class="card-title">Son Başarısız Siparişler</div>
+      <div class="card-title">Son Başarısız Siparişler <a class="link-btn" href="/admin/failed-orders" style="padding:5px 9px">Retry</a></div>
       <div id="failedList"><div class="empty">Yükleniyor...</div></div>
     </div>
   </div>
 
-  <!-- LOG GEÇMİŞİ -->
   <div class="card">
-    <div class="card-title" style="display:flex;justify-content:space-between">
+    <div class="card-title">
       <span>Canlı Log</span>
       <span id="logCount" style="color:var(--muted);font-size:11px"></span>
     </div>
@@ -1997,53 +2043,97 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+const dateFilter = document.getElementById('dateFilter');
+const viewType = document.getElementById('viewType');
+let mainChart = null;
+
+function money(value) {
+  return Number(value || 0).toLocaleString('tr-TR', { maximumFractionDigits: 0 }) + ' ₺';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;'}[ch]));
+}
+
 async function loadAll() {
   document.getElementById('lastUpdated').textContent = 'Güncelleniyor...';
-  await Promise.all([loadStats(), loadSalesChart(), loadPending(), loadFailed(), loadLogs()]);
+  await Promise.all([loadStatsAndChart(), loadPending(), loadFailed(), loadLogs()]);
   const now = new Date().toLocaleTimeString('tr-TR');
   document.getElementById('lastUpdated').textContent = `Son güncelleme: ${now}`;
 }
 
-async function loadStats() {
-  const r = await fetch('/api/stats');
-  const d = await r.json();
-  document.getElementById('todayCount').textContent = d.today_count;
-  document.getElementById('pendingCount').textContent = d.pending_count;
-  document.getElementById('failedCount').textContent = d.failed_count;
-  document.getElementById('todayGross').textContent = d.today_gross.toFixed(0) + ' ₺';
-  document.getElementById('todayNet').textContent = 'net ' + d.today_net.toFixed(0) + ' ₺';
+async function loadStatsAndChart() {
+  const days = Number(dateFilter.value || 30);
+  const type = viewType.value || 'orders';
+  const [statsRes, salesRes] = await Promise.all([
+    fetch('/api/stats'),
+    fetch(`/api/sales-data?days=${days}`)
+  ]);
+  const stats = await statsRes.json();
+  const sales = await salesRes.json();
+
+  document.getElementById('rangeOrders').textContent = sales.total_orders ?? 0;
+  document.getElementById('todayCount').textContent = `bugün ${stats.today_count ?? 0}`;
+  document.getElementById('rangeGross').textContent = money(sales.total_gross ?? 0);
+  document.getElementById('rangeNet').textContent = `net ${money(sales.total_net ?? 0)}`;
+  document.getElementById('pendingCount').textContent = stats.pending_count ?? 0;
+  document.getElementById('failedCount').textContent = stats.failed_count ?? 0;
+
+  const map = {
+    orders: { label: 'Satış Sayısı', values: sales.order_values || [] },
+    gross: { label: 'Brüt Gelir', values: sales.gross_values || [] },
+    net: { label: 'Net Gelir', values: sales.net_values || [] },
+  };
+  const selected = map[type] || map.orders;
+  document.getElementById('chartTitle').textContent = `${selected.label} · Son ${days} Gün`;
+  document.getElementById('chartSummary').textContent = `Toplam ${sales.total_orders || 0} sipariş · ${money(sales.total_gross || 0)} brüt`;
+  createOrUpdateChart(sales.labels || [], selected.values, selected.label, type);
 }
 
-async function loadSalesChart() {
-  const canvas = document.getElementById('dailySalesChart');
+function createOrUpdateChart(labels, values, label, type) {
+  const canvas = document.getElementById('mainChart');
   if (!canvas || typeof Chart === 'undefined') return;
-  const r = await fetch('/api/sales-data');
-  const d = await r.json();
   const ctx = canvas.getContext('2d');
-  if (window.dailySalesChart) {
-    window.dailySalesChart.data.labels = d.labels;
-    window.dailySalesChart.data.datasets[0].data = d.values;
-    window.dailySalesChart.update();
+
+  if (mainChart) {
+    mainChart.data.labels = labels;
+    mainChart.data.datasets[0].label = label;
+    mainChart.data.datasets[0].data = values;
+    mainChart.options.scales.y.ticks.callback = type === 'orders' ? (v) => v : (v) => money(v);
+    mainChart.update();
     return;
   }
-  window.dailySalesChart = new Chart(ctx, {
+
+  mainChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: d.labels,
+      labels,
       datasets: [{
-        label: 'Satış Sayısı',
-        data: d.values,
-        fill: false,
-        borderColor: 'rgba(124, 58, 237, 0.9)',
-        tension: 0.3
+        label,
+        data: values,
+        fill: true,
+        borderColor: 'rgba(124, 58, 237, 0.95)',
+        backgroundColor: 'rgba(124, 58, 237, 0.12)',
+        tension: 0.32,
+        pointRadius: 3,
+        pointHoverRadius: 5,
       }]
     },
     options: {
       responsive: true,
-      plugins: { legend: { labels: { color: '#e2e8f0' } } },
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#e2e8f0' } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => type === 'orders' ? `${ctx.dataset.label}: ${ctx.raw}` : `${ctx.dataset.label}: ${money(ctx.raw)}`
+          }
+        }
+      },
       scales: {
         x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: { beginAtZero: true, ticks: { color: '#64748b', precision: 0 }, grid: { color: 'rgba(255,255,255,0.05)' } }
+        y: { beginAtZero: true, ticks: { color: '#64748b', precision: 0, callback: type === 'orders' ? (v) => v : (v) => money(v) }, grid: { color: 'rgba(255,255,255,0.05)' } }
       }
     }
   });
@@ -2053,13 +2143,14 @@ async function loadPending() {
   const r = await fetch('/api/pending');
   const d = await r.json();
   const el = document.getElementById('pendingList');
-  if (!d.orders.length) { el.innerHTML = '<div class="empty">Bekleyen sipariş yok</div>'; return; }
-  el.innerHTML = d.orders.map(o => {
-    const mins = Math.floor((Date.now()/1000 - o.created_at) / 60);
+  const orders = d.orders || [];
+  if (!orders.length) { el.innerHTML = '<div class="empty">Bekleyen sipariş yok</div>'; return; }
+  el.innerHTML = orders.slice(-8).reverse().map(o => {
+    const mins = Math.floor((Date.now()/1000 - Number(o.created_at || 0)) / 60);
     return `<div class="order-row">
       <div>
-        <div>${o.product_name}</div>
-        <div class="order-detail">${o.link} · ${o.panel} #${o.smm_order_id}</div>
+        <div>${escapeHtml(o.product_name)}</div>
+        <div class="order-detail">${escapeHtml(o.link)} · ${escapeHtml(o.panel)} #${escapeHtml(o.smm_order_id)}</div>
       </div>
       <span class="badge pending">${mins}dk</span>
     </div>`;
@@ -2070,12 +2161,13 @@ async function loadFailed() {
   const r = await fetch('/api/failed');
   const d = await r.json();
   const el = document.getElementById('failedList');
-  if (!d.orders.length) { el.innerHTML = '<div class="empty">Başarısız sipariş yok</div>'; return; }
-  el.innerHTML = d.orders.slice(-8).reverse().map(o => `
+  const orders = d.orders || [];
+  if (!orders.length) { el.innerHTML = '<div class="empty">Başarısız sipariş yok</div>'; return; }
+  el.innerHTML = orders.slice(-8).reverse().map(o => `
     <div class="order-row">
       <div>
-        <div>${o.product_name}</div>
-        <div class="order-detail">${o.reason}${o.smm_order_id ? ' · SMM #' + o.smm_order_id : ''}${o.panel ? ' · ' + o.panel : ''}</div>
+        <div>${escapeHtml(o.product_name)}</div>
+        <div class="order-detail">${escapeHtml(o.reason)}${o.smm_order_id ? ' · SMM #' + escapeHtml(o.smm_order_id) : ''}${o.panel ? ' · ' + escapeHtml(o.panel) : ''}</div>
       </div>
       <span class="badge failed">hata</span>
     </div>`).join('');
@@ -2084,21 +2176,24 @@ async function loadFailed() {
 async function loadLogs() {
   const r = await fetch('/api/logs');
   const d = await r.json();
-  document.getElementById('logCount').textContent = `${d.logs.length} kayıt`;
+  document.getElementById('logCount').textContent = `${(d.logs || []).length} kayıt`;
   const el = document.getElementById('logList');
-  if (!d.logs.length) { el.innerHTML = '<div class="empty">Log yok</div>'; return; }
-  el.innerHTML = [...d.logs].reverse().map(l => {
+  const logs = d.logs || [];
+  if (!logs.length) { el.innerHTML = '<div class="empty">Log yok</div>'; return; }
+  el.innerHTML = [...logs].reverse().map(l => {
     const meta = Object.entries(l)
       .filter(([k]) => !['ts','level','event'].includes(k))
-      .map(([k,v]) => `${k}=${v}`).join(' ');
+      .map(([k,v]) => `${escapeHtml(k)}=${escapeHtml(v)}`).join(' ');
     return `<div class="log-entry">
-      <span class="log-ts">${l.ts.slice(11,19)}</span>
-      <span class="log-level ${l.level}">${l.level}</span>
-      <span class="log-event">${l.event} <span class="log-meta">${meta}</span></span>
+      <span class="log-ts">${escapeHtml(String(l.ts || '').slice(11,19))}</span>
+      <span class="log-level ${escapeHtml(l.level)}">${escapeHtml(l.level)}</span>
+      <span class="log-event">${escapeHtml(l.event)} <span class="log-meta">${meta}</span></span>
     </div>`;
   }).join('');
 }
 
+dateFilter.addEventListener('change', loadStatsAndChart);
+viewType.addEventListener('change', loadStatsAndChart);
 loadAll();
 setInterval(loadAll, 30000);
 </script>
@@ -2109,12 +2204,12 @@ setInterval(loadAll, 30000);
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
+def dashboard(user: str = Depends(get_current_admin)):
     return DASHBOARD_HTML
 
 
 @app.get("/api/stats")
-def api_stats():
+def api_stats(user: str = Depends(get_current_admin)):
     today_count = sum(normalize_stat_item(v)["count"] for v in DAILY_STATS.values())
     today_gross = sum(normalize_stat_item(v)["gross"] for v in DAILY_STATS.values())
     commission = today_gross * ITEMSATIS_COMMISSION_RATE
@@ -2128,39 +2223,71 @@ def api_stats():
 
 
 @app.get("/api/sales-data")
-def api_sales_data():
+def api_sales_data(days: int = 30, user: str = Depends(get_current_admin)):
+    """Dashboard grafiği için tarih bazlı satış geçmişi döndürür."""
+    try:
+        days = int(days)
+    except Exception:
+        days = 30
+
+    if days not in [7, 14, 30, 60, 90]:
+        days = 30
+
     labels = []
-    values = []
+    order_values = []
     gross_values = []
+    net_values = []
     now = now_tr()
 
-    for i in range(6, -1, -1):
+    total_orders = 0
+    total_gross = 0.0
+
+    for i in range(days - 1, -1, -1):
         day_dt = now - timedelta(days=i)
         day_key = day_dt.strftime("%Y-%m-%d")
         labels.append(day_dt.strftime("%d.%m"))
+
         item = SALES_HISTORY.get(day_key, {})
         try:
-            values.append(int(item.get("count", 0) or 0))
-            gross_values.append(float(item.get("gross", 0) or 0))
+            count = int(item.get("count", 0) or 0)
+            gross = float(item.get("gross", 0) or 0)
         except Exception:
-            values.append(0)
-            gross_values.append(0.0)
+            count = 0
+            gross = 0.0
 
-    return {"labels": labels, "values": values, "gross_values": gross_values}
+        net = gross * (1 - ITEMSATIS_COMMISSION_RATE)
+        order_values.append(count)
+        gross_values.append(round(gross, 2))
+        net_values.append(round(net, 2))
+        total_orders += count
+        total_gross += gross
 
+    total_net = total_gross * (1 - ITEMSATIS_COMMISSION_RATE)
+
+    return {
+        "labels": labels,
+        "order_values": order_values,
+        "gross_values": gross_values,
+        "net_values": net_values,
+        "total_orders": total_orders,
+        "total_gross": round(total_gross, 2),
+        "total_net": round(total_net, 2),
+        # Eski dashboard parçalarıyla geriye uyumluluk için:
+        "values": order_values,
+    }
 
 @app.get("/api/pending")
-def api_pending():
-    return {"orders": PENDING_ORDERS}
+def api_pending(user: str = Depends(get_current_admin)):
+    return {"orders": [sanitize_pending_order(item) for item in PENDING_ORDERS]}
 
 
 @app.get("/api/failed")
-def api_failed():
+def api_failed(user: str = Depends(get_current_admin)):
     return {"orders": FAILED_ORDERS}
 
 
 @app.get("/api/logs")
-def api_logs():
+def api_logs(user: str = Depends(get_current_admin)):
     return {"logs": LOG_HISTORY}
 
 
@@ -2197,11 +2324,12 @@ def check_orders():
             changed = True
             continue
 
+        runtime_service = get_runtime_service_for_pending(item)
         status_data = check_panel_order_status(
-            item.get("api_url", ""),
-            item.get("api_key", ""),
+            runtime_service.get("api_url", ""),
+            runtime_service.get("api_key", ""),
             item.get("smm_order_id", ""),
-            item.get("panel", ""),
+            runtime_service.get("panel", item.get("panel", "")),
         )
 
         if "error" in status_data:
@@ -2237,10 +2365,10 @@ def check_orders():
                 smm_order_id=item.get("smm_order_id", ""),
                 link=item.get("link", ""),
                 panel=item.get("panel", ""),
-                panel_key=item.get("panel_key", ""),
-                service_id=item.get("service_id", ""),
-                quantity=item.get("quantity", ""),
-                platform=item.get("platform", ""),
+                panel_key=item.get("panel_key", runtime_service.get("panel_key", "")),
+                service_id=item.get("service_id", runtime_service.get("service_id", "")),
+                quantity=item.get("quantity", runtime_service.get("quantity", "")),
+                platform=item.get("platform", runtime_service.get("platform", "")),
                 retryable=True,
             )
             send_telegram(
