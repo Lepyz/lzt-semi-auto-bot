@@ -3,28 +3,48 @@ import re
 import json
 import time
 import hashlib
+import asyncio
+import secrets
 import requests
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, HTTPException, Depends, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
-import structlog
-from structlog import get_logger
+try:
+    import structlog
+    from structlog import get_logger
 
-# ─── STRUCTLOG SETUP ───────────────────────────────────────────────────────────
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.add_log_level,
-        structlog.processors.JSONRenderer(),
-    ]
-)
-logger = get_logger()
+    # ─── STRUCTLOG SETUP ───────────────────────────────────────────────────────
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.add_log_level,
+            structlog.processors.JSONRenderer(),
+        ]
+    )
+    logger = get_logger()
+except Exception:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+
+    class _FallbackLogger:
+        def info(self, event, **kwargs):
+            logging.info("%s %s", event, kwargs)
+        def warning(self, event, **kwargs):
+            logging.warning("%s %s", event, kwargs)
+        def error(self, event, **kwargs):
+            logging.error("%s %s", event, kwargs)
+
+    logger = _FallbackLogger()
 
 app = FastAPI()
+security = HTTPBasic()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 
 ITEMSATIS_COMMISSION_RATE = 0.07
 RECORDED_SALES = set()
@@ -137,6 +157,10 @@ SMM_SERVICE_MAP = {
     #     "platform": "tiktok",
     # },
 }
+
+# /admin panelinden Redis'e kaydedilen dinamik ilan-servis eşleştirmeleri.
+# API key burada tutulmaz; panel API bilgileri PANEL_MAP ve Render Environment üzerinden gelir.
+DYNAMIC_SERVICES = {}
 
 PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
@@ -316,7 +340,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -333,6 +357,7 @@ def load_state():
     LOG_HISTORY = redis_get_json("log_history", [])
     PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
+    DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
@@ -352,6 +377,7 @@ def save_state():
     redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
     redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
     redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+    redis_set_json("dynamic_services", DYNAMIC_SERVICES)
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -654,6 +680,7 @@ def cache_itemsatis_product_name(advert_id: str, product_name: str):
         PRODUCT_NAME_CACHE[advert_id] = product_name
         redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
     redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+    redis_set_json("dynamic_services", DYNAMIC_SERVICES)
 
 
 def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
@@ -867,6 +894,7 @@ def cache_panel_service_name(panel_key: str, service_id: str, service_name: str)
     cache_key = make_panel_service_cache_key(panel_key, service_id)
     PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
     redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+    redis_set_json("dynamic_services", DYNAMIC_SERVICES)
 
 
 def get_cached_panel_service_name(panel_key: str, service_id: str) -> str:
@@ -892,6 +920,142 @@ def get_panel_service_display_name(service: dict, target_service: dict = None) -
         return f"Panel Servisi {service_id}"
 
     return "Bilinmeyen Panel Servisi"
+
+
+def normalize_dynamic_service(advert_id: str, service: dict) -> dict:
+    """Admin panelden gelen servis kaydını güvenli formata çevirir."""
+    advert_id = str(advert_id or "").strip()
+    service = dict(service or {})
+    panel_key = normalize_panel_key(service.get("panel_key") or service.get("panel") or "")
+    platform = normalize_text(service.get("platform") or "instagram") or "instagram"
+
+    try:
+        quantity = int(service.get("quantity") or 0)
+    except Exception:
+        quantity = 0
+
+    return {
+        "advert_id": advert_id,
+        "panel": panel_key,
+        "panel_key": panel_key,
+        "service_id": str(service.get("service_id") or "").strip(),
+        "quantity": quantity,
+        "platform": platform,
+        "active": bool(service.get("active", True)),
+        "source": service.get("source") or "dynamic",
+        "created_at": service.get("created_at") or int(time.time()),
+    }
+
+
+def get_dynamic_services() -> dict:
+    """Redis'teki dinamik servisleri temizleyerek döndürür."""
+    cleaned = {}
+    for advert_id, service in (DYNAMIC_SERVICES or {}).items():
+        advert_id = str(advert_id or "").strip()
+        if not advert_id:
+            continue
+        normalized = normalize_dynamic_service(advert_id, service)
+        if normalized.get("panel") and normalized.get("service_id") and normalized.get("quantity") > 0:
+            cleaned[advert_id] = normalized
+    return cleaned
+
+
+def get_all_services(include_inactive: bool = False) -> dict:
+    """Kod içindeki servislerle /admin üzerinden eklenen dinamik servisleri birleştirir."""
+    services = {}
+    for advert_id, service in SMM_SERVICE_MAP.items():
+        item = dict(service or {})
+        item.setdefault("active", True)
+        item.setdefault("source", "code")
+        services[str(advert_id)] = item
+
+    for advert_id, service in get_dynamic_services().items():
+        services[str(advert_id)] = service
+
+    if include_inactive:
+        return services
+
+    return {
+        advert_id: service
+        for advert_id, service in services.items()
+        if bool(service.get("active", True))
+    }
+
+
+def save_dynamic_services():
+    redis_set_json("dynamic_services", DYNAMIC_SERVICES)
+
+
+def set_dynamic_service(advert_id: str, panel: str, service_id: str, quantity: int, platform: str, active: bool = True):
+    global DYNAMIC_SERVICES
+    advert_id = str(advert_id or "").strip()
+    if not advert_id:
+        raise ValueError("Itemsatış ilan ID boş olamaz")
+
+    panel_key = normalize_panel_key(panel)
+    if panel_key not in PANEL_MAP:
+        raise ValueError("Panel bulunamadı")
+
+    service_id = str(service_id or "").strip()
+    if not service_id:
+        raise ValueError("Panel servis ID boş olamaz")
+
+    quantity = int(quantity or 0)
+    if quantity <= 0:
+        raise ValueError("Adet 0'dan büyük olmalı")
+
+    DYNAMIC_SERVICES[advert_id] = normalize_dynamic_service(
+        advert_id,
+        {
+            "panel": panel_key,
+            "service_id": service_id,
+            "quantity": quantity,
+            "platform": platform,
+            "active": active,
+            "source": "dynamic",
+            "created_at": int(time.time()),
+        },
+    )
+    save_dynamic_services()
+    return DYNAMIC_SERVICES[advert_id]
+
+
+def delete_dynamic_service(advert_id: str) -> bool:
+    global DYNAMIC_SERVICES
+    advert_id = str(advert_id or "").strip()
+    if advert_id in DYNAMIC_SERVICES:
+        DYNAMIC_SERVICES.pop(advert_id, None)
+        save_dynamic_services()
+        return True
+    return False
+
+
+def toggle_dynamic_service(advert_id: str) -> bool:
+    global DYNAMIC_SERVICES
+    advert_id = str(advert_id or "").strip()
+    if advert_id not in DYNAMIC_SERVICES:
+        return False
+    current = bool(DYNAMIC_SERVICES[advert_id].get("active", True))
+    DYNAMIC_SERVICES[advert_id]["active"] = not current
+    save_dynamic_services()
+    return True
+
+
+def build_services_list_text() -> str:
+    services = get_all_services(include_inactive=True)
+    if not services:
+        return "Aktif servis kaydı yok."
+
+    lines = ["Servis Eşleştirmeleri:\n"]
+    for advert_id, raw_service in sorted(services.items(), key=lambda x: x[0]):
+        service = get_service_config(raw_service)
+        source = raw_service.get("source", "code")
+        active = "Aktif" if raw_service.get("active", True) else "Pasif"
+        lines.append(
+            f"{advert_id} | {active} | {source} | {service['panel']} | "
+            f"Servis ID: {service.get('service_id')} | Adet: {service.get('quantity')} | Platform: {service.get('platform')}"
+        )
+    return "\n".join(lines)
 
 
 def is_panel_configured(panel_key: str) -> bool:
@@ -1028,7 +1192,175 @@ def check_low_balance(balance, currency, panel_name="Panel"):
         log("error", "balance_check_error", error=str(e))
 
 
+
+async def background_scheduler():
+    """Render açık kaldığı sürece sipariş ve servis kontrollerini otomatik çalıştırır."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            log("info", "background_check_orders_start")
+            check_orders()
+        except Exception as e:
+            log("error", "background_check_orders_error", error=str(e))
+
+        try:
+            log("info", "background_check_services_start")
+            check_services()
+        except Exception as e:
+            log("error", "background_check_services_error", error=str(e))
+
+        await asyncio.sleep(300)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_scheduler())
+
+
 load_state()
+
+
+
+# ─── ADMIN SERVİS YÖNETİM PANELİ ──────────────────────────────────────────────
+def get_current_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    if ADMIN_PASSWORD == "changeme":
+        log("warning", "admin_default_password")
+    correct_password = secrets.compare_digest(credentials.password or "", ADMIN_PASSWORD)
+    if not correct_password:
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
+
+
+ADMIN_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boostera SMM Admin</title>
+<style>
+body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
+.container { max-width:1100px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
+h1 { margin:0 0 6px; color:#fff; } .muted { color:#8a8fa3; font-size:13px; margin-bottom:22px; }
+form.grid { display:grid; grid-template-columns: repeat(6, 1fr); gap:10px; margin-bottom:22px; }
+input, select, button { padding:11px; border-radius:8px; border:1px solid #2a2a3a; background:#181824; color:#e2e8f0; }
+button { background:#7c3aed; border:none; cursor:pointer; font-weight:700; }
+button.delete { background:#ef4444; } button.toggle { background:#334155; }
+table { width:100%; border-collapse:collapse; overflow:hidden; border-radius:10px; }
+th, td { padding:12px; border-bottom:1px solid #242436; text-align:left; font-size:14px; }
+th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+.badge { padding:4px 8px; border-radius:99px; font-size:12px; font-weight:700; }
+.active { background:#064e3b; color:#86efac; } .passive { background:#3f1d1d; color:#fca5a5; }
+a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
+.notice { background:#172554; color:#bfdbfe; padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
+@media (max-width: 900px) { form.grid { grid-template-columns: 1fr; } table { font-size:12px; } }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Boostera SMM Admin</h1>
+<div class="muted">API key girilmez. API keyler Render Environment içinde kalır. Buradan sadece Itemsatış ilanını panel servisine bağlarsın.</div>
+<div class="notice">Yeni servis ekleme: Itemsatış İlan ID + Panel + Panel Servis ID + Adet + Platform.</div>
+<form class="grid" method="post" action="/admin/add-service">
+  <input name="advert_id" placeholder="Itemsatış İlan ID" required>
+  <select name="panel" required>
+    {% for key, panel in panels.items() %}
+      <option value="{{ key }}">{{ panel.name }} ({{ key }})</option>
+    {% endfor %}
+  </select>
+  <input name="service_id" placeholder="Panel Servis ID" required>
+  <input name="quantity" type="number" min="1" placeholder="Adet" required>
+  <select name="platform" required>
+    <option value="instagram">Instagram</option>
+    <option value="tiktok">TikTok</option>
+    <option value="youtube">YouTube</option>
+    <option value="x">X/Twitter</option>
+    <option value="twitch">Twitch</option>
+    <option value="kick">Kick</option>
+    <option value="other">Diğer</option>
+  </select>
+  <button type="submit">Ekle / Güncelle</button>
+</form>
+<table>
+<thead><tr><th>İlan ID</th><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Platform</th><th>Durum</th><th>Kaynak</th><th>İşlem</th></tr></thead>
+<tbody>
+{% for advert_id, service in services.items() %}
+<tr>
+<td>{{ advert_id }}</td>
+<td>{{ service.panel }}</td>
+<td>{{ service.service_id }}</td>
+<td>{{ service.quantity }}</td>
+<td>{{ service.platform }}</td>
+<td><span class="badge {{ 'active' if service.active else 'passive' }}">{{ 'Aktif' if service.active else 'Pasif' }}</span></td>
+<td>{{ service.source }}</td>
+<td class="actions">
+  {% if service.source == 'dynamic' %}
+  <form method="post" action="/admin/toggle-service"><input type="hidden" name="advert_id" value="{{ advert_id }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
+  <form method="post" action="/admin/delete-service" onsubmit="return confirm('Silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id }}"><button class="delete" type="submit">Sil</button></form>
+  {% else %}
+  Kod içi servis
+  {% endif %}
+</td>
+</tr>
+{% else %}
+<tr><td colspan="8" style="text-align:center;color:#8a8fa3;">Servis yok.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<p style="margin-top:18px"><a href="/">Dashboard'a dön</a></p>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel(user: str = Depends(get_current_admin)):
+    template = Template(ADMIN_HTML)
+    services = {}
+    for advert_id, raw_service in get_all_services(include_inactive=True).items():
+        service = get_service_config(raw_service)
+        services[advert_id] = {
+            "panel": service.get("panel"),
+            "service_id": service.get("service_id"),
+            "quantity": service.get("quantity"),
+            "platform": service.get("platform"),
+            "active": bool(raw_service.get("active", True)),
+            "source": raw_service.get("source", "code"),
+        }
+    html = template.render(services=services, panels=PANEL_MAP)
+    return HTMLResponse(content=html)
+
+
+@app.post("/admin/add-service")
+def admin_add_service(
+    advert_id: str = Form(...),
+    panel: str = Form(...),
+    service_id: str = Form(...),
+    quantity: int = Form(...),
+    platform: str = Form("instagram"),
+    user: str = Depends(get_current_admin),
+):
+    try:
+        set_dynamic_service(advert_id, panel, service_id, quantity, platform, True)
+        log("success", "admin_service_saved", advert_id=advert_id, panel=panel, service_id=service_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/delete-service")
+def admin_delete_service(advert_id: str = Form(...), user: str = Depends(get_current_admin)):
+    delete_dynamic_service(advert_id)
+    log("warning", "admin_service_deleted", advert_id=advert_id)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/toggle-service")
+def admin_toggle_service(advert_id: str = Form(...), user: str = Depends(get_current_admin)):
+    toggle_dynamic_service(advert_id)
+    log("info", "admin_service_toggled", advert_id=advert_id)
+    return RedirectResponse("/admin", status_code=303)
 
 
 # ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
@@ -1507,13 +1839,13 @@ def check_orders():
 # ─── YENİ: /cancel KOMUTU (Telegram'dan SMM siparişini iptal et) ──────────────
 def handle_cancel_command(text: str):
     """
-    /cancel <smm_order_id> — bekleyen siparişi iptal eder.
+    /cancel smm_order_id — bekleyen siparişi iptal eder.
     Örnek: /cancel 12345
     """
     parts = text.strip().split()
     if len(parts) < 2:
         send_telegram(
-            "Kullanım: /cancel <smm_order_id>\n\n"
+            "Kullanım: /cancel smm_order_id\n\n"
             "Bekleyen siparişleri görmek için: /pending"
         )
         return
@@ -1616,7 +1948,7 @@ def check_services_head():
 def check_services():
     global SERVICE_PRICE_CACHE
     changed_count = 0
-    for advert_id, raw_service in SMM_SERVICE_MAP.items():
+    for advert_id, raw_service in get_all_services().items():
         service = get_service_config(raw_service)
 
         if not service.get("api_url") or not service.get("api_key"):
@@ -1701,8 +2033,9 @@ async def itemsatis_webhook(request: Request):
         send_telegram(f"Yeni CS2 5 yıllık hesap siparişi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\n\n{get_lzt_links()}")
         return {"ok": True, "type": "cs2", "order_id": order_id}
 
-    if advert_id in SMM_SERVICE_MAP:
-        service = get_service_config(SMM_SERVICE_MAP[advert_id])
+    all_services = get_all_services()
+    if advert_id in all_services:
+        service = get_service_config(all_services[advert_id])
         service_name = get_itemsatis_report_name(advert_id, product_name)
         platform = normalize_text(service.get("platform", "instagram"))
         customer_link = find_order_link(data, platform)
@@ -1797,6 +2130,8 @@ async def telegram_webhook(request: Request):
             "/health - Sistem durumu\n"
             "/failed - Başarısız siparişler\n"
             "/pending - Bekleyen siparişler\n"
+            "/services - Servis eşleştirmeleri\n"
+            "/admin - Web servis yönetim paneli\n"
             "/cancel smm_id - Siparişi iptal et\n"
             "/report - Bugünkü özet\n"
             "/week-report - Haftalık özet\n"
@@ -1814,6 +2149,10 @@ async def telegram_webhook(request: Request):
 
     if text == "/panels":
         send_telegram(build_panels_list_text())
+        return {"ok": True}
+
+    if text == "/services":
+        send_telegram(build_services_list_text())
         return {"ok": True}
 
     if text == "/balance" or text.startswith("/balance "):
