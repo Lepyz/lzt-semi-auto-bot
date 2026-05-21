@@ -7,10 +7,11 @@ import asyncio
 import secrets
 import requests
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, HTTPException, Depends, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+
+from fastapi import FastAPI, Request, Form, Depends, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.staticfiles import StaticFiles
+from jinja2 import Template
 try:
     import structlog
     from structlog import get_logger
