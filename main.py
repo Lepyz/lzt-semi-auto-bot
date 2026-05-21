@@ -7,11 +7,11 @@ import asyncio
 import secrets
 import requests
 from datetime import datetime, timedelta
-
-from fastapi import FastAPI, Request, Form, Depends, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi import FastAPI, Request, HTTPException, Depends, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from jinja2 import Template
+from fastapi.staticfiles import StaticFiles
 try:
     import structlog
     from structlog import get_logger
@@ -176,6 +176,7 @@ LAST_WEEKLY_REPORT_DATE = ""
 LAST_MONTHLY_REPORT_DATE = ""
 PRODUCT_NAME_CACHE = {}
 PANEL_SERVICE_NAME_CACHE = {}
+SALES_HISTORY = {}
 
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
 LOG_HISTORY = []
@@ -341,7 +342,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, SALES_HISTORY
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -359,6 +360,7 @@ def load_state():
     PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
+    SALES_HISTORY = redis_get_json("sales_history", {})
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
@@ -379,6 +381,7 @@ def save_state():
     redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
     redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
     redis_set_json("dynamic_services", DYNAMIC_SERVICES)
+    redis_set_json("sales_history", SALES_HISTORY)
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -495,6 +498,31 @@ def normalize_stat_item(value):
         return {"count": 0, "gross": 0.0}
 
 
+def add_sales_history(price: float = 0):
+    """Dashboard grafiği için günlük satış geçmişini tutar."""
+    global SALES_HISTORY
+    today = now_tr().strftime("%Y-%m-%d")
+    item = SALES_HISTORY.get(today, {})
+    try:
+        count = int(item.get("count", 0) or 0)
+        gross = float(item.get("gross", 0) or 0)
+    except Exception:
+        count = 0
+        gross = 0.0
+
+    SALES_HISTORY[today] = {
+        "count": count + 1,
+        "gross": gross + float(price or 0),
+    }
+
+    # Eski verileri şişirmemek için son 90 günü tut.
+    try:
+        keep_from = (now_tr() - timedelta(days=90)).strftime("%Y-%m-%d")
+        SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) >= keep_from}
+    except Exception:
+        pass
+
+
 def add_daily_stat(product_name: str, price: float = 0):
     global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS
     product_name = str(product_name or "Bilinmeyen Ürün").strip() or "Bilinmeyen Ürün"
@@ -507,6 +535,7 @@ def add_daily_stat(product_name: str, price: float = 0):
     add_to(DAILY_STATS)
     add_to(WEEKLY_STATS)
     add_to(MONTHLY_STATS)
+    add_sales_history(price)
     save_state()
 
 
@@ -682,6 +711,7 @@ def cache_itemsatis_product_name(advert_id: str, product_name: str):
         redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
     redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
     redis_set_json("dynamic_services", DYNAMIC_SERVICES)
+    redis_set_json("sales_history", SALES_HISTORY)
 
 
 def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
@@ -896,6 +926,7 @@ def cache_panel_service_name(panel_key: str, service_id: str, service_name: str)
     PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
     redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
     redis_set_json("dynamic_services", DYNAMIC_SERVICES)
+    redis_set_json("sales_history", SALES_HISTORY)
 
 
 def get_cached_panel_service_name(panel_key: str, service_id: str) -> str:
@@ -985,6 +1016,7 @@ def get_all_services(include_inactive: bool = False) -> dict:
 
 def save_dynamic_services():
     redis_set_json("dynamic_services", DYNAMIC_SERVICES)
+    redis_set_json("sales_history", SALES_HISTORY)
 
 
 def set_dynamic_service(advert_id: str, panel: str, service_id: str, quantity: int, platform: str, active: bool = True):
@@ -997,13 +1029,20 @@ def set_dynamic_service(advert_id: str, panel: str, service_id: str, quantity: i
     if panel_key not in PANEL_MAP:
         raise ValueError("Panel bulunamadı")
 
+    if not advert_id.isdigit():
+        raise ValueError("Itemsatış ilan ID sadece rakam olmalı")
+
     service_id = str(service_id or "").strip()
     if not service_id:
         raise ValueError("Panel servis ID boş olamaz")
+    if not service_id.isdigit():
+        raise ValueError("Panel servis ID sadece rakam olmalı")
 
     quantity = int(quantity or 0)
     if quantity <= 0:
         raise ValueError("Adet 0'dan büyük olmalı")
+    if quantity > 1000000:
+        raise ValueError("Adet en fazla 1.000.000 olabilir")
 
     DYNAMIC_SERVICES[advert_id] = normalize_dynamic_service(
         advert_id,
@@ -1238,15 +1277,18 @@ ADMIN_HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Boostera SMM Admin</title>
+<title>Boostera Admin</title>
 <style>
 body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
-.container { max-width:1100px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
+.container { max-width:1180px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
 h1 { margin:0 0 6px; color:#fff; } .muted { color:#8a8fa3; font-size:13px; margin-bottom:22px; }
-form.grid { display:grid; grid-template-columns: repeat(6, 1fr); gap:10px; margin-bottom:22px; }
-input, select, button { padding:11px; border-radius:8px; border:1px solid #2a2a3a; background:#181824; color:#e2e8f0; }
-button { background:#7c3aed; border:none; cursor:pointer; font-weight:700; }
-button.delete { background:#ef4444; } button.toggle { background:#334155; }
+form.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-bottom:22px; }
+input, select, button { padding:11px; border-radius:8px; border:1px solid #2a2a3a; background:#181824; color:#e2e8f0; font-size:14px; }
+input:focus, select:focus { border-color:#7c3aed; outline:none; }
+button { background:#7c3aed; border:none; cursor:pointer; font-weight:700; transition:background .2s; }
+button:hover { background:#5b27b1; }
+button.delete { background:#ef4444; } button.delete:hover { background:#dc2626; }
+button.toggle { background:#334155; } button.green { background:#16a34a; } button.green:hover { background:#15803d; }
 table { width:100%; border-collapse:collapse; overflow:hidden; border-radius:10px; }
 th, td { padding:12px; border-bottom:1px solid #242436; text-align:left; font-size:14px; }
 th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
@@ -1254,23 +1296,33 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
 .active { background:#064e3b; color:#86efac; } .passive { background:#3f1d1d; color:#fca5a5; }
 a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
 .notice { background:#172554; color:#bfdbfe; padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
-@media (max-width: 900px) { form.grid { grid-template-columns: 1fr; } table { font-size:12px; } }
+.toolbar { display:flex; flex-wrap:wrap; gap:10px; margin:18px 0 22px; align-items:center; }
+@media (max-width: 900px) { table { font-size:12px; display:block; overflow-x:auto; white-space:nowrap; } }
 </style>
 </head>
 <body>
 <div class="container">
-<h1>Boostera SMM Admin</h1>
+<h1>Boostera Admin</h1>
 <div class="muted">API key girilmez. API keyler Render Environment içinde kalır. Buradan sadece Itemsatış ilanını panel servisine bağlarsın.</div>
-<div class="notice">Yeni servis ekleme: Itemsatış İlan ID + Panel + Panel Servis ID + Adet + Platform.</div>
+<div class="notice">Yeni servis ekleme: Itemsatış İlan ID + Panel + Panel Servis ID + Adet + Platform. İlan adı raporlarda Itemsatış webhookundan otomatik alınır.</div>
+
+<div class="toolbar">
+  <a href="/"><button type="button">Dashboard</button></a>
+  <a href="/admin/pending-orders"><button type="button">Bekleyen Siparişler</button></a>
+  <form method="post" action="/admin/update-services" style="display:inline;">
+    <button class="green" type="submit">Servis Fiyatlarını Kontrol Et</button>
+  </form>
+</div>
+
 <form class="grid" method="post" action="/admin/add-service">
-  <input name="advert_id" placeholder="Itemsatış İlan ID" required>
+  <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir İlan ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
   <select name="panel" required>
     {% for key, panel in panels.items() %}
       <option value="{{ key }}">{{ panel.name }} ({{ key }})</option>
     {% endfor %}
   </select>
-  <input name="service_id" placeholder="Panel Servis ID" required>
-  <input name="quantity" type="number" min="1" placeholder="Adet" required>
+  <input name="service_id" placeholder="Panel Servis ID" pattern="^\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir Servis ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
+  <input name="quantity" type="number" min="1" max="1000000" placeholder="Adet" required oninvalid="this.setCustomValidity('Lütfen 1 ile 1.000.000 arasında bir adet giriniz')" oninput="setCustomValidity('')">
   <select name="platform" required>
     <option value="instagram">Instagram</option>
     <option value="tiktok">TikTok</option>
@@ -1282,6 +1334,15 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
   </select>
   <button type="submit">Ekle / Güncelle</button>
 </form>
+<script>
+document.querySelector('form.grid').addEventListener('submit', function(event) {
+  if (!this.checkValidity()) {
+    event.preventDefault();
+    alert('Formda hatalı veya eksik alanlar var. Lütfen düzeltin.');
+  }
+});
+</script>
+
 <table>
 <thead><tr><th>İlan ID</th><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Platform</th><th>Durum</th><th>Kaynak</th><th>İşlem</th></tr></thead>
 <tbody>
@@ -1308,7 +1369,6 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
 {% endfor %}
 </tbody>
 </table>
-<p style="margin-top:18px"><a href="/">Dashboard'a dön</a></p>
 </div>
 </body>
 </html>
@@ -1364,13 +1424,108 @@ def admin_toggle_service(advert_id: str = Form(...), user: str = Depends(get_cur
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.post("/admin/update-services")
+def admin_update_services(user: str = Depends(get_current_admin)):
+    """Admin panelden servis fiyat kontrolünü manuel başlatır."""
+    check_services()
+    return RedirectResponse("/admin", status_code=303)
+
+
+ADMIN_PENDING_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boostera Bekleyen Siparişler</title>
+<style>
+body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
+.container { max-width:1180px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
+h1 { margin:0 0 8px; } .muted { color:#8a8fa3; font-size:13px; margin-bottom:18px; }
+a { color:#a78bfa; text-decoration:none; }
+button { padding:8px 12px; border-radius:8px; border:none; background:#7c3aed; color:#fff; cursor:pointer; font-weight:700; }
+button.delete { background:#ef4444; }
+table { width:100%; border-collapse:collapse; margin-top:20px; }
+th, td { padding:12px; border-bottom:1px solid #242436; text-align:left; font-size:14px; }
+th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+.badge { padding:4px 8px; border-radius:99px; font-size:12px; font-weight:700; }
+.active { background:#064e3b; color:#86efac; } .cancelled { background:#3f1d1d; color:#fca5a5; }
+@media (max-width: 900px) { table { display:block; overflow-x:auto; white-space:nowrap; } }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Bekleyen Siparişler</h1>
+<div class="muted">Buradaki iptal işlemi panelde gerçek iptal yapmaz; sadece bot takip listesinde iptal işaretler.</div>
+<p><a href="/admin">← Admin Paneline Dön</a></p>
+<table>
+<thead>
+<tr><th>Ürün</th><th>SMM ID</th><th>Link</th><th>Panel</th><th>Bekleme</th><th>Durum</th><th>İşlem</th></tr>
+</thead>
+<tbody>
+{% for order in pending_orders %}
+<tr>
+<td>{{ order.product_name }}</td>
+<td>{{ order.smm_order_id }}</td>
+<td><a href="{{ order.link }}" target="_blank">Link</a></td>
+<td>{{ order.panel }}</td>
+<td>{{ ((now_ts - order.created_at) // 60) }} dk</td>
+<td>{% if order.cancelled %}<span class="badge cancelled">İptal İşaretli</span>{% else %}<span class="badge active">Aktif</span>{% endif %}</td>
+<td>
+{% if not order.cancelled %}
+<form method="post" action="/admin/cancel-order" onsubmit="return confirm('Bu sipariş sadece bot takip listesinde iptal işaretlenecek. Devam edilsin mi?')">
+<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id }}">
+<button class="delete" type="submit">İptal İşaretle</button>
+</form>
+{% else %}-{% endif %}
+</td>
+</tr>
+{% else %}
+<tr><td colspan="7" style="text-align:center;color:#8a8fa3;">Bekleyen sipariş yok.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/pending-orders", response_class=HTMLResponse)
+def admin_pending_orders(user: str = Depends(get_current_admin)):
+    template = Template(ADMIN_PENDING_HTML)
+    html = template.render(pending_orders=PENDING_ORDERS, now_ts=int(time.time()))
+    return HTMLResponse(content=html)
+
+
+@app.post("/admin/cancel-order")
+def admin_cancel_order(smm_order_id: str = Form(...), user: str = Depends(get_current_admin)):
+    for order in PENDING_ORDERS:
+        if str(order.get("smm_order_id")) == str(smm_order_id):
+            if not order.get("cancelled"):
+                order["cancelled"] = True
+                save_state()
+                log("warning", "order_cancelled_admin", smm_order_id=smm_order_id, product=order.get("product_name"))
+                send_telegram(
+                    f"Admin panelden sipariş bot takip listesinde iptal işaretlendi.\n\n"
+                    f"SMM ID: {smm_order_id}\n"
+                    f"Ürün: {order.get('product_name', 'Bilinmiyor')}\n"
+                    f"Panel: {order.get('panel', 'Bilinmiyor')}\n\n"
+                    f"Not: Bu işlem panelde gerçek iptal yapmaz. Panel tarafını ayrıca kontrol et."
+                )
+            return RedirectResponse("/admin/pending-orders", status_code=303)
+
+    raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
+
+
 # ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Boostera SMM Dashboard</title>
+<title>Boostera Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
 
@@ -1628,6 +1783,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- SATIŞ GRAFİĞİ -->
+  <div class="card" style="margin-bottom:28px;">
+    <div class="card-title">Son 7 Gün Satış Grafiği</div>
+    <canvas id="dailySalesChart" height="90"></canvas>
+  </div>
+
   <!-- BEKLEYEN + BAŞARISIZ -->
   <div class="grid-2">
     <div class="card">
@@ -1654,7 +1815,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 async function loadAll() {
   document.getElementById('lastUpdated').textContent = 'Güncelleniyor...';
-  await Promise.all([loadStats(), loadPending(), loadFailed(), loadLogs()]);
+  await Promise.all([loadStats(), loadSalesChart(), loadPending(), loadFailed(), loadLogs()]);
   const now = new Date().toLocaleTimeString('tr-TR');
   document.getElementById('lastUpdated').textContent = `Son güncelleme: ${now}`;
 }
@@ -1667,6 +1828,41 @@ async function loadStats() {
   document.getElementById('failedCount').textContent = d.failed_count;
   document.getElementById('todayGross').textContent = d.today_gross.toFixed(0) + ' ₺';
   document.getElementById('todayNet').textContent = 'net ' + d.today_net.toFixed(0) + ' ₺';
+}
+
+async function loadSalesChart() {
+  const canvas = document.getElementById('dailySalesChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const r = await fetch('/api/sales-data');
+  const d = await r.json();
+  const ctx = canvas.getContext('2d');
+  if (window.dailySalesChart) {
+    window.dailySalesChart.data.labels = d.labels;
+    window.dailySalesChart.data.datasets[0].data = d.values;
+    window.dailySalesChart.update();
+    return;
+  }
+  window.dailySalesChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: d.labels,
+      datasets: [{
+        label: 'Satış Sayısı',
+        data: d.values,
+        fill: false,
+        borderColor: 'rgba(124, 58, 237, 0.9)',
+        tension: 0.3
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { labels: { color: '#e2e8f0' } } },
+      scales: {
+        x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+        y: { beginAtZero: true, ticks: { color: '#64748b', precision: 0 }, grid: { color: 'rgba(255,255,255,0.05)' } }
+      }
+    }
+  });
 }
 
 async function loadPending() {
@@ -1745,6 +1941,28 @@ def api_stats():
         "pending_count": len(PENDING_ORDERS),
         "failed_count": len(FAILED_ORDERS),
     }
+
+
+@app.get("/api/sales-data")
+def api_sales_data():
+    labels = []
+    values = []
+    gross_values = []
+    now = now_tr()
+
+    for i in range(6, -1, -1):
+        day_dt = now - timedelta(days=i)
+        day_key = day_dt.strftime("%Y-%m-%d")
+        labels.append(day_dt.strftime("%d.%m"))
+        item = SALES_HISTORY.get(day_key, {})
+        try:
+            values.append(int(item.get("count", 0) or 0))
+            gross_values.append(float(item.get("gross", 0) or 0))
+        except Exception:
+            values.append(0)
+            gross_values.append(0.0)
+
+    return {"labels": labels, "values": values, "gross_values": gross_values}
 
 
 @app.get("/api/pending")
@@ -2111,6 +2329,7 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     message = data.get("message", {})
     text = message.get("text", "").strip()
+    command = text.split()[0].split("@")[0].lower() if text else ""
     chat = message.get("chat", {})
     chat_id = str(chat.get("id", ""))
 
@@ -2119,7 +2338,7 @@ async def telegram_webhook(request: Request):
 
     log("info", "telegram_command", command=text[:50])
 
-    if text in ["/start", "/help"]:
+    if command in ["/start", "/help"]:
         send_telegram(
             "Bot komutları:\n\n"
             "/panels - Ekli panelleri göster\n"
@@ -2144,31 +2363,34 @@ async def telegram_webhook(request: Request):
         )
         return {"ok": True}
 
-    if text == "/status":
+    if command == "/status":
         send_telegram("Bot aktif çalışıyor.\n\nRender: Aktif\nTelegram: Aktif\nItemsatış Webhook: Aktif")
         return {"ok": True}
 
-    if text == "/panels":
+    if command == "/panels":
         send_telegram(build_panels_list_text())
         return {"ok": True}
 
-    if text == "/services":
+    if command == "/services":
         send_telegram(build_services_list_text())
         return {"ok": True}
 
-    if text == "/balance" or text.startswith("/balance "):
-        handle_panel_balance_command(text)
+    if command == "/balance":
+        balance_text = text
+        if text.split()[0].startswith("/balance@"):
+            balance_text = "/balance" + (" " + " ".join(text.split()[1:]) if len(text.split()) > 1 else "")
+        handle_panel_balance_command(balance_text)
         return {"ok": True}
 
-    if text == "/balance-all":
+    if command == "/balance-all":
         handle_panel_balance_command("/balance all")
         return {"ok": True}
 
-    if text == "/medyabalance":
+    if command == "/medyabalance":
         handle_panel_balance_command("/balance medyabayim")
         return {"ok": True}
 
-    if text == "/health":
+    if command == "/health":
         redis_t = "Redis: Aktif" if UPSTASH_REDIS_REST_URL else "Redis: Eksik"
         panel_lines = []
         for key in PANEL_MAP.keys():
@@ -2189,7 +2411,7 @@ async def telegram_webhook(request: Request):
         )
         return {"ok": True}
 
-    if text == "/failed":
+    if command == "/failed":
         if not FAILED_ORDERS:
             send_telegram("Başarısız sipariş yok.")
             return {"ok": True}
@@ -2199,7 +2421,7 @@ async def telegram_webhook(request: Request):
         send_telegram("\n".join(lines))
         return {"ok": True}
 
-    if text == "/pending":
+    if command == "/pending":
         if not PENDING_ORDERS:
             send_telegram("Bekleyen sipariş yok.")
             return {"ok": True}
@@ -2213,45 +2435,45 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     # YENİ: /cancel komutu
-    if text.startswith("/cancel"):
+    if command == "/cancel":
         handle_cancel_command(text)
         return {"ok": True}
 
-    if text == "/report":
+    if command == "/report":
         send_telegram(build_sales_report("Bugünkü Sipariş Özeti", DAILY_STATS, "Bugün sipariş yok."))
         return {"ok": True}
 
-    if text == "/week-report":
+    if command == "/week-report":
         send_telegram(build_sales_report("Haftalık Özet", WEEKLY_STATS, "Bu hafta sipariş yok."))
         return {"ok": True}
 
-    if text == "/month-report":
+    if command == "/month-report":
         send_telegram(build_sales_report("Aylık Özet", MONTHLY_STATS, "Bu ay sipariş yok."))
         return {"ok": True}
 
-    if text == "/report-all":
+    if command == "/report-all":
         daily = build_sales_report("Bugünkü Özet", DAILY_STATS, "Bugün sipariş yok.")
         weekly = build_sales_report("Haftalık Özet", WEEKLY_STATS, "Bu hafta sipariş yok.")
         monthly = build_sales_report("Aylık Özet", MONTHLY_STATS, "Bu ay sipariş yok.")
         send_telegram(daily + "\n\n---\n\n" + weekly + "\n\n---\n\n" + monthly)
         return {"ok": True}
 
-    if text == "/reset-report":
+    if command == "/reset-report":
         reset_sales_stats("daily")
         send_telegram("Günlük rapor sıfırlandı.")
         return {"ok": True}
 
-    if text == "/reset-week-report":
+    if command == "/reset-week-report":
         reset_sales_stats("weekly")
         send_telegram("Haftalık rapor sıfırlandı.")
         return {"ok": True}
 
-    if text == "/reset-month-report":
+    if command == "/reset-month-report":
         reset_sales_stats("monthly")
         send_telegram("Aylık rapor sıfırlandı.")
         return {"ok": True}
 
-    if text == "/reset-all-reports":
+    if command == "/reset-all-reports":
         reset_sales_stats("all")
         send_telegram("Tüm raporlar sıfırlandı.")
         return {"ok": True}
