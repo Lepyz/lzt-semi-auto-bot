@@ -11,6 +11,9 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
+ITEMSATIS_COMMISSION_RATE = 0.07
+RECORDED_SALES = set()
+
 SMM_API_URL = os.getenv("SMM_API_URL", "https://smmrush.com/api/v2")
 SMM_API_KEY = os.getenv("SMM_API_KEY", "")
 INSTAGRAM_1000_SERVICE_ID = os.getenv("INSTAGRAM_1000_SERVICE_ID", "63")
@@ -123,7 +126,9 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
+    global RECORDED_SALES
 
+    RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
     FAILED_ORDERS = redis_get_json("failed_orders", [])
@@ -138,6 +143,7 @@ def load_state():
 
 
 def save_state():
+    redis_set_json("recorded_sales", list(RECORDED_SALES))
     redis_set_json("processed_orders", list(PROCESSED_ORDERS))
     redis_set_json("processed_links", list(PROCESSED_LINKS))
     redis_set_json("failed_orders", FAILED_ORDERS)
@@ -211,14 +217,121 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail=""):
     save_state()
 
 
-def add_daily_stat(product_name: str):
+def get_order_price(data: dict) -> float:
+    value = get_nested(
+        data,
+        "price", "total", "amount", "total_price", "order_price",
+        "details.price", "details.total", "details.amount", "details.total_price", "details.order_price",
+        "data.price", "data.total", "data.amount", "data.total_price", "data.order_price",
+        "payment.price", "payment.total", "payment.amount",
+        "details.payment.price", "details.payment.total", "details.payment.amount",
+        "data.payment.price", "data.payment.total", "data.payment.amount",
+    )
+
+    try:
+        clean_value = str(value or "0")
+        clean_value = clean_value.replace("TL", "").replace("₺", "").replace("TRY", "")
+        clean_value = clean_value.replace(" ", "").replace(",", ".").strip()
+        return float(clean_value)
+    except Exception:
+        return 0.0
+
+
+def normalize_stat_item(value):
+    if isinstance(value, dict):
+        return {
+            "count": int(value.get("count", 0) or 0),
+            "gross": float(value.get("gross", 0) or 0),
+        }
+
+    try:
+        return {"count": int(value or 0), "gross": 0.0}
+    except Exception:
+        return {"count": 0, "gross": 0.0}
+
+
+def add_daily_stat(product_name: str, price: float = 0):
     global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS
 
-    DAILY_STATS[product_name] = DAILY_STATS.get(product_name, 0) + 1
-    WEEKLY_STATS[product_name] = WEEKLY_STATS.get(product_name, 0) + 1
-    MONTHLY_STATS[product_name] = MONTHLY_STATS.get(product_name, 0) + 1
+    product_name = str(product_name or "Bilinmeyen Ürün").strip() or "Bilinmeyen Ürün"
+
+    def add_to(stats):
+        stats[product_name] = normalize_stat_item(stats.get(product_name, {}))
+        stats[product_name]["count"] += 1
+        stats[product_name]["gross"] += float(price or 0)
+
+    add_to(DAILY_STATS)
+    add_to(WEEKLY_STATS)
+    add_to(MONTHLY_STATS)
 
     save_state()
+
+
+def record_itemsatis_sale(order_id, advert_id, buyer, product_name, price, link="") -> bool:
+    global RECORDED_SALES
+
+    sale_key = make_order_key(order_id, advert_id, buyer, link)
+
+    if sale_key in RECORDED_SALES:
+        return False
+
+    add_daily_stat(product_name, price)
+    RECORDED_SALES.add(sale_key)
+    save_state()
+
+    return True
+
+
+def build_sales_report(title: str, stats: dict, empty_text: str):
+    lines = [f"{title}\n"]
+
+    total_count = 0
+    gross_total = 0.0
+
+    if stats:
+        normalized_items = []
+
+        for product_name, raw_value in stats.items():
+            item = normalize_stat_item(raw_value)
+            count = item["count"]
+            gross = item["gross"]
+
+            if count <= 0:
+                continue
+
+            normalized_items.append((product_name, count, gross))
+            total_count += count
+            gross_total += gross
+
+        normalized_items.sort(key=lambda x: x[1], reverse=True)
+
+        if normalized_items:
+            for product_name, count, gross in normalized_items:
+                if gross > 0:
+                    lines.append(f"{product_name} | {count}x | {gross:.2f} TL")
+                else:
+                    lines.append(f"{product_name} | {count}x")
+        else:
+            lines.append(empty_text)
+    else:
+        lines.append(empty_text)
+
+    commission = gross_total * ITEMSATIS_COMMISSION_RATE
+    net_total = gross_total - commission
+
+    lines.append(f"\nToplam Sipariş: {total_count}")
+
+    if gross_total > 0:
+        lines.append(f"Brüt Kazanç: {gross_total:.2f} TL")
+        lines.append(f"Itemsatış Komisyonu (%7): {commission:.2f} TL")
+        lines.append(f"Net Kazanç: {net_total:.2f} TL")
+    else:
+        lines.append("Kazanç: Tutar bilgisi gelmediği için hesaplanamadı.")
+
+    lines.append(f"Başarısız Sipariş: {len(FAILED_ORDERS)}")
+    lines.append(f"Bekleyen SMM Sipariş: {len(PENDING_ORDERS)}")
+
+    return "\n".join(lines)
 
 
 def add_pending_order(order_id, advert_id, product_name, panel, api_url, api_key, smm_order_id, link):
@@ -644,21 +757,13 @@ def daily_report():
     if LAST_DAILY_REPORT_DATE == today:
         return {"ok": True, "message": "Bugünün raporu zaten gönderildi"}
 
-    lines = ["Günlük Satış Özeti\n"]
-    total = 0
+    report_text = build_sales_report(
+        "Günlük Satış Özeti",
+        DAILY_STATS,
+        "Bugün kayıtlı sipariş yok.",
+    )
 
-    if DAILY_STATS:
-        for product_name, count in DAILY_STATS.items():
-            lines.append(f"{product_name}: {count}")
-            total += count
-    else:
-        lines.append("Bugün kayıtlı otomatik sipariş yok.")
-
-    lines.append(f"\nToplam otomatik sipariş: {total}")
-    lines.append(f"Başarısız sipariş kaydı: {len(FAILED_ORDERS)}")
-    lines.append(f"Bekleyen sipariş: {len(PENDING_ORDERS)}")
-
-    send_telegram("\n".join(lines))
+    send_telegram(report_text)
 
     LAST_DAILY_REPORT_DATE = today
     DAILY_STATS = {}
@@ -685,26 +790,13 @@ def weekly_report():
     if LAST_WEEKLY_REPORT_DATE == today:
         return {"ok": True, "message": "Bu haftanın raporu zaten gönderildi"}
 
-    lines = ["Haftalık Satış Raporu\n"]
-    total = 0
+    report_text = build_sales_report(
+        "Haftalık Satış Raporu",
+        WEEKLY_STATS,
+        "Bu hafta kayıtlı sipariş yok.",
+    )
 
-    if WEEKLY_STATS:
-        sorted_items = sorted(WEEKLY_STATS.items(), key=lambda x: x[1], reverse=True)
-
-        for product_name, count in sorted_items:
-            lines.append(f"{product_name}: {count}")
-            total += count
-
-        top_product, top_count = sorted_items[0]
-        lines.append(f"\nEn çok satan: {top_product} ({top_count})")
-    else:
-        lines.append("Bu hafta kayıtlı sipariş yok.")
-
-    lines.append(f"\nToplam sipariş: {total}")
-    lines.append(f"Başarısız sipariş kaydı: {len(FAILED_ORDERS)}")
-    lines.append(f"Bekleyen sipariş: {len(PENDING_ORDERS)}")
-
-    send_telegram("\n".join(lines))
+    send_telegram(report_text)
 
     LAST_WEEKLY_REPORT_DATE = today
     WEEKLY_STATS = {}
@@ -731,26 +823,13 @@ def monthly_report():
     if LAST_MONTHLY_REPORT_DATE == today:
         return {"ok": True, "message": "Bu ayın raporu zaten gönderildi"}
 
-    lines = ["Aylık Satış Raporu\n"]
-    total = 0
+    report_text = build_sales_report(
+        "Aylık Satış Raporu",
+        MONTHLY_STATS,
+        "Bu ay kayıtlı sipariş yok.",
+    )
 
-    if MONTHLY_STATS:
-        sorted_items = sorted(MONTHLY_STATS.items(), key=lambda x: x[1], reverse=True)
-
-        for product_name, count in sorted_items:
-            lines.append(f"{product_name}: {count}")
-            total += count
-
-        top_product, top_count = sorted_items[0]
-        lines.append(f"\nEn çok satan: {top_product} ({top_count})")
-    else:
-        lines.append("Bu ay kayıtlı sipariş yok.")
-
-    lines.append(f"\nToplam sipariş: {total}")
-    lines.append(f"Başarısız sipariş kaydı: {len(FAILED_ORDERS)}")
-    lines.append(f"Bekleyen sipariş: {len(PENDING_ORDERS)}")
-
-    send_telegram("\n".join(lines))
+    send_telegram(report_text)
 
     LAST_MONTHLY_REPORT_DATE = today
     MONTHLY_STATS = {}
@@ -840,6 +919,7 @@ async def itemsatis_webhook(request: Request):
     advert_id = get_advert_id(data)
     product_name = get_product_name(data)
     buyer = get_buyer(data)
+    price = get_order_price(data)
 
     ignored_events = {
         "review_received",
@@ -853,15 +933,30 @@ async def itemsatis_webhook(request: Request):
         print("IGNORED EVENT:", event, flush=True)
         return {"ignored": True, "event": event}
 
+    report_product_name = (
+        product_name
+        or SMM_SERVICE_MAP.get(advert_id, {}).get("name")
+        or ("CS2 5 Yıllık Hesap" if advert_id == CS2_ADVERT_ID else "Bilinmeyen Ürün")
+    )
+
+    record_itemsatis_sale(
+        order_id=order_id,
+        advert_id=advert_id,
+        buyer=buyer,
+        product_name=report_product_name,
+        price=price,
+    )
+
     send_telegram(
         f"""
 Itemsatış webhook geldi.
 
 Event: {event or "Yok"}
 Advert ID: {advert_id or "Yok"}
-Ürün: {product_name or "Bulunamadı"}
+Ürün: {report_product_name}
 Sipariş ID: {order_id}
 Müşteri: {buyer}
+Tutar: {price:.2f} TL
 """
     )
 
@@ -1033,7 +1128,6 @@ Bakiye: {balance} {currency}
         PROCESSED_LINKS.add(duplicate_link_key)
         PROCESSED_ORDERS.add(order_key)
 
-        add_daily_stat(service["name"])
 
         add_pending_order(
             order_id,
@@ -1113,7 +1207,7 @@ Bot komutları:
 /health - Genel sistem durumunu gösterir
 /failed - Başarısız siparişleri gösterir
 /pending - Takip edilen siparişleri gösterir
-/report - Günlük sayaç durumunu gösterir
+/report - Bugünkü sipariş özetini gösterir
 /help - Komutları gösterir
 """
         )
@@ -1247,21 +1341,13 @@ Link: {item["link"]}
         return {"ok": True}
 
     if text == "/report":
-        lines = ["Bugünkü Otomatik Sipariş Sayacı:\n"]
-        total = 0
+        report_text = build_sales_report(
+            "Bugünkü Sipariş Özeti",
+            DAILY_STATS,
+            "Bugün kayıtlı sipariş yok.",
+        )
 
-        if DAILY_STATS:
-            for product_name, count in DAILY_STATS.items():
-                lines.append(f"{product_name}: {count}")
-                total += count
-        else:
-            lines.append("Bugün kayıtlı otomatik sipariş yok.")
-
-        lines.append(f"\nToplam: {total}")
-        lines.append(f"Başarısız: {len(FAILED_ORDERS)}")
-        lines.append(f"Bekleyen: {len(PENDING_ORDERS)}")
-
-        send_telegram("\n".join(lines))
+        send_telegram(report_text)
         return {"ok": True}
 
     send_telegram("Bilinmeyen komut. Komutları görmek için: /help")
