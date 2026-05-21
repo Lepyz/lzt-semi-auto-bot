@@ -5,6 +5,7 @@ import time
 import hashlib
 import asyncio
 import secrets
+import threading
 import requests
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends, Form
@@ -43,10 +44,17 @@ except Exception:
 app = FastAPI()
 security = HTTPBasic()
 
+# Optional favicon/static assets. If the static folder is not in the repo, bot still starts.
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
+STATE_LOCK = threading.RLock()
+
 
 ITEMSATIS_COMMISSION_RATE = 0.07
 RECORDED_SALES = set()
@@ -192,6 +200,46 @@ HEADERS = {
 FAILED_PANEL_STATUSES = {"cancelled", "canceled", "partial", "fail", "failed", "refunded"}
 COMPLETED_PANEL_STATUSES = {"completed", "complete", "tamamlandı"}
 SLOW_API_THRESHOLD_SECONDS = float(os.getenv("SLOW_API_THRESHOLD_SECONDS", "8"))
+PANEL_SAFE_RETRY_COUNT = int(os.getenv("PANEL_SAFE_RETRY_COUNT", "2"))
+PANEL_RETRY_SLEEP_SECONDS = float(os.getenv("PANEL_RETRY_SLEEP_SECONDS", "1"))
+
+
+
+
+def validate_environment():
+    """Başlangıçta kritik ayarları kontrol eder; eksik olanları loglar.
+    Panel API keyleri zorunlu değildir; sadece ilgili panel kullanılırken gerekir.
+    """
+    required = {
+        "BOT_TOKEN": BOT_TOKEN,
+        "CHAT_ID": CHAT_ID,
+        "UPSTASH_REDIS_REST_URL": UPSTASH_REDIS_REST_URL,
+        "UPSTASH_REDIS_REST_TOKEN": UPSTASH_REDIS_REST_TOKEN,
+        "ADMIN_PASSWORD": ADMIN_PASSWORD,
+    }
+    missing = [name for name, value in required.items() if not value or (name == "ADMIN_PASSWORD" and value == "changeme")]
+    if missing:
+        try:
+            logger.warning("environment_missing_or_unsafe", missing=missing)
+        except Exception:
+            print("ENV WARNING:", missing, flush=True)
+    return missing
+
+
+def is_webhook_authorized(request: Request) -> bool:
+    """Opsiyonel webhook token kontrolü.
+    WEBHOOK_SECRET_TOKEN boşsa eski sistem gibi herkese açık kalır.
+    Token ayarlanırsa Itemsatış webhook URL'sine ?token=... ekleyebilir veya X-Webhook-Token header kullanabilirsin.
+    """
+    if not WEBHOOK_SECRET_TOKEN:
+        return True
+    provided = (
+        request.headers.get("X-Webhook-Token")
+        or request.headers.get("X-Boostera-Token")
+        or request.query_params.get("token")
+        or ""
+    )
+    return secrets.compare_digest(str(provided), WEBHOOK_SECRET_TOKEN)
 
 
 def now_tr():
@@ -422,23 +470,24 @@ def load_state():
 
 
 def save_state():
-    sanitize_pending_orders_for_storage()
-    redis_set_json("recorded_sales", list(RECORDED_SALES))
-    redis_set_json("processed_orders", list(PROCESSED_ORDERS))
-    redis_set_json("processed_links", list(PROCESSED_LINKS))
-    redis_set_json("failed_orders", FAILED_ORDERS)
-    redis_set_json("pending_orders", PENDING_ORDERS)
-    redis_set_json("daily_stats", DAILY_STATS)
-    redis_set_json("last_daily_report_date", LAST_DAILY_REPORT_DATE)
-    redis_set_json("service_price_cache", SERVICE_PRICE_CACHE)
-    redis_set_json("weekly_stats", WEEKLY_STATS)
-    redis_set_json("monthly_stats", MONTHLY_STATS)
-    redis_set_json("last_weekly_report_date", LAST_WEEKLY_REPORT_DATE)
-    redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
-    redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
-    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
-    redis_set_json("dynamic_services", DYNAMIC_SERVICES)
-    redis_set_json("sales_history", SALES_HISTORY)
+    with STATE_LOCK:
+        sanitize_pending_orders_for_storage()
+        redis_set_json("recorded_sales", list(RECORDED_SALES))
+        redis_set_json("processed_orders", list(PROCESSED_ORDERS))
+        redis_set_json("processed_links", list(PROCESSED_LINKS))
+        redis_set_json("failed_orders", FAILED_ORDERS)
+        redis_set_json("pending_orders", PENDING_ORDERS)
+        redis_set_json("daily_stats", DAILY_STATS)
+        redis_set_json("last_daily_report_date", LAST_DAILY_REPORT_DATE)
+        redis_set_json("service_price_cache", SERVICE_PRICE_CACHE)
+        redis_set_json("weekly_stats", WEEKLY_STATS)
+        redis_set_json("monthly_stats", MONTHLY_STATS)
+        redis_set_json("last_weekly_report_date", LAST_WEEKLY_REPORT_DATE)
+        redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
+        redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
+        redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+        redis_set_json("dynamic_services", DYNAMIC_SERVICES)
+        redis_set_json("sales_history", SALES_HISTORY)
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -525,20 +574,21 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail="", **ext
         if value not in [None, ""]:
             entry[key] = value
 
-    FAILED_ORDERS.append(entry)
-    if len(FAILED_ORDERS) > 50:
-        FAILED_ORDERS.pop(0)
+    with STATE_LOCK:
+        FAILED_ORDERS.append(entry)
+        if len(FAILED_ORDERS) > 50:
+            FAILED_ORDERS.pop(0)
 
-    log(
-        "error",
-        "order_failed",
-        order_id=order_id,
-        reason=reason,
-        product=product_name,
-        smm_order_id=extra.get("smm_order_id", ""),
-        panel=extra.get("panel", ""),
-    )
-    save_state()
+        log(
+            "error",
+            "order_failed",
+            order_id=order_id,
+            reason=reason,
+            product=product_name,
+            smm_order_id=extra.get("smm_order_id", ""),
+            panel=extra.get("panel", ""),
+        )
+        save_state()
 
 
 def get_order_price(data: dict) -> float:
@@ -604,21 +654,23 @@ def add_daily_stat(product_name: str, price: float = 0):
         stats[product_name]["count"] += 1
         stats[product_name]["gross"] += float(price or 0)
 
-    add_to(DAILY_STATS)
-    add_to(WEEKLY_STATS)
-    add_to(MONTHLY_STATS)
-    add_sales_history(price)
-    save_state()
+    with STATE_LOCK:
+        add_to(DAILY_STATS)
+        add_to(WEEKLY_STATS)
+        add_to(MONTHLY_STATS)
+        add_sales_history(price)
+        save_state()
 
 
 def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price, link="") -> bool:
     global RECORDED_SALES
     sale_key = make_sale_key(data, order_id, advert_id, buyer, product_name, price, link)
-    if sale_key in RECORDED_SALES:
-        return False
-    add_daily_stat(product_name, price)
-    RECORDED_SALES.add(sale_key)
-    save_state()
+    with STATE_LOCK:
+        if sale_key in RECORDED_SALES:
+            return False
+        add_daily_stat(product_name, price)
+        RECORDED_SALES.add(sale_key)
+        save_state()
     return True
 
 
@@ -704,24 +756,25 @@ def add_pending_order(
         return
     if any(str(item.get("smm_order_id")) == str(smm_order_id) for item in PENDING_ORDERS):
         return
-    PENDING_ORDERS.append({
-        "itemsatis_order_id": str(order_id),
-        "advert_id": str(advert_id),
-        "product_name": str(product_name),
-        "panel": str(panel),
-        "panel_key": str(panel_key),
-        "api_url": str(api_url),
-        "service_id": str(service_id),
-        "quantity": int(quantity or 0) if str(quantity or "").isdigit() else quantity,
-        "platform": str(platform),
-        "smm_order_id": str(smm_order_id),
-        "link": str(link),
-        "created_at": int(time.time()),
-        "delay_alert_sent": False,
-        "cancelled": False,
-    })
-    log("info", "order_queued", order_id=order_id, smm_order_id=smm_order_id, product=product_name)
-    save_state()
+    with STATE_LOCK:
+        PENDING_ORDERS.append({
+            "itemsatis_order_id": str(order_id),
+            "advert_id": str(advert_id),
+            "product_name": str(product_name),
+            "panel": str(panel),
+            "panel_key": str(panel_key),
+            "api_url": str(api_url),
+            "service_id": str(service_id),
+            "quantity": int(quantity or 0) if str(quantity or "").isdigit() else quantity,
+            "platform": str(platform),
+            "smm_order_id": str(smm_order_id),
+            "link": str(link),
+            "created_at": int(time.time()),
+            "delay_alert_sent": False,
+            "cancelled": False,
+        })
+        log("info", "order_queued", order_id=order_id, smm_order_id=smm_order_id, product=product_name)
+        save_state()
 
 
 def get_lzt_links() -> str:
@@ -1256,7 +1309,10 @@ def handle_panel_balance_command(text: str):
 
 
 def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="", timeout=30):
-    """Panel API çağrılarını tek yerden yapar, süreyi ölçer ve yavaş çağrıları loglar."""
+    """Panel API çağrılarını tek yerden yapar.
+    balance/status/services gibi güvenli okuma çağrılarında kısa retry uygular.
+    add action otomatik retry yapmaz; çift sipariş riskini önler.
+    """
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
 
@@ -1264,39 +1320,75 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
     if extra_data:
         payload.update(extra_data)
 
-    started = time.perf_counter()
-    try:
-        r = requests.post(api_url, data=payload, headers=HEADERS, timeout=timeout)
-        elapsed = time.perf_counter() - started
-        level = "warning" if elapsed >= SLOW_API_THRESHOLD_SECONDS else "info"
-        log(
-            level,
-            "panel_api_performance",
-            panel=panel_name or api_url,
-            action=action,
-            duration=f"{elapsed:.2f}s",
-            status_code=r.status_code,
-        )
+    max_attempts = 1 if action == "add" else max(1, PANEL_SAFE_RETRY_COUNT)
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        started = time.perf_counter()
         try:
-            result = r.json()
-        except Exception:
-            return {"error": f"Panel {action} JSON cevap vermedi", "raw": r.text[:300], "duration": elapsed}
+            r = requests.post(api_url, data=payload, headers=HEADERS, timeout=timeout)
+            elapsed = time.perf_counter() - started
+            level = "warning" if elapsed >= SLOW_API_THRESHOLD_SECONDS else "info"
+            log(
+                level,
+                "panel_api_performance",
+                panel=panel_name or api_url,
+                action=action,
+                duration=f"{elapsed:.2f}s",
+                status_code=r.status_code,
+                attempt=attempt,
+            )
 
-        if isinstance(result, dict):
-            result.setdefault("_duration", elapsed)
-        return result
-    except Exception as e:
-        elapsed = time.perf_counter() - started
-        log(
-            "error",
-            "panel_api_error",
-            panel=panel_name or api_url,
-            action=action,
-            duration=f"{elapsed:.2f}s",
-            error=str(e),
-        )
-        return {"error": str(e), "duration": elapsed}
+            # 5xx panel hatalarında güvenli okuma işlemlerini tekrar deneyebiliriz.
+            if action != "add" and r.status_code >= 500 and attempt < max_attempts:
+                last_error = f"HTTP {r.status_code}"
+                time.sleep(PANEL_RETRY_SLEEP_SECONDS)
+                continue
 
+            try:
+                result = r.json()
+            except Exception:
+                result = {"error": f"Panel {action} JSON cevap vermedi", "raw": r.text[:300]}
+
+            if isinstance(result, dict):
+                result.setdefault("_duration", elapsed)
+                result.setdefault("_attempt", attempt)
+            return result
+
+        except requests.exceptions.Timeout as e:
+            elapsed = time.perf_counter() - started
+            last_error = f"timeout: {e}"
+            log(
+                "warning",
+                "panel_api_timeout",
+                panel=panel_name or api_url,
+                action=action,
+                duration=f"{elapsed:.2f}s",
+                attempt=attempt,
+            )
+            if action != "add" and attempt < max_attempts:
+                time.sleep(PANEL_RETRY_SLEEP_SECONDS)
+                continue
+            return {"error": last_error, "duration": elapsed, "attempt": attempt}
+
+        except Exception as e:
+            elapsed = time.perf_counter() - started
+            last_error = str(e)
+            log(
+                "error",
+                "panel_api_error",
+                panel=panel_name or api_url,
+                action=action,
+                duration=f"{elapsed:.2f}s",
+                attempt=attempt,
+                error=str(e),
+            )
+            if action != "add" and attempt < max_attempts:
+                time.sleep(PANEL_RETRY_SLEEP_SECONDS)
+                continue
+            return {"error": str(e), "duration": elapsed, "attempt": attempt}
+
+    return {"error": last_error or "Panel API isteği başarısız"}
 
 def panel_balance(api_url, api_key, panel_name=""):
     return _panel_api_request(api_url, api_key, "balance", panel_name=panel_name)
@@ -1361,6 +1453,7 @@ async def background_scheduler():
 
 @app.on_event("startup")
 async def startup_event():
+    validate_environment()
     asyncio.create_task(background_scheduler())
 
 
@@ -1392,6 +1485,8 @@ ADMIN_HTML = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Boostera Admin</title>
+<link rel="icon" type="image/png" href="/static/favicon.png?v=3">
+<link rel="shortcut icon" href="/static/favicon.png?v=3">
 <style>
 body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
 .container { max-width:1180px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
@@ -1768,6 +1863,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Boostera Dashboard</title>
+<link rel="icon" type="image/png" href="/static/favicon.png?v=3">
+<link rel="shortcut icon" href="/static/favicon.png?v=3">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap');
@@ -2573,6 +2670,10 @@ def check_services():
 
 @app.post("/itemsatis-webhook")
 async def itemsatis_webhook(request: Request):
+    if not is_webhook_authorized(request):
+        log("warning", "webhook_unauthorized", ip=request.client.host if request.client else "")
+        raise HTTPException(status_code=401, detail="Unauthorized webhook")
+
     try:
         data = await request.json()
     except Exception:
