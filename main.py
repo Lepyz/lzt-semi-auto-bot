@@ -202,6 +202,9 @@ COMPLETED_PANEL_STATUSES = {"completed", "complete", "tamamlandı"}
 SLOW_API_THRESHOLD_SECONDS = float(os.getenv("SLOW_API_THRESHOLD_SECONDS", "8"))
 PANEL_SAFE_RETRY_COUNT = int(os.getenv("PANEL_SAFE_RETRY_COUNT", "2"))
 PANEL_RETRY_SLEEP_SECONDS = float(os.getenv("PANEL_RETRY_SLEEP_SECONDS", "1"))
+USD_TO_TRY_RATE = float(os.getenv("USD_TO_TRY_RATE", "46"))
+USD_TO_TRY_CACHE = {"rate": USD_TO_TRY_RATE, "updated_at": 0}
+USD_TO_TRY_REFRESH_SECONDS = int(os.getenv("USD_TO_TRY_REFRESH_SECONDS", "21600"))
 
 
 
@@ -591,21 +594,106 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail="", **ext
         save_state()
 
 
+def parse_price_value(value) -> float:
+    """TL/TRY/₺ formatındaki fiyatları güvenli şekilde float'a çevirir."""
+    try:
+        if value is None:
+            return 0.0
+
+        text = str(value or "").strip()
+        if not text:
+            return 0.0
+
+        # Öncelik: içinde para birimi olan değerler. Örn: "39.90 TL", "1.250,50 TL"
+        money_match = re.search(
+            r"(\d{1,3}(?:[.\s]\d{3})*(?:[,\.]\d{1,2})|\d+(?:[,\.]\d{1,2})?)\s*(?:TL|TRY|₺)",
+            text,
+            re.IGNORECASE,
+        )
+        if money_match:
+            text = money_match.group(1)
+        else:
+            # Para birimi yoksa sadece doğrudan sayı gibi görünen alanları kabul et.
+            # Böylece "Kalan stok sayısı: 71" gibi metinlerden fiyat sanıp değer çekmeyiz.
+            if not re.fullmatch(r"\s*\d+(?:[,\.]\d{1,2})?\s*", text):
+                return 0.0
+
+        text = text.replace("TL", "").replace("TRY", "").replace("₺", "")
+        text = text.replace("tl", "").replace("try", "")
+        text = text.replace(" ", "").strip()
+
+        # TR formatı: 1.250,50 -> 1250.50
+        if "," in text and "." in text:
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", ".")
+
+        text = re.sub(r"[^0-9.]", "", text)
+        if not text:
+            return 0.0
+
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def find_price_recursive(obj) -> float:
+    """Itemsatış farklı JSON/string formatları gönderdiğinde fiyatı tüm payload içinde arar."""
+    price_keys = {
+        "price", "total", "amount", "total_price", "order_price", "sale_price",
+        "paid_price", "payment_amount", "product_price", "advert_price",
+        "earning", "seller_earning", "cost", "fee", "subtotal",
+    }
+
+    if isinstance(obj, dict):
+        # Önce güvenilir fiyat alanları.
+        for key, value in obj.items():
+            key_lower = str(key).lower()
+            if key_lower in price_keys or "price" in key_lower or "amount" in key_lower or "total" in key_lower:
+                parsed = parse_price_value(value)
+                if parsed > 0:
+                    return parsed
+
+        # Sonra nested alanlar ve raw/content içindeki "39.90 TL" gibi metinler.
+        for value in obj.values():
+            nested = find_price_recursive(value)
+            if nested > 0:
+                return nested
+
+    elif isinstance(obj, list):
+        for item in obj:
+            nested = find_price_recursive(item)
+            if nested > 0:
+                return nested
+
+    elif isinstance(obj, str):
+        return parse_price_value(obj)
+
+    return 0.0
+
+
 def get_order_price(data: dict) -> float:
     value = get_nested(
         data,
         "price", "total", "amount", "total_price", "order_price",
-        "details.price", "details.total", "details.amount",
-        "data.price", "data.total", "data.amount",
-        "payment.price", "payment.total", "payment.amount",
+        "sale_price", "paid_price", "payment_amount", "product_price",
+        "advert.price", "advert.amount", "advert.total", "advert.sale_price",
+        "details.price", "details.total", "details.amount", "details.total_price",
+        "details.order_price", "details.sale_price", "details.paid_price", "details.payment_amount",
+        "details.advert.price", "details.advert.amount", "details.advert.total",
+        "data.price", "data.total", "data.amount", "data.total_price",
+        "data.order_price", "data.sale_price", "data.paid_price", "data.payment_amount",
+        "data.advert.price", "data.advert.amount", "data.advert.total",
+        "payment.price", "payment.total", "payment.amount", "payment.total_price", "payment.paid_price",
+        "data.payment.price", "data.payment.total", "data.payment.amount",
+        "details.payment.price", "details.payment.total", "details.payment.amount",
     )
-    try:
-        clean_value = str(value or "0")
-        clean_value = clean_value.replace("TL", "").replace("₺", "").replace("TRY", "")
-        clean_value = clean_value.replace(" ", "").replace(",", ".").strip()
-        return float(clean_value)
-    except Exception:
-        return 0.0
+
+    parsed = parse_price_value(value)
+    if parsed > 0:
+        return parsed
+
+    return find_price_recursive(data)
 
 
 def normalize_stat_item(value):
@@ -1322,18 +1410,119 @@ def build_panels_list_text() -> str:
     return "\n".join(lines)
 
 
+
+def parse_numeric_balance(value) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        text = str(value).strip()
+        text = text.replace("TL", "").replace("₺", "").replace("TRY", "")
+        text = text.replace("USD", "").replace("$", "").strip()
+        if "," in text and "." in text:
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", ".")
+        text = re.sub(r"[^0-9.\-]", "", text)
+        if not text:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def get_usd_to_try_rate() -> float:
+    """USD bakiyeleri TL göstermek için güncel kura yakın değeri döndürür.
+    Önce cache kullanır, sonra ücretsiz kur API'lerinden çekmeyi dener.
+    API başarısız olursa env'deki USD_TO_TRY_RATE fallback olarak kullanılır.
+    """
+    now_ts = int(time.time())
+
+    try:
+        cached_rate = float(USD_TO_TRY_CACHE.get("rate") or 0)
+        updated_at = int(USD_TO_TRY_CACHE.get("updated_at") or 0)
+        if cached_rate > 0 and updated_at and (now_ts - updated_at) < USD_TO_TRY_REFRESH_SECONDS:
+            return cached_rate
+    except Exception:
+        pass
+
+    urls = [
+        "https://open.er-api.com/v6/latest/USD",
+        "https://api.frankfurter.app/latest?from=USD&to=TRY",
+    ]
+
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=10, headers=HEADERS)
+            data = r.json()
+
+            rate = None
+            if isinstance(data, dict):
+                rates = data.get("rates") or {}
+                rate = rates.get("TRY")
+
+            if rate:
+                rate = float(rate)
+                if rate > 0:
+                    USD_TO_TRY_CACHE["rate"] = rate
+                    USD_TO_TRY_CACHE["updated_at"] = now_ts
+                    return rate
+        except Exception as e:
+            log("warning", "usd_try_rate_fetch_failed", url=url, error=str(e))
+
+    return float(os.getenv("USD_TO_TRY_RATE", USD_TO_TRY_RATE))
+
+
+def convert_balance_to_try(balance, currency="") -> float | None:
+    numeric_balance = parse_numeric_balance(balance)
+    if numeric_balance is None:
+        return None
+    cur = str(currency or "").upper().strip()
+    if cur in ["USD", "USDT", "$"]:
+        return numeric_balance * get_usd_to_try_rate()
+    return numeric_balance
+
+
+def get_balance_currency_label(currency="") -> str:
+    cur = str(currency or "").upper().strip()
+    if cur in ["USD", "USDT", "$"]:
+        return f"USD kuru: {get_usd_to_try_rate():.2f} TL"
+    return ""
+
+
+def format_tl_amount(value) -> str:
+    try:
+        return f"{float(value):.2f} TL"
+    except Exception:
+        return "Bilinmiyor"
+
+
+def format_panel_balance_tl(balance_data: dict) -> str:
+    if not isinstance(balance_data, dict):
+        return "Bilinmiyor"
+    balance = balance_data.get("balance", "Bilinmiyor")
+    currency = balance_data.get("currency", "")
+    balance_tl = convert_balance_to_try(balance, currency)
+    if balance_tl is None:
+        return "Bilinmiyor"
+    return format_tl_amount(balance_tl)
+
 def build_all_panel_balances_text() -> str:
     lines = ["Panel Bakiyeleri:\n"]
+    used_usd_rate = False
     for key in PANEL_MAP.keys():
         panel = get_panel_config(key)
         if not is_panel_configured(key):
             lines.append(f"{panel['name']}: Eksik env")
             continue
-        balance_data = panel_balance(panel["api_url"], panel["api_key"])
+        balance_data = panel_balance(panel["api_url"], panel["api_key"], panel.get("name", key))
         if "error" in balance_data:
             lines.append(f"{panel['name']}: Hatalı - {balance_data.get('error')}")
         else:
-            lines.append(f"{panel['name']}: {balance_data.get('balance', 'Bilinmiyor')} {balance_data.get('currency', '')}")
+            if get_balance_currency_label(balance_data.get("currency", "")):
+                used_usd_rate = True
+            lines.append(f"{panel['name']}: {format_panel_balance_tl(balance_data)}")
+    if used_usd_rate:
+        lines.append(f"\n{get_balance_currency_label('USD')}")
     return "\n".join(lines)
 
 
@@ -1363,9 +1552,11 @@ def handle_panel_balance_command(text: str):
         send_telegram(f"{panel['name']} bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
         return
 
+    currency_note = get_balance_currency_label(balance_data.get("currency", ""))
+    extra = f"\n{currency_note}" if currency_note else ""
     send_telegram(
         f"{panel['name']} Bakiyesi:\n\n"
-        f"Bakiye: {balance_data.get('balance', 'Bilinmiyor')} {balance_data.get('currency', '')}"
+        f"Bakiye: {format_panel_balance_tl(balance_data)}{extra}"
     )
 
 
@@ -1483,11 +1674,12 @@ def get_panel_services(api_url, api_key, panel_name=""):
 
 def check_low_balance(balance, currency, panel_name="Panel"):
     try:
-        numeric_balance = float(balance)
-        balance_tl = numeric_balance * 39 if str(currency).upper() == "USD" else numeric_balance
+        balance_tl = convert_balance_to_try(balance, currency)
+        if balance_tl is None:
+            return
         if balance_tl <= 100:
-            log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency)
-            send_telegram(f"{panel_name} bakiyesi 100 TL altına düştü.\n\nKalan: {balance} {currency}\n\nLütfen kontrol et.")
+            log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency, balance_tl=balance_tl)
+            send_telegram(f"{panel_name} bakiyesi 100 TL altına düştü.\n\nKalan: {format_tl_amount(balance_tl)}\n\nLütfen kontrol et.")
     except Exception as e:
         log("error", "balance_check_error", error=str(e))
 
@@ -2865,7 +3057,7 @@ async def itemsatis_webhook(request: Request):
         send_telegram(
             f"SMM siparişi panele girildi.\n\nÜrün: {service_name}\nPanel: {service['panel']}\n"
             f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
-            f"Adet: {service['quantity']}\nBakiye: {balance} {currency}"
+            f"Adet: {service['quantity']}\nBakiye: {format_tl_amount(convert_balance_to_try(balance, currency) or 0)}"
         )
 
         return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
@@ -2952,7 +3144,7 @@ async def telegram_webhook(request: Request):
             if "error" in balance_data:
                 panel_lines.append(f"{panel['name']}: Hatalı - {balance_data.get('error')}")
             else:
-                panel_lines.append(f"{panel['name']}: Aktif - {balance_data.get('balance')} {balance_data.get('currency', '')}")
+                panel_lines.append(f"{panel['name']}: Aktif - {format_panel_balance_tl(balance_data)}")
 
         panel_text = "\n".join(panel_lines)
         send_telegram(
