@@ -884,7 +884,11 @@ def reset_sales_stats(scope: str = "daily"):
             WEEKLY_STATS = {}
             week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
             SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) < week_start}
-        elif scope == "monthly":
+        elif scope in ["monthly", "current_month"]:
+            # Mevcut ayı komple temizler. Dashboard bugünkü kartları da sıfırlansın diye
+            # günlük/haftalık sayaçlar da temizlenir.
+            DAILY_STATS = {}
+            WEEKLY_STATS = {}
             MONTHLY_STATS = {}
             month_start = now.replace(day=1).strftime("%Y-%m-%d")
             SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) < month_start}
@@ -1309,6 +1313,43 @@ def get_panel_service_display_name(service: dict, target_service: dict = None) -
         return f"Panel Servisi {service_id}"
 
     return "Bilinmeyen Panel Servisi"
+
+
+
+def fetch_panel_service_name_by_id(panel_key: str, service_id: str) -> str:
+    """Panel services listesinden verilen servis ID'nin gerçek servis adını çeker ve cache'ler."""
+    panel_key = normalize_panel_key(panel_key)
+    service_id = str(service_id or "").strip()
+    if not panel_key or not service_id:
+        return ""
+
+    cached = get_cached_panel_service_name(panel_key, service_id)
+    if cached:
+        return cached
+
+    panel = get_panel_config(panel_key)
+    if not panel.get("api_url") or not panel.get("api_key"):
+        return ""
+
+    services_data = get_panel_services(panel["api_url"], panel["api_key"], panel.get("name", panel_key))
+    if isinstance(services_data, dict) and "error" in services_data:
+        log("warning", "manual_service_name_fetch_failed", panel=panel_key, service_id=service_id, error=services_data.get("error"))
+        return ""
+
+    if not isinstance(services_data, list):
+        return ""
+
+    for item in services_data:
+        if str(item.get("service")) == service_id:
+            service_name = get_panel_service_display_name(
+                {"panel_key": panel_key, "panel": panel.get("name"), "service_id": service_id},
+                item,
+            )
+            if service_name and not service_name.startswith("Panel Servisi"):
+                return service_name
+            return extract_panel_service_name(item) or ""
+
+    return ""
 
 
 def normalize_dynamic_service(advert_id: str, service: dict) -> dict:
@@ -1839,11 +1880,12 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
   <a href="/"><button type="button">Dashboard</button></a>
   <a href="/admin/pending-orders"><button type="button">Bekleyen Siparişler</button></a>
   <a href="/admin/failed-orders"><button type="button">Başarısız Siparişler</button></a>
+  <a href="/admin/manual-order"><button type="button">Manuel SMM Sipariş</button></a>
   <form method="post" action="/admin/update-services" style="display:inline;">
     <button class="green" type="submit">Servis Fiyatlarını Kontrol Et</button>
   </form>
-  <form method="post" action="/admin/reset-dashboard" style="display:inline;" onsubmit="return confirm('Günlük dashboard verisi sıfırlansın mı?')">
-    <button class="delete" type="submit">Bugünü Sıfırla</button>
+  <form method="post" action="/admin/reset-dashboard" style="display:inline;" onsubmit="return confirm('Bu ayın dashboard ve rapor verileri sıfırlansın mı?')">
+    <button class="delete" type="submit">Bu Ayı Sıfırla</button>
   </form>
 </div>
 
@@ -1969,10 +2011,182 @@ def admin_update_services(user: str = Depends(get_current_admin)):
 
 @app.post("/admin/reset-dashboard")
 def admin_reset_dashboard(user: str = Depends(get_current_admin)):
-    """Admin panelden bugünkü dashboard/rapor verisini sıfırlar."""
-    reset_sales_stats("daily")
-    log("warning", "admin_dashboard_reset", user=user)
+    """Admin panelden mevcut ayın dashboard/rapor verisini sıfırlar."""
+    reset_sales_stats("current_month")
+    log("warning", "admin_month_dashboard_reset", user=user)
     return RedirectResponse("/admin", status_code=303)
+
+
+
+ADMIN_MANUAL_ORDER_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boostera Manuel SMM Sipariş</title>
+<link rel="icon" type="image/png" href="/static/favicon.png?v=3">
+<link rel="shortcut icon" href="/static/favicon.png?v=3">
+<style>
+body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
+.container { max-width:980px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
+h1 { margin:0 0 8px; } .muted { color:#8a8fa3; font-size:13px; margin-bottom:18px; line-height:1.5; }
+a { color:#a78bfa; text-decoration:none; }
+form.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:12px; margin-top:18px; }
+input, select, button, textarea { padding:11px; border-radius:8px; border:1px solid #2a2a3a; background:#181824; color:#e2e8f0; font-size:14px; }
+textarea { grid-column:1/-1; min-height:72px; resize:vertical; }
+input:focus, select:focus, textarea:focus { border-color:#7c3aed; outline:none; }
+button { background:#7c3aed; border:none; cursor:pointer; font-weight:700; }
+button:hover { background:#5b27b1; }
+.notice { background:#172554; color:#bfdbfe; padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
+.ok { background:#064e3b; color:#86efac; padding:10px 12px; border-radius:8px; margin-bottom:14px; }
+.err { background:#3f1d1d; color:#fca5a5; padding:10px 12px; border-radius:8px; margin-bottom:14px; }
+.full { grid-column:1/-1; }
+label { display:flex; flex-direction:column; gap:6px; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+small { color:#8a8fa3; text-transform:none; letter-spacing:0; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Manuel SMM Sipariş</h1>
+<div class="muted">Bu sayfa sadece senin kullanımın içindir. Panel panel dolaşmadan direkt Boostera üzerinden dış panele sipariş girer. Müşteri paneli değildir.</div>
+<p><a href="/admin">← Admin Paneline Dön</a></p>
+{% if message %}<div class="ok">{{ message|e }}</div>{% endif %}
+{% if error %}<div class="err">{{ error|e }}</div>{% endif %}
+<div class="notice">Servis adını boş bırakırsan bot seçtiğin paneldeki servis ID'den gerçek servis adını çekmeye çalışır.</div>
+<form class="grid" method="post" action="/admin/manual-order">
+  <label>Panel
+    <select name="panel" required>
+      {% for key, panel in panels.items() %}
+        <option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Panel Servis ID
+    <input name="service_id" placeholder="Örn: 93" pattern="^\\d+$" title="Sadece rakam giriniz" required maxlength="20">
+  </label>
+  <label>Adet
+    <input name="quantity" type="number" min="1" max="1000000" placeholder="Örn: 1000" required>
+  </label>
+  <label>Platform
+    <select name="platform" required>
+      <option value="instagram">Instagram</option>
+      <option value="tiktok">TikTok</option>
+      <option value="youtube">YouTube</option>
+      <option value="x">X/Twitter</option>
+      <option value="twitch">Twitch</option>
+      <option value="kick">Kick</option>
+      <option value="other">Diğer</option>
+    </select>
+  </label>
+  <label class="full">Link
+    <input name="link" placeholder="Müşteri/profil/video/gönderi linki" required maxlength="500">
+    <small>Instagram seçiliyse link temizlenir, diğer platformlarda link olduğu gibi panele gider.</small>
+  </label>
+  <label class="full">Servis adı / not (opsiyonel)
+    <input name="product_name" placeholder="Boş bırakırsan paneldeki servis adı çekilir" maxlength="180">
+  </label>
+  <button class="full" type="submit" onclick="return confirm('Bu sipariş seçilen dış panele gönderilecek. Devam edilsin mi?')">Siparişi Panele Gönder</button>
+</form>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/manual-order", response_class=HTMLResponse)
+def admin_manual_order_page(
+    message: str = "",
+    error: str = "",
+    user: str = Depends(get_current_admin),
+):
+    template = Template(ADMIN_MANUAL_ORDER_HTML)
+    return HTMLResponse(content=template.render(panels=PANEL_MAP, message=message, error=error))
+
+
+@app.post("/admin/manual-order")
+def admin_manual_order_submit(
+    panel: str = Form(...),
+    service_id: str = Form(...),
+    quantity: int = Form(...),
+    platform: str = Form("other"),
+    link: str = Form(...),
+    product_name: str = Form(""),
+    user: str = Depends(get_current_admin),
+):
+    panel_key = normalize_panel_key(panel)
+    panel_conf = get_panel_config(panel_key)
+
+    if panel_key not in PANEL_MAP:
+        raise HTTPException(status_code=400, detail="Panel bulunamadı")
+    if not panel_conf.get("api_url") or not panel_conf.get("api_key"):
+        raise HTTPException(status_code=400, detail="Panel API URL veya API KEY eksik")
+
+    service_id = str(service_id or "").strip()
+    if not service_id.isdigit():
+        raise HTTPException(status_code=400, detail="Panel servis ID sadece rakam olmalı")
+    if quantity <= 0 or quantity > 1000000:
+        raise HTTPException(status_code=400, detail="Adet 1 ile 1.000.000 arasında olmalı")
+
+    raw_link = str(link or "").strip()
+    if not raw_link:
+        raise HTTPException(status_code=400, detail="Link boş olamaz")
+
+    platform = normalize_text(platform or "other") or "other"
+    panel_link = normalize_panel_link(raw_link, platform)
+
+    if is_blacklisted(panel_link):
+        raise HTTPException(status_code=400, detail="Bu link blacklist içinde")
+
+    fetched_service_name = fetch_panel_service_name_by_id(panel_key, service_id)
+    final_product_name = str(product_name or "").strip() or fetched_service_name or f"{panel_conf['name']} Servis {service_id}"
+
+    smm_result = create_panel_order(
+        panel_conf["api_url"],
+        panel_conf["api_key"],
+        service_id,
+        panel_link,
+        quantity,
+        panel_conf.get("name", panel_key),
+    )
+
+    if "error" in smm_result:
+        log("error", "manual_order_failed", panel=panel_key, service_id=service_id, error=smm_result.get("error"))
+        raise HTTPException(status_code=400, detail=f"Panel sipariş hatası: {smm_result.get('error')}")
+
+    smm_order_id = smm_result.get("order", "Bilinmiyor")
+    manual_order_id = f"manual-{now_tr().strftime('%Y%m%d%H%M%S')}"
+    manual_advert_id = f"manual-{panel_key}-{service_id}"
+
+    add_pending_order(
+        manual_order_id,
+        manual_advert_id,
+        final_product_name,
+        panel_conf.get("name", panel_key),
+        panel_conf["api_url"],
+        panel_conf["api_key"],
+        smm_order_id,
+        panel_link,
+        service_id=service_id,
+        quantity=quantity,
+        platform=platform,
+        panel_key=panel_key,
+        price=0,
+    )
+
+    log("success", "manual_order_created", panel=panel_key, service_id=service_id, smm_order_id=smm_order_id)
+    send_telegram(
+        f"Manuel SMM siparişi panele girildi.\n\n"
+        f"Ürün: {final_product_name}\n"
+        f"Panel: {panel_conf.get('name', panel_key)}\n"
+        f"Servis ID: {service_id}\n"
+        f"SMM ID: {smm_order_id}\n"
+        f"Adet: {quantity}\n"
+        f"Link: {panel_link}"
+    )
+
+    msg = f"Sipariş panele girildi. SMM ID: {smm_order_id}"
+    return RedirectResponse(f"/admin/manual-order?message={msg}", status_code=303)
 
 
 ADMIN_PENDING_HTML = """
@@ -2385,7 +2599,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge.pending { background: rgba(245,158,11,0.15); color: var(--warning); }
   .badge.failed { background: rgba(239,68,68,0.15); color: var(--danger); }
   .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px; }
-  .order-detail { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; word-break: break-all; }
+  .order-detail { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; word-break: break-word; overflow-wrap:anywhere; }
+  .history-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:center; padding:13px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
+  .history-row:last-child { border-bottom:none; }
+  .history-title { font-size:13px; font-weight:700; color:var(--text); line-height:1.35; word-break:break-word; overflow-wrap:anywhere; }
+  .history-meta { margin-top:5px; display:flex; flex-wrap:wrap; gap:7px 10px; align-items:center; color:var(--muted); font-size:11px; font-family:'JetBrains Mono',monospace; }
+  .history-meta span { max-width:100%; overflow-wrap:anywhere; }
+  .history-link { color:var(--accent2); text-decoration:none; max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
+  .history-link:hover { text-decoration:underline; }
+  .price-badge { font-size:11px; padding:5px 9px; border-radius:999px; font-family:'JetBrains Mono',monospace; font-weight:700; white-space:nowrap; background:rgba(245,158,11,0.16); color:var(--warning); }
 
   @media (max-width: 1050px) { .grid-4 { grid-template-columns: repeat(2, 1fr); } .grid-2 { grid-template-columns: 1fr; } }
   @media (max-width: 600px) { header { padding: 16px; align-items:flex-start; flex-direction:column; } .container { padding: 18px; } .grid-4 { grid-template-columns: 1fr; } .filter-box { width:100%; justify-content:space-between; } select { flex:1; } }
@@ -2397,6 +2619,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="logo">Boostera <span>SMM</span></div>
   <div class="top-actions">
     <a class="link-btn" href="/admin">Admin</a>
+    <a class="link-btn" href="/admin/manual-order">Manuel Sipariş</a>
     <a class="link-btn" href="/api/export">CSV İndir</a>
     <span class="last-updated" id="lastUpdated">—</span>
     <button class="refresh-btn" onclick="loadAll()">↻ Yenile</button>
@@ -2621,14 +2844,24 @@ async function loadHistory() {
   const orders = d.orders || [];
   document.getElementById('historyCount').textContent = `${orders.length} kayıt`;
   if (!orders.length) { el.innerHTML = '<div class="empty">Sipariş geçmişi yok</div>'; return; }
-  el.innerHTML = orders.slice(-12).reverse().map(o => `
-    <div class="order-row">
-      <div>
-        <div>${escapeHtml(o.product_name)}</div>
-        <div class="order-detail">${escapeHtml(o.completed_at)} · ${escapeHtml(o.panel)} #${escapeHtml(o.smm_order_id)} · ${escapeHtml(o.link)}</div>
+  el.innerHTML = orders.slice(-12).reverse().map(o => {
+    const rawLink = String(o.link || '');
+    const linkPart = new RegExp('^https?://', 'i').test(rawLink)
+      ? `<a class="history-link" href="${escapeHtml(rawLink)}" target="_blank" rel="noopener">Linki Aç</a>`
+      : `<span>${escapeHtml(rawLink || 'Link yok')}</span>`;
+    return `<div class="history-row">
+      <div class="history-main">
+        <div class="history-title">${escapeHtml(o.product_name || 'Bilinmeyen Ürün')}</div>
+        <div class="history-meta">
+          <span>${escapeHtml(o.completed_at || '')}</span>
+          <span>${escapeHtml(o.panel || 'Panel yok')}</span>
+          <span>SMM #${escapeHtml(o.smm_order_id || '—')}</span>
+          ${linkPart}
+        </div>
       </div>
-      <span class="badge pending">${money(o.price || 0)}</span>
-    </div>`).join('');
+      <span class="price-badge">${money(o.price || 0)}</span>
+    </div>`;
+  }).join('');
 }
 
 async function loadLogs() {
@@ -3267,7 +3500,7 @@ async def telegram_webhook(request: Request):
             "/week-report - Haftalık özet\n"
             "/month-report - Aylık özet\n"
             "/report-all - Tüm özetler\n"
-            "/reset-report - Günlük raporu sıfırla\n"
+            "/reset-report - Bu ayın rapor/dashboard verilerini sıfırla\n"
             "/reset-all-reports - Tüm raporları sıfırla\n"
             "/help - Komutları gösterir"
         )
@@ -3401,8 +3634,8 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     if command == "/reset-report":
-        reset_sales_stats("daily")
-        send_telegram("Günlük rapor sıfırlandı.")
+        reset_sales_stats("current_month")
+        send_telegram("Bu ayın rapor ve dashboard verileri sıfırlandı.")
         return {"ok": True}
 
     if command == "/reset-week-report":
@@ -3412,7 +3645,7 @@ async def telegram_webhook(request: Request):
 
     if command == "/reset-month-report":
         reset_sales_stats("monthly")
-        send_telegram("Aylık rapor sıfırlandı.")
+        send_telegram("Aylık rapor ve dashboard verileri sıfırlandı.")
         return {"ok": True}
 
     if command == "/reset-all-reports":
