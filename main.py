@@ -2123,6 +2123,26 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
   .muted, .notice { font-size:12px; line-height:1.45; }
   .badge { display:inline-block; margin-top:4px; }
 }
+
+/* Boostera global responsive polish */
+@media (max-width: 900px) {
+  html { -webkit-text-size-adjust: 100%; }
+  body { padding: 10px !important; }
+  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
+  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
+  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
+  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { white-space: normal; overflow-wrap: anywhere; }
+  a { overflow-wrap: anywhere; }
+}
+@media (max-width: 520px) {
+  body { padding: 6px !important; }
+  h1 { font-size: 24px !important; line-height: 1.15 !important; }
+  h2 { font-size: 18px !important; }
+  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
+  input, select, button, .btn, .rbtn { width: 100% !important; }
+}
+
 </style>
 </head>
 <body>
@@ -2358,135 +2378,120 @@ ADMIN_PACKAGES_HTML = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Boostera Paketler</title>
-<link rel="icon" type="image/png" href="/static/favicon.png?v=3">
+<link rel="icon" type="image/png" href="/static/favicon.png?v=4">
+<link rel="shortcut icon" href="/static/favicon.png?v=4">
 <style>
-body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
-.container { max-width:1200px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
-h1 { margin:0 0 6px; color:#fff; } .muted { color:#8a8fa3; font-size:13px; margin-bottom:18px; }
-form.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin:18px 0 22px; }
-input, select, button { padding:11px; border-radius:8px; border:1px solid #2a2a3a; background:#181824; color:#e2e8f0; font-size:14px; }
-button { background:#7c3aed; border:none; cursor:pointer; font-weight:700; } button:hover { background:#5b27b1; }
-button.delete { background:#ef4444; } button.green { background:#16a34a; } button.toggle { background:#334155; }
-table { width:100%; border-collapse:collapse; margin-top:12px; }
-th, td { padding:10px; border-bottom:1px solid #242436; text-align:left; font-size:13px; vertical-align:top; }
-th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; }
-.badge { padding:4px 8px; border-radius:99px; font-size:12px; font-weight:700; }
-.active { background:#064e3b; color:#86efac; } .passive { background:#3f1d1d; color:#fca5a5; }
-a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
-.notice { background:#172554; color:#bfdbfe; padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
-.component { background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:10px; margin:8px 0; }
-.service-name { color:#dbeafe; font-size:12px; margin-top:4px; }
+:root{--bg:#090910;--panel:#10111b;--card:#151724;--card2:#0f172a;--border:#25283a;--border2:#30364c;--text:#eef2ff;--muted:#98a2b3;--accent:#8b5cf6;--accent2:#22d3ee;--green:#16a34a;--red:#ef4444;--blue:#1d4ed8;--orange:#f59e0b;--shadow:0 18px 50px rgba(0,0,0,.28)}
+*{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at top left,rgba(139,92,246,.14),transparent 38%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;font-size:15px;line-height:1.45}.wrap{width:min(1480px,calc(100% - 32px));margin:20px auto 40px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.back{color:#c4b5fd;text-decoration:none;font-weight:700}.shell{background:rgba(16,17,27,.92);border:1px solid var(--border);border-radius:20px;padding:24px;box-shadow:var(--shadow)}h1{margin:0 0 6px;font-size:30px;letter-spacing:-.04em}h2{font-size:18px;margin:28px 0 12px}.muted{color:var(--muted);font-size:14px}.notice{background:linear-gradient(90deg,rgba(29,78,216,.45),rgba(30,64,175,.22));border:1px solid rgba(147,197,253,.16);color:#dbeafe;padding:12px 14px;border-radius:12px;margin:14px 0;font-size:14px}.form-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:12px;margin:16px 0 8px}.form-grid .wide{grid-column:span 2}input,select,button{width:100%;min-height:46px;padding:12px 13px;border-radius:12px;border:1px solid var(--border2);background:#151622;color:var(--text);font-size:15px;outline:none}input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(139,92,246,.18)}button{border:0;background:linear-gradient(135deg,#8b5cf6,#6d28d9);font-weight:800;cursor:pointer;transition:.18s transform,.18s filter}.btn:hover,button:hover{filter:brightness(1.08);transform:translateY(-1px)}.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border-radius:12px;padding:12px 14px;min-height:44px;color:#fff;font-weight:800;background:linear-gradient(135deg,#8b5cf6,#6d28d9)}.btn.green,button.green{background:linear-gradient(135deg,#22c55e,#15803d)}.btn.red,button.red{background:linear-gradient(135deg,#ef4444,#dc2626)}.btn.slate,button.slate{background:#334155}.packages{display:grid;grid-template-columns:1fr;gap:16px}.package-card{background:linear-gradient(180deg,rgba(21,23,36,.98),rgba(13,15,24,.98));border:1px solid var(--border);border-radius:18px;padding:18px}.package-head{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px}.pkg-title{font-size:18px;font-weight:900;letter-spacing:-.02em;overflow-wrap:anywhere}.pkg-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:800;background:#1f2937;color:#cbd5e1}.pill.ok{background:#064e3b;color:#86efac}.pill.off{background:#3f1d1d;color:#fca5a5}.pkg-actions{display:flex;gap:8px;min-width:230px}.pkg-body{display:grid;grid-template-columns:minmax(280px,420px) 1fr;gap:16px}.component-form{background:rgba(15,23,42,.72);border:1px solid #1e293b;border-radius:16px;padding:14px}.component-form h3,.components h3{font-size:14px;margin:0 0 10px;color:#cbd5e1;text-transform:uppercase;letter-spacing:.08em}.component-form .stack{display:grid;gap:9px}.components-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.component-card{background:rgba(15,23,42,.86);border:1px solid #24324a;border-radius:16px;padding:14px;min-width:0}.component-name{font-weight:900;margin-bottom:8px;overflow-wrap:anywhere}.component-line{color:#cbd5e1;font-size:13px;margin:3px 0}.service-name{margin-top:9px;padding:9px 10px;background:rgba(30,64,175,.3);border:1px solid rgba(59,130,246,.22);border-radius:10px;color:#dbeafe;font-size:13px;overflow-wrap:anywhere}.empty{color:var(--muted);padding:12px;border:1px dashed var(--border2);border-radius:12px;text-align:center}.inline-form{display:inline}.mt8{margin-top:8px}.danger-text{color:#fecaca}.small{font-size:12px;color:var(--muted)}
+@media(max-width:1050px){.pkg-body{grid-template-columns:1fr}.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.pkg-actions{min-width:0}}
+@media(max-width:720px){.wrap{width:100%;margin:0}.shell{border-radius:0;border-left:0;border-right:0;padding:16px}.topbar{padding:12px 14px;margin:0}.form-grid{grid-template-columns:1fr}.form-grid .wide{grid-column:auto}h1{font-size:25px}.package-head{grid-template-columns:1fr}.pkg-actions{display:grid;grid-template-columns:1fr 1fr;width:100%}.packages{gap:12px}.package-card{border-radius:16px;padding:14px}.components-grid{grid-template-columns:1fr}input,select,button,.btn{min-height:48px;font-size:16px}.notice{font-size:13px}.pkg-meta{gap:6px}.pill{font-size:11px}}
+@media(max-width:420px){.pkg-actions{grid-template-columns:1fr}.shell{padding:12px}.package-card{padding:12px}.component-card,.component-form{padding:12px}}
+
+/* Boostera global responsive polish */
 @media (max-width: 900px) {
-  body { padding: 12px; }
-  .container { padding: 16px; border-radius: 12px; }
-  h1 { font-size:24px; }
-  form.grid { grid-template-columns: 1fr !important; gap:10px; }
-  input, select, button { width:100%; min-height:44px; font-size:16px; }
-  table { display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
-  th, td { padding:10px 9px; }
-  .component { overflow-wrap:anywhere; }
-  .actions form { display:block; margin:4px 0; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { padding: 10px !important; }
+  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
+  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
+  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
+  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { white-space: normal; overflow-wrap: anywhere; }
+  a { overflow-wrap: anywhere; }
 }
 @media (max-width: 520px) {
-  body { padding:8px; }
-  .container { padding:12px; }
-  .muted, .notice { font-size:12px; line-height:1.45; }
+  body { padding: 6px !important; }
+  h1 { font-size: 24px !important; line-height: 1.15 !important; }
+  h2 { font-size: 18px !important; }
+  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
+  input, select, button, .btn, .rbtn { width: 100% !important; }
 }
+
 </style>
 </head>
-<body><div class="container">
+<body>
+<div class="topbar"><a class="back" href="/admin">← Admin Paneline Dön</a><a class="btn slate" href="/">Dashboard</a></div>
+<main class="wrap"><section class="shell">
 <h1>Boostera Paket Sistemi</h1>
 <div class="muted">Tek Itemsatış ilanından birden fazla panel siparişi oluşturur. Aynı müşteri linki paket içindeki tüm bileşenlere gönderilir.</div>
-<div class="notice">Örnek: TikTok paket ilanı → izlenme + beğeni + favori. Raporlarda tek satış sayılır, pending tarafında her SMM ID ayrı takip edilir.</div>
-<p><a href="/admin">← Admin Paneline Dön</a></p>
+<div class="notice">Paket oluştururken ilk bileşeni de gir. Sonradan aynı pakete izlenme, beğeni, favori, yorum gibi ek bileşenler ekleyebilirsin.</div>
 
 <h2>Paket Oluştur / Güncelle</h2>
-<div class="notice">Paket tek başına panel/servis bilmez. Aşağıda ilk bileşeni de girersen paket hemen hangi panelden hangi servisi çekeceğini öğrenir. Sonradan pakete ek bileşenleri tablodan ekleyebilirsin.</div>
-<form class="grid" method="post" action="/admin/packages/add">
+<form class="form-grid" method="post" action="/admin/packages/add">
   <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\\d+$" required maxlength="20">
-  <input name="name" placeholder="Paket adı (örn: TikTok Fenomen Paket)" required maxlength="120">
+  <input class="wide" name="name" placeholder="Paket adı (örn: TikTok Fenomen Paket)" required maxlength="120">
   <select name="platform" required>
-    <option value="tiktok">TikTok</option>
-    <option value="instagram">Instagram</option>
-    <option value="youtube">YouTube</option>
-    <option value="x">X/Twitter</option>
-    <option value="twitch">Twitch</option>
-    <option value="kick">Kick</option>
-    <option value="other">Diğer</option>
+    <option value="tiktok">TikTok</option><option value="instagram">Instagram</option><option value="youtube">YouTube</option><option value="x">X/Twitter</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="other">Diğer</option>
   </select>
   <input name="first_component_name" placeholder="İlk bileşen adı: İzlenme / Beğeni" required maxlength="80">
-  <select name="first_panel" required>
-    {% for key, panel in panels.items() %}<option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>{% endfor %}
-  </select>
+  <select name="first_panel" required>{% for key, panel in panels.items() %}<option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>{% endfor %}</select>
   <input name="first_service_id" placeholder="İlk panel servis ID" pattern="^\\d+$" required maxlength="20">
   <input name="first_quantity" type="number" min="1" max="1000000" placeholder="İlk adet" required>
   <select name="first_platform" required>
-    <option value="tiktok">TikTok</option>
-    <option value="instagram">Instagram</option>
-    <option value="youtube">YouTube</option>
-    <option value="x">X/Twitter</option>
-    <option value="twitch">Twitch</option>
-    <option value="kick">Kick</option>
-    <option value="other">Diğer</option>
+    <option value="tiktok">TikTok</option><option value="instagram">Instagram</option><option value="youtube">YouTube</option><option value="x">X/Twitter</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="other">Diğer</option>
   </select>
   <button type="submit">Paketi ve İlk Bileşeni Kaydet</button>
 </form>
 
 <h2>Paketler</h2>
-<table>
-<thead><tr><th>İlan ID</th><th>Paket</th><th>Platform</th><th>Durum</th><th>Bileşen Ekle</th><th>Bileşenler</th><th>İşlem</th></tr></thead>
-<tbody>
+<div class="packages">
 {% for advert_id, package in packages.items() %}
-<tr>
-<td>{{ advert_id|e }}</td>
-<td>{{ package.name|e }}</td>
-<td>{{ package.platform|e }}</td>
-<td><span class="badge {{ 'active' if package.active else 'passive' }}">{{ 'Aktif' if package.active else 'Pasif' }}</span></td>
-<td>
-  <form method="post" action="/admin/packages/add-component" style="min-width:330px;">
-    <input type="hidden" name="advert_id" value="{{ advert_id|e }}">
-    <input name="name" placeholder="Bileşen adı: İzlenme / Beğeni" required maxlength="80" style="width:100%;margin-bottom:6px;">
-    <select name="panel" required style="width:100%;margin-bottom:6px;">
-      {% for key, panel in panels.items() %}<option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>{% endfor %}
-    </select>
-    <input name="service_id" placeholder="Panel Servis ID" pattern="^\\d+$" required maxlength="20" style="width:100%;margin-bottom:6px;">
-    <input name="quantity" type="number" min="1" max="1000000" placeholder="Adet" required style="width:100%;margin-bottom:6px;">
-    <select name="platform" required style="width:100%;margin-bottom:6px;">
-      <option value="{{ package.platform|e }}">Paket platformu: {{ package.platform|e }}</option>
-      <option value="instagram">Instagram</option><option value="tiktok">TikTok</option><option value="youtube">YouTube</option><option value="x">X/Twitter</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="other">Diğer</option>
-    </select>
-    <button class="green" type="submit">Bileşen Ekle</button>
-  </form>
-</td>
-<td>
-  {% for comp in package.components %}
-    <div class="component">
-      <b>{{ comp.name|e }}</b><br>
-      Panel: {{ comp.panel_name|e }} | ID: {{ comp.service_id|e }} | Adet: {{ comp.quantity|e }} | Platform: {{ comp.platform|e }}
-      <div class="service-name">{{ comp.panel_service_name or 'Panel servis adı güncellenmedi' }}</div>
-      <form method="post" action="/admin/packages/delete-component" onsubmit="return confirm('Bileşen silinsin mi?')" style="margin-top:6px;">
-        <input type="hidden" name="advert_id" value="{{ advert_id|e }}">
-        <input type="hidden" name="component_id" value="{{ comp.id|e }}">
-        <button class="delete" type="submit">Bileşeni Sil</button>
-      </form>
+  <article class="package-card">
+    <div class="package-head">
+      <div>
+        <div class="pkg-title">{{ package.name|e }}</div>
+        <div class="pkg-meta">
+          <span class="pill">İlan ID: {{ advert_id|e }}</span>
+          <span class="pill">Platform: {{ package.platform|e }}</span>
+          <span class="pill {{ 'ok' if package.active else 'off' }}">{{ 'Aktif' if package.active else 'Pasif' }}</span>
+          <span class="pill">{{ package.components|length }} bileşen</span>
+        </div>
+      </div>
+      <div class="pkg-actions">
+        <form method="post" action="/admin/packages/toggle"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="slate" type="submit">Aktif/Pasif</button></form>
+        <form method="post" action="/admin/packages/delete" onsubmit="return confirm('Paket tamamen silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="red" type="submit">Paketi Sil</button></form>
+      </div>
     </div>
-  {% else %}
-    <span style="color:#8a8fa3;">Bileşen yok.</span>
-  {% endfor %}
-</td>
-<td class="actions">
-  <form method="post" action="/admin/packages/toggle"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
-  <form method="post" action="/admin/packages/delete" onsubmit="return confirm('Paket tamamen silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="delete" type="submit">Sil</button></form>
-</td>
-</tr>
-{% else %}
-<tr><td colspan="7" style="text-align:center;color:#8a8fa3;">Paket yok.</td></tr>
-{% endfor %}
-</tbody>
-</table>
-</div></body></html>
+    <div class="pkg-body">
+      <div class="component-form">
+        <h3>Bileşen Ekle</h3>
+        <form class="stack" method="post" action="/admin/packages/add-component">
+          <input type="hidden" name="advert_id" value="{{ advert_id|e }}">
+          <input name="name" placeholder="Bileşen adı: İzlenme / Beğeni" required maxlength="80">
+          <select name="panel" required>{% for key, panel in panels.items() %}<option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>{% endfor %}</select>
+          <input name="service_id" placeholder="Panel Servis ID" pattern="^\\d+$" required maxlength="20">
+          <input name="quantity" type="number" min="1" max="1000000" placeholder="Adet" required>
+          <select name="platform" required>
+            <option value="{{ package.platform|e }}">Paket platformu: {{ package.platform|e }}</option>
+            <option value="instagram">Instagram</option><option value="tiktok">TikTok</option><option value="youtube">YouTube</option><option value="x">X/Twitter</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="other">Diğer</option>
+          </select>
+          <button class="green" type="submit">Bileşen Ekle</button>
+        </form>
+      </div>
+      <div class="components">
+        <h3>Bileşenler</h3>
+        <div class="components-grid">
+        {% for comp in package.components %}
+          <div class="component-card">
+            <div class="component-name">{{ comp.name|e }}</div>
+            <div class="component-line">Panel: <b>{{ comp.panel_name|e }}</b></div>
+            <div class="component-line">Servis ID: <b>{{ comp.service_id|e }}</b> · Adet: <b>{{ comp.quantity|e }}</b></div>
+            <div class="component-line">Platform: {{ comp.platform|e }}</div>
+            <div class="service-name">{{ comp.panel_service_name or 'Panel servis adı güncellenmedi' }}</div>
+            <form class="mt8" method="post" action="/admin/packages/delete-component" onsubmit="return confirm('Bileşen silinsin mi?')">
+              <input type="hidden" name="advert_id" value="{{ advert_id|e }}"><input type="hidden" name="component_id" value="{{ comp.id|e }}"><button class="red" type="submit">Bileşeni Sil</button>
+            </form>
+          </div>
+        {% else %}<div class="empty">Bileşen yok.</div>{% endfor %}
+        </div>
+      </div>
+    </div>
+  </article>
+{% else %}<div class="empty">Henüz paket yok.</div>{% endfor %}
+</div>
+</section></main>
+</body>
+</html>
 """
-
 
 def build_packages_for_admin() -> dict:
     packages = {}
@@ -2620,6 +2625,26 @@ small { color:#8a8fa3; text-transform:none; letter-spacing:0; font-size:12px; }
   .container { padding:12px; }
   .muted, .notice { font-size:12px; line-height:1.45; }
 }
+
+/* Boostera global responsive polish */
+@media (max-width: 900px) {
+  html { -webkit-text-size-adjust: 100%; }
+  body { padding: 10px !important; }
+  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
+  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
+  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
+  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { white-space: normal; overflow-wrap: anywhere; }
+  a { overflow-wrap: anywhere; }
+}
+@media (max-width: 520px) {
+  body { padding: 6px !important; }
+  h1 { font-size: 24px !important; line-height: 1.15 !important; }
+  h2 { font-size: 18px !important; }
+  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
+  input, select, button, .btn, .rbtn { width: 100% !important; }
+}
+
 </style>
 </head>
 <body>
@@ -2797,6 +2822,26 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
   .container { padding:12px; }
   .muted { font-size:12px; line-height:1.45; }
 }
+
+/* Boostera global responsive polish */
+@media (max-width: 900px) {
+  html { -webkit-text-size-adjust: 100%; }
+  body { padding: 10px !important; }
+  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
+  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
+  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
+  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { white-space: normal; overflow-wrap: anywhere; }
+  a { overflow-wrap: anywhere; }
+}
+@media (max-width: 520px) {
+  body { padding: 6px !important; }
+  h1 { font-size: 24px !important; line-height: 1.15 !important; }
+  h2 { font-size: 18px !important; }
+  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
+  input, select, button, .btn, .rbtn { width: 100% !important; }
+}
+
 </style>
 </head>
 <body>
@@ -2895,6 +2940,26 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
   .container { padding:12px; }
   .muted { font-size:12px; line-height:1.45; }
 }
+
+/* Boostera global responsive polish */
+@media (max-width: 900px) {
+  html { -webkit-text-size-adjust: 100%; }
+  body { padding: 10px !important; }
+  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
+  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
+  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
+  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { white-space: normal; overflow-wrap: anywhere; }
+  a { overflow-wrap: anywhere; }
+}
+@media (max-width: 520px) {
+  body { padding: 6px !important; }
+  h1 { font-size: 24px !important; line-height: 1.15 !important; }
+  h2 { font-size: 18px !important; }
+  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
+  input, select, button, .btn, .rbtn { width: 100% !important; }
+}
+
 </style>
 </head>
 <body>
@@ -3245,6 +3310,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .card-title { align-items:flex-start; flex-direction:column; }
     .chart-wrap { height:220px; }
   }
+
+/* Boostera global responsive polish */
+@media (max-width: 900px) {
+  html { -webkit-text-size-adjust: 100%; }
+  body { padding: 10px !important; }
+  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
+  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
+  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
+  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { white-space: normal; overflow-wrap: anywhere; }
+  a { overflow-wrap: anywhere; }
+}
+@media (max-width: 520px) {
+  body { padding: 6px !important; }
+  h1 { font-size: 24px !important; line-height: 1.15 !important; }
+  h2 { font-size: 18px !important; }
+  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
+  input, select, button, .btn, .rbtn { width: 100% !important; }
+}
+
 </style>
 </head>
 <body>
@@ -3908,6 +3993,48 @@ def monthly_report():
     return {"ok": True, "sent": True}
 
 
+def get_price_check_targets(include_inactive: bool = False):
+    """Normal servisler + paket bileşenleri için fiyat/servis varlık kontrol hedefleri."""
+    targets = []
+    seen = set()
+
+    for advert_id, raw_service in get_all_services(include_inactive=include_inactive).items():
+        service = get_service_config(raw_service)
+        if not service.get("service_id"):
+            continue
+        key = f'{service.get("panel_key")}:{service.get("service_id")}'
+        if key in seen:
+            continue
+        seen.add(key)
+        service["context"] = f"Itemsatış ilanı {advert_id}"
+        service["advert_id"] = str(advert_id)
+        targets.append(service)
+
+    for advert_id, package in get_package_configs(include_inactive=include_inactive).items():
+        package_name = str(package.get("name") or f"Paket {advert_id}")
+        for comp in package.get("components", []) or []:
+            comp = normalize_package_component(comp)
+            if not comp.get("active", True):
+                continue
+            service = get_service_config({
+                "panel": comp.get("panel"),
+                "service_id": comp.get("service_id"),
+                "quantity": comp.get("quantity"),
+                "platform": comp.get("platform"),
+            })
+            if not service.get("service_id"):
+                continue
+            key = f'{service.get("panel_key")}:{service.get("service_id")}'
+            if key in seen:
+                continue
+            seen.add(key)
+            service["context"] = f"Paket: {package_name} / {comp.get('name')}"
+            service["advert_id"] = str(advert_id)
+            targets.append(service)
+
+    return targets
+
+
 @app.head("/check-services")
 def check_services_head():
     return check_services()
@@ -3917,46 +4044,71 @@ def check_services_head():
 def check_services():
     global SERVICE_PRICE_CACHE
     changed_count = 0
-    for advert_id, raw_service in get_all_services().items():
-        service = get_service_config(raw_service)
+    missing_count = 0
 
+    for service in get_price_check_targets(include_inactive=False):
         if not service.get("api_url") or not service.get("api_key"):
-            log("warning", "service_panel_missing", advert_id=advert_id, panel=service.get("panel_key"))
+            log("warning", "service_panel_missing", advert_id=service.get("advert_id"), panel=service.get("panel_key"))
             continue
 
         services_data = get_panel_services(service["api_url"], service["api_key"], service.get("panel", ""))
         if isinstance(services_data, dict) and "error" in services_data:
             continue
+
         target_service = None
-        for item in services_data:
+        for item in services_data if isinstance(services_data, list) else []:
             if str(item.get("service")) == str(service["service_id"]):
                 target_service = item
                 break
+
+        cache_key = f'{service["panel_key"]}:{service["service_id"]}'
+        missing_key = f"missing:{cache_key}"
+
         if not target_service:
+            # Servis panelden silindiyse ya da ID artık listede yoksa bir kez uyar.
+            if SERVICE_PRICE_CACHE.get(cache_key) is not None and not SERVICE_PRICE_CACHE.get(missing_key):
+                panel_service_name = get_panel_service_display_name(service)
+                log("warning", "service_missing_from_panel", panel=service["panel"], service_id=service["service_id"], context=service.get("context"))
+                send_telegram(
+                    f"Servis panelde bulunamadı.\n\n"
+                    f"Panel Servisi: {panel_service_name}\n"
+                    f"Panel: {service['panel']}\n"
+                    f"Servis ID: {service['service_id']}\n"
+                    f"Kullanım: {service.get('context', 'Bilinmiyor')}\n\n"
+                    f"Bu servis silinmiş/pasif olmuş olabilir. İlan veya paket bileşenini kontrol et."
+                )
+                SERVICE_PRICE_CACHE[missing_key] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+                missing_count += 1
             continue
 
+        SERVICE_PRICE_CACHE.pop(missing_key, None)
         panel_service_name = get_panel_service_display_name(service, target_service)
         current_rate = str(target_service.get("rate", ""))
-        cache_key = f'{service["panel_key"]}:{service["service_id"]}'
         old_rate = SERVICE_PRICE_CACHE.get(cache_key)
+
         if old_rate is None:
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             save_state()
             continue
+
         if str(old_rate) != str(current_rate):
-            panel_service_name = get_panel_service_display_name(service, target_service)
             log("warning", "service_price_changed", panel=service["panel"], service_id=service["service_id"],
-                service_name=panel_service_name, old=old_rate, new=current_rate)
+                service_name=panel_service_name, old=old_rate, new=current_rate, context=service.get("context"))
             send_telegram(
-                f"Servis fiyatı değişti.\n\nPanel Servisi: {panel_service_name}\nPanel: {service['panel']}\n"
-                f"Servis ID: {service['service_id']}\nEski: {old_rate} → Yeni: {current_rate}\n\n"
-                f"Bu servis ID'sini kullanan Itemsatış ilanlarını kontrol et."
+                f"Servis fiyatı değişti.\n\n"
+                f"Panel Servisi: {panel_service_name}\n"
+                f"Panel: {service['panel']}\n"
+                f"Servis ID: {service['service_id']}\n"
+                f"Kullanım: {service.get('context', 'Bilinmiyor')}\n"
+                f"Eski: {old_rate} → Yeni: {current_rate}\n\n"
+                f"Bu servis ID'sini kullanan Itemsatış ilanlarını veya paketleri kontrol et."
             )
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             changed_count += 1
-    if changed_count:
+
+    if changed_count or missing_count:
         save_state()
-    return {"ok": True, "changed_count": changed_count}
+    return {"ok": True, "changed_count": changed_count, "missing_count": missing_count}
 
 
 @app.post("/itemsatis-webhook")
