@@ -5,6 +5,7 @@ import csv
 import io
 import time
 import hashlib
+import ast
 import asyncio
 import secrets
 import threading
@@ -174,6 +175,7 @@ SMM_SERVICE_MAP = {
 # /admin panelinden Redis'e kaydedilen dinamik ilan-servis eşleştirmeleri.
 # API key burada tutulmaz; panel API bilgileri PANEL_MAP ve Render Environment üzerinden gelir.
 DYNAMIC_SERVICES = {}
+PACKAGE_CONFIGS = {}
 
 PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
@@ -195,6 +197,9 @@ BLACKLIST = set()
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
 LOG_HISTORY = []
 MAX_LOG_HISTORY = 200
+LOG_FLUSH_INTERVAL_SECONDS = int(os.getenv("LOG_FLUSH_INTERVAL_SECONDS", "30"))
+_LOG_DIRTY = False
+_LOG_LAST_FLUSH = 0
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -254,11 +259,21 @@ def now_tr():
 
 
 # ─── YENİ: GELİŞMİŞ LOGLAMA ──────────────────────────────────────────────────
+def flush_logs(force: bool = False):
+    """Log geçmişini Redis'e kontrollü yazar; her logda Redis yazıp yavaşlatmaz."""
+    global _LOG_DIRTY, _LOG_LAST_FLUSH
+    if not force and not _LOG_DIRTY:
+        return
+    now_ts = time.time()
+    if force or (now_ts - _LOG_LAST_FLUSH) >= LOG_FLUSH_INTERVAL_SECONDS:
+        redis_set_json("log_history", LOG_HISTORY[-MAX_LOG_HISTORY:])
+        _LOG_LAST_FLUSH = now_ts
+        _LOG_DIRTY = False
+
+
 def log(level: str, event: str, **kwargs):
-    """
-    Hem structlog ile JSON log yazar hem de dashboard için hafızada tutar.
-    level: info | warning | error | success
-    """
+    """Hem structlog ile JSON log yazar hem de dashboard için hafızada tutar."""
+    global _LOG_DIRTY
     entry = {
         "ts": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
         "level": level,
@@ -266,17 +281,20 @@ def log(level: str, event: str, **kwargs):
         **kwargs,
     }
 
-    # Structlog
     log_fn = getattr(logger, level if level != "success" else "info", logger.info)
     log_fn(event, **kwargs)
 
-    # Dashboard geçmişi
-    LOG_HISTORY.append(entry)
-    if len(LOG_HISTORY) > MAX_LOG_HISTORY:
-        LOG_HISTORY.pop(0)
+    with STATE_LOCK:
+        LOG_HISTORY.append(entry)
+        if len(LOG_HISTORY) > MAX_LOG_HISTORY:
+            LOG_HISTORY.pop(0)
+        _LOG_DIRTY = True
 
-    # Redis'e de kaydet (son 200)
-    redis_set_json("log_history", LOG_HISTORY[-MAX_LOG_HISTORY:])
+    # Sadece aralık dolduysa Redis'e yaz.
+    try:
+        flush_logs(force=False)
+    except Exception:
+        pass
 
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -452,7 +470,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, SALES_HISTORY, ORDER_HISTORY, BLACKLIST
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -471,6 +489,7 @@ def load_state():
     PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
+    PACKAGE_CONFIGS = redis_get_json("package_configs", {})
     SALES_HISTORY = redis_get_json("sales_history", {})
     ORDER_HISTORY = redis_get_json("order_history", [])
     BLACKLIST = set(redis_get_json("blacklist", []))
@@ -496,9 +515,11 @@ def save_state():
         redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
         redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
         redis_set_json("dynamic_services", DYNAMIC_SERVICES)
+        redis_set_json("package_configs", PACKAGE_CONFIGS)
         redis_set_json("sales_history", SALES_HISTORY)
         redis_set_json("order_history", ORDER_HISTORY[-500:])
         redis_set_json("blacklist", list(BLACKLIST))
+        flush_logs(force=True)
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -975,8 +996,59 @@ def get_nested(data: dict, *paths):
     return ""
 
 
+def parse_embedded_itemsatis_payload(data: dict) -> dict:
+    """Itemsatış bazen asıl payload'u raw/raw_body içinde Python dict stringi olarak gönderir."""
+    if not isinstance(data, dict):
+        return {}
+    for key in ["raw", "raw_body", "body", "payload"]:
+        raw_value = data.get(key)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        raw_text = raw_value.strip()
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(raw_text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+    return {}
+
+
+def payload_variants(data: dict):
+    """Önce ana payload, sonra varsa raw içindeki gömülü payload'u döndürür."""
+    yield data
+    embedded = parse_embedded_itemsatis_payload(data)
+    if embedded:
+        yield embedded
+
+
+def extract_product_name_from_content(text: str) -> str:
+    """'... başlıklı ilanınız 39.90 TL...' metninden gerçek ilan adını çeker."""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    patterns = [
+        r"^(.*?)\s+başlıklı\s+ilanınız\s+",
+        r"^(.*?)\s+baslikli\s+ilaniniz\s+",
+        r"^(.*?)\s+başlıklı\s+ilaniniz\s+",
+        r"^(.*?)\s+baslikli\s+ilanınız\s+",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip(" .:-|\n\t")
+            if candidate and not is_generic_itemsatis_title(candidate):
+                return candidate
+    return ""
+
+
 def get_event(data: dict) -> str:
-    return normalize_text(get_nested(data, "event", "type", "action", "details.event", "data.event"))
+    for payload in payload_variants(data):
+        event = normalize_text(get_nested(payload, "event", "type", "action", "details.event", "data.event"))
+        if event:
+            return event
+    return ""
 
 
 def is_generic_itemsatis_title(value: str) -> bool:
@@ -997,50 +1069,69 @@ def is_generic_itemsatis_title(value: str) -> bool:
 
 
 def get_order_id(data: dict) -> str:
-    value = get_nested(
-        data,
-        "order_id", "id", "purchaseId", "purchase_id", "sale_id", "transaction_id",
-        "order.id", "order.order_id", "order.purchase_id",
-        "purchase.id", "purchase.order_id", "purchase.purchase_id",
-        "data.order_id", "data.id", "data.purchaseId", "data.purchase_id", "data.order.id",
-        "details.order_id", "details.id", "details.purchaseId", "details.purchase_id", "details.order.id",
-    )
-    return str(value or "Bilinmiyor")
+    for payload in payload_variants(data):
+        value = get_nested(
+            payload,
+            "order_id", "id", "purchaseId", "purchase_id", "sale_id", "transaction_id",
+            "order.id", "order.order_id", "order.purchase_id",
+            "purchase.id", "purchase.order_id", "purchase.purchase_id",
+            "data.order_id", "data.id", "data.purchaseId", "data.purchase_id", "data.order.id",
+            "details.order_id", "details.id", "details.purchaseId", "details.purchase_id", "details.order.id",
+        )
+        if value:
+            return str(value)
+    return "Bilinmiyor"
 
 
 def get_advert_id(data: dict) -> str:
-    return str(get_nested(data, "advert.id", "details.advert.id", "data.advert.id",
-                          "advert_id", "details.advert_id", "data.advert_id") or "")
+    for payload in payload_variants(data):
+        value = get_nested(
+            payload,
+            "advert.id", "details.advert.id", "data.advert.id",
+            "advert_id", "details.advert_id", "data.advert_id",
+            "advertId", "advert_id", "ilan_id", "ilan.id",
+        )
+        if value:
+            return str(value)
+    return ""
 
 
 def get_product_name(data: dict) -> str:
     """Itemsatış ilan adını mümkün olan tüm alanlardan yakalar; genel webhook başlıklarını ürün adı sanmaz."""
     candidate_paths = [
-        # En güvenilir ilan/advert alanları
         "advert.title", "advert.name", "advert.subject",
         "details.advert.title", "details.advert.name", "details.advert.subject",
         "data.advert.title", "data.advert.name", "data.advert.subject",
         "order.advert.title", "order.advert.name", "order.advert.subject",
         "purchase.advert.title", "purchase.advert.name", "purchase.advert.subject",
-
-        # Ürün alanları
         "product_name", "product.title", "product.name",
         "details.product_name", "details.product.title", "details.product.name",
         "data.product_name", "data.product.title", "data.product.name",
         "order.product_name", "order.product.title", "order.product.name",
         "purchase.product_name", "purchase.product.title", "purchase.product.name",
-
-        # Daha düşük güvenilir genel alanlar en sonda
+        "content", "details.content", "data.content",
         "title", "name", "details.title", "data.title",
     ]
 
-    for path in candidate_paths:
-        value = get_nested(data, path)
-        if isinstance(value, dict):
-            value = value.get("title") or value.get("name") or value.get("subject") or ""
-        value = str(value or "").strip()
-        if value and not is_generic_itemsatis_title(value):
-            return value
+    for payload in payload_variants(data):
+        for path in candidate_paths:
+            value = get_nested(payload, path)
+            if isinstance(value, dict):
+                value = value.get("title") or value.get("name") or value.get("subject") or value.get("content") or ""
+            value = str(value or "").strip()
+            if not value:
+                continue
+            from_content = extract_product_name_from_content(value)
+            if from_content:
+                return from_content
+            if value and not is_generic_itemsatis_title(value):
+                return value
+
+    # Son çare: tüm stringlerde "başlıklı ilanınız" kalıbını ara.
+    for text in collect_strings(data):
+        from_content = extract_product_name_from_content(text)
+        if from_content:
+            return from_content
 
     return ""
 
@@ -1053,9 +1144,6 @@ def cache_itemsatis_product_name(advert_id: str, product_name: str):
     if advert_id and product_name:
         PRODUCT_NAME_CACHE[advert_id] = product_name
         redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
-    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
-    redis_set_json("dynamic_services", DYNAMIC_SERVICES)
-    redis_set_json("sales_history", SALES_HISTORY)
 
 
 def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
@@ -1084,23 +1172,24 @@ def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
 
 
 def get_buyer(data: dict) -> str:
-    buyer = get_nested(
-        data,
-        "buyer", "buyer.username", "buyer.name", "buyer.user_name",
-        "customer", "customer.username", "customer.name", "customer.user_name",
-        "user", "user.username", "user.name",
-        "details.buyer", "details.buyer.username", "details.buyer.name",
-        "details.customer", "details.customer.username", "details.customer.name",
-        "data.buyer", "data.buyer.username", "data.buyer.name",
-        "data.customer", "data.customer.username", "data.customer.name",
-        "order.buyer", "order.buyer.username", "order.customer.username",
-    )
-    if isinstance(buyer, dict):
-        return str(buyer.get("username") or buyer.get("name") or buyer.get("user_name") or buyer.get("id") or "Bilinmiyor")
-    buyer = str(buyer or "").strip()
-    if is_generic_itemsatis_title(buyer):
-        return "Bilinmiyor"
-    return buyer or "Bilinmiyor"
+    for payload in payload_variants(data):
+        buyer = get_nested(
+            payload,
+            "buyer", "buyer.username", "buyer.name", "buyer.user_name",
+            "customer", "customer.username", "customer.name", "customer.user_name",
+            "user", "user.username", "user.name",
+            "details.buyer", "details.buyer.username", "details.buyer.name",
+            "details.customer", "details.customer.username", "details.customer.name",
+            "data.buyer", "data.buyer.username", "data.buyer.name",
+            "data.customer", "data.customer.username", "data.customer.name",
+            "order.buyer", "order.buyer.username", "order.customer.username",
+        )
+        if isinstance(buyer, dict):
+            buyer = buyer.get("username") or buyer.get("name") or buyer.get("user_name") or buyer.get("id") or ""
+        buyer = str(buyer or "").strip()
+        if buyer and not is_generic_itemsatis_title(buyer):
+            return buyer
+    return "Bilinmiyor"
 
 
 def collect_strings(obj, results=None):
@@ -1286,8 +1375,6 @@ def cache_panel_service_name(panel_key: str, service_id: str, service_name: str)
     cache_key = make_panel_service_cache_key(panel_key, service_id)
     PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
     redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
-    redis_set_json("dynamic_services", DYNAMIC_SERVICES)
-    redis_set_json("sales_history", SALES_HISTORY)
 
 
 def get_cached_panel_service_name(panel_key: str, service_id: str) -> str:
@@ -1478,6 +1565,154 @@ def toggle_dynamic_service(advert_id: str) -> bool:
     save_dynamic_services()
     return True
 
+
+
+
+def normalize_package_component(component: dict) -> dict:
+    component = dict(component or {})
+    panel_key = normalize_panel_key(component.get("panel_key") or component.get("panel") or "")
+    platform = normalize_text(component.get("platform") or "tiktok") or "tiktok"
+    try:
+        quantity = int(component.get("quantity") or 0)
+    except Exception:
+        quantity = 0
+    component_id = str(component.get("id") or component.get("component_id") or f"cmp_{int(time.time() * 1000)}")
+    return {
+        "id": component_id,
+        "name": str(component.get("name") or component.get("type") or "Paket Bileşeni").strip() or "Paket Bileşeni",
+        "panel": panel_key,
+        "panel_key": panel_key,
+        "service_id": str(component.get("service_id") or "").strip(),
+        "quantity": quantity,
+        "platform": platform,
+        "active": bool(component.get("active", True)),
+    }
+
+
+def normalize_package_config(advert_id: str, package: dict) -> dict:
+    advert_id = str(advert_id or "").strip()
+    package = dict(package or {})
+    platform = normalize_text(package.get("platform") or "tiktok") or "tiktok"
+    components = []
+    for component in package.get("components", []) or []:
+        normalized = normalize_package_component(component)
+        if normalized.get("panel") and normalized.get("service_id") and normalized.get("quantity", 0) > 0:
+            components.append(normalized)
+    return {
+        "advert_id": advert_id,
+        "name": str(package.get("name") or "").strip(),
+        "platform": platform,
+        "active": bool(package.get("active", True)),
+        "components": components,
+        "source": "package",
+        "created_at": package.get("created_at") or int(time.time()),
+    }
+
+
+def get_package_configs(include_inactive: bool = False) -> dict:
+    cleaned = {}
+    for advert_id, package in (PACKAGE_CONFIGS or {}).items():
+        advert_id = str(advert_id or "").strip()
+        if not advert_id:
+            continue
+        normalized = normalize_package_config(advert_id, package)
+        if normalized.get("components") and (include_inactive or normalized.get("active", True)):
+            cleaned[advert_id] = normalized
+    return cleaned
+
+
+def save_package_configs():
+    redis_set_json("package_configs", PACKAGE_CONFIGS)
+
+
+def set_package(advert_id: str, name: str, platform: str = "tiktok", active: bool = True):
+    global PACKAGE_CONFIGS
+    advert_id = str(advert_id or "").strip()
+    if not advert_id or not advert_id.isdigit():
+        raise ValueError("Itemsatış ilan ID sadece rakam olmalı")
+    existing = normalize_package_config(advert_id, PACKAGE_CONFIGS.get(advert_id, {}))
+    PACKAGE_CONFIGS[advert_id] = {
+        "advert_id": advert_id,
+        "name": str(name or existing.get("name") or f"Paket {advert_id}").strip(),
+        "platform": normalize_text(platform or existing.get("platform") or "tiktok") or "tiktok",
+        "active": active,
+        "components": existing.get("components", []),
+        "source": "package",
+        "created_at": existing.get("created_at") or int(time.time()),
+    }
+    save_package_configs()
+    return PACKAGE_CONFIGS[advert_id]
+
+
+def delete_package(advert_id: str) -> bool:
+    global PACKAGE_CONFIGS
+    advert_id = str(advert_id or "").strip()
+    if advert_id in PACKAGE_CONFIGS:
+        PACKAGE_CONFIGS.pop(advert_id, None)
+        save_package_configs()
+        return True
+    return False
+
+
+def toggle_package(advert_id: str) -> bool:
+    advert_id = str(advert_id or "").strip()
+    if advert_id not in PACKAGE_CONFIGS:
+        return False
+    current = bool(PACKAGE_CONFIGS[advert_id].get("active", True))
+    PACKAGE_CONFIGS[advert_id]["active"] = not current
+    save_package_configs()
+    return True
+
+
+def add_package_component(advert_id: str, name: str, panel: str, service_id: str, quantity: int, platform: str):
+    advert_id = str(advert_id or "").strip()
+    if advert_id not in PACKAGE_CONFIGS:
+        raise ValueError("Önce paketi oluşturmalısın")
+    panel_key = normalize_panel_key(panel)
+    if panel_key not in PANEL_MAP:
+        raise ValueError("Panel bulunamadı")
+    service_id = str(service_id or "").strip()
+    if not service_id.isdigit():
+        raise ValueError("Servis ID sadece rakam olmalı")
+    quantity = int(quantity or 0)
+    if quantity <= 0 or quantity > 1000000:
+        raise ValueError("Adet 1 ile 1.000.000 arasında olmalı")
+    component = normalize_package_component({
+        "id": f"cmp_{int(time.time() * 1000)}",
+        "name": name or "Paket Bileşeni",
+        "panel": panel_key,
+        "service_id": service_id,
+        "quantity": quantity,
+        "platform": platform,
+        "active": True,
+    })
+    PACKAGE_CONFIGS[advert_id].setdefault("components", []).append(component)
+    save_package_configs()
+    return component
+
+
+def delete_package_component(advert_id: str, component_id: str) -> bool:
+    advert_id = str(advert_id or "").strip()
+    component_id = str(component_id or "").strip()
+    if advert_id not in PACKAGE_CONFIGS:
+        return False
+    components = PACKAGE_CONFIGS[advert_id].get("components", []) or []
+    new_components = [c for c in components if str(c.get("id")) != component_id]
+    if len(new_components) == len(components):
+        return False
+    PACKAGE_CONFIGS[advert_id]["components"] = new_components
+    save_package_configs()
+    return True
+
+
+def get_package_display_name(advert_id: str, package: dict, product_name: str = "") -> str:
+    name = str(product_name or "").strip()
+    if name and not is_generic_title(name):
+        return name
+    name = str((package or {}).get("name") or "").strip()
+    if name:
+        return name
+    return f"Paket İlanı {advert_id}"
 
 def build_services_list_text() -> str:
     services = get_all_services(include_inactive=True)
@@ -1866,8 +2101,28 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
 .active { background:#064e3b; color:#86efac; } .passive { background:#3f1d1d; color:#fca5a5; }
 a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
 .notice { background:#172554; color:#bfdbfe; padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
+.service-name { max-width:360px; white-space:normal; line-height:1.35; color:#dbeafe; }
+.service-name.missing { color:#8a8fa3; font-style:italic; }
 .toolbar { display:flex; flex-wrap:wrap; gap:10px; margin:18px 0 22px; align-items:center; }
-@media (max-width: 900px) { table { font-size:12px; display:block; overflow-x:auto; white-space:nowrap; } }
+@media (max-width: 900px) {
+  body { padding: 12px; }
+  .container { padding: 16px; border-radius: 12px; }
+  h1 { font-size: 24px; }
+  .toolbar { display:grid; grid-template-columns:1fr; gap:8px; }
+  .toolbar a, .toolbar form, .toolbar button { width:100%; }
+  form.grid { grid-template-columns: 1fr !important; gap:10px; }
+  input, select, button { width:100%; min-height:44px; font-size:16px; }
+  table { font-size:12px; display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
+  th, td { padding:10px 9px; }
+  .service-name { max-width:220px; }
+  .actions form { display:block; margin:4px 0; }
+}
+@media (max-width: 520px) {
+  body { padding: 8px; }
+  .container { padding: 12px; }
+  .muted, .notice { font-size:12px; line-height:1.45; }
+  .badge { display:inline-block; margin-top:4px; }
+}
 </style>
 </head>
 <body>
@@ -1881,6 +2136,10 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
   <a href="/admin/pending-orders"><button type="button">Bekleyen Siparişler</button></a>
   <a href="/admin/failed-orders"><button type="button">Başarısız Siparişler</button></a>
   <a href="/admin/manual-order"><button type="button">Manuel SMM Sipariş</button></a>
+  <a href="/admin/packages"><button type="button">Paketler</button></a>
+  <form method="post" action="/admin/update-service-names" style="display:inline;">
+    <button class="green" type="submit">Servis İsimlerini Güncelle</button>
+  </form>
   <form method="post" action="/admin/update-services" style="display:inline;">
     <button class="green" type="submit">Servis Fiyatlarını Kontrol Et</button>
   </form>
@@ -1919,13 +2178,14 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 </script>
 
 <table>
-<thead><tr><th>İlan ID</th><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Platform</th><th>Durum</th><th>Kaynak</th><th>İşlem</th></tr></thead>
+<thead><tr><th>İlan ID</th><th>Panel</th><th>Servis ID</th><th>Panel Servis Adı</th><th>Adet</th><th>Platform</th><th>Durum</th><th>Kaynak</th><th>İşlem</th></tr></thead>
 <tbody>
 {% for advert_id, service in services.items() %}
 <tr>
 <td>{{ advert_id|e }}</td>
 <td>{{ service.panel|e }}</td>
 <td>{{ service.service_id|e }}</td>
+<td class="service-name {{ 'missing' if not service.panel_service_name else '' }}">{{ service.panel_service_name or 'Güncellenmedi' }}</td>
 <td>{{ service.quantity|e }}</td>
 <td>{{ service.platform|e }}</td>
 <td><span class="badge {{ 'active' if service.active else 'passive' }}">{{ 'Aktif' if service.active else 'Pasif' }}</span></td>
@@ -1940,7 +2200,7 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 </td>
 </tr>
 {% else %}
-<tr><td colspan="8" style="text-align:center;color:#8a8fa3;">Servis yok.</td></tr>
+<tr><td colspan="9" style="text-align:center;color:#8a8fa3;">Servis yok.</td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -1956,9 +2216,12 @@ def admin_panel(user: str = Depends(get_current_admin)):
     services = {}
     for advert_id, raw_service in get_all_services(include_inactive=True).items():
         service = get_service_config(raw_service)
+        panel_key = service.get("panel_key") or raw_service.get("panel") or ""
+        service_id = str(service.get("service_id") or "")
         services[advert_id] = {
             "panel": service.get("panel"),
-            "service_id": service.get("service_id"),
+            "service_id": service_id,
+            "panel_service_name": get_cached_panel_service_name(panel_key, service_id),
             "quantity": service.get("quantity"),
             "platform": service.get("platform"),
             "active": bool(raw_service.get("active", True)),
@@ -2009,6 +2272,74 @@ def admin_update_services(user: str = Depends(get_current_admin)):
     return RedirectResponse("/admin", status_code=303)
 
 
+def refresh_panel_service_names() -> dict:
+    """Kayıtlı servislerin paneldeki gerçek servis adlarını çekip cache'e kaydeder."""
+    updated = 0
+    missing = 0
+    checked = 0
+    services_by_panel = {}
+
+    for advert_id, raw_service in get_all_services(include_inactive=True).items():
+        service = get_service_config(raw_service)
+        panel_key = service.get("panel_key") or raw_service.get("panel") or ""
+        service_id = str(service.get("service_id") or "").strip()
+        if not panel_key or not service_id:
+            continue
+        services_by_panel.setdefault(panel_key, []).append((advert_id, service_id, service))
+
+    for package_advert_id, package in get_package_configs(include_inactive=True).items():
+        for component in package.get("components", []) or []:
+            component = normalize_package_component(component)
+            panel_key = component.get("panel")
+            service_id = str(component.get("service_id") or "").strip()
+            if panel_key and service_id:
+                services_by_panel.setdefault(panel_key, []).append((package_advert_id, service_id, component))
+
+    for panel_key, rows in services_by_panel.items():
+        panel = get_panel_config(panel_key)
+        if not panel.get("api_url") or not panel.get("api_key"):
+            missing += len(rows)
+            continue
+
+        services_data = get_panel_services(panel["api_url"], panel["api_key"], panel.get("name", panel_key))
+        if isinstance(services_data, dict) and "error" in services_data:
+            log("warning", "panel_service_names_fetch_failed", panel=panel_key, error=services_data.get("error"))
+            missing += len(rows)
+            continue
+        if not isinstance(services_data, list):
+            missing += len(rows)
+            continue
+
+        service_index = {str(item.get("service")): item for item in services_data if isinstance(item, dict)}
+        for advert_id, service_id, service in rows:
+            checked += 1
+            item = service_index.get(service_id)
+            service_name = extract_panel_service_name(item or {})
+            if service_name:
+                before = get_cached_panel_service_name(panel_key, service_id)
+                cache_panel_service_name(panel_key, service_id, service_name)
+                if before != service_name:
+                    updated += 1
+            else:
+                missing += 1
+
+    save_state()
+    return {"checked": checked, "updated": updated, "missing": missing}
+
+
+@app.post("/admin/update-service-names")
+def admin_update_service_names(user: str = Depends(get_current_admin)):
+    result = refresh_panel_service_names()
+    log("info", "admin_service_names_updated", **result)
+    send_telegram(
+        "Servis isimleri güncellendi.\n\n"
+        f"Kontrol edilen: {result.get('checked', 0)}\n"
+        f"Güncellenen: {result.get('updated', 0)}\n"
+        f"Bulunamayan: {result.get('missing', 0)}"
+    )
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/reset-dashboard")
 def admin_reset_dashboard(user: str = Depends(get_current_admin)):
     """Admin panelden mevcut ayın dashboard/rapor verisini sıfırlar."""
@@ -2017,6 +2348,204 @@ def admin_reset_dashboard(user: str = Depends(get_current_admin)):
     return RedirectResponse("/admin", status_code=303)
 
 
+
+
+
+ADMIN_PACKAGES_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boostera Paketler</title>
+<link rel="icon" type="image/png" href="/static/favicon.png?v=3">
+<style>
+body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e8f0; margin:0; padding:24px; }
+.container { max-width:1200px; margin:auto; background:#111118; border:1px solid #1e1e2e; border-radius:14px; padding:24px; }
+h1 { margin:0 0 6px; color:#fff; } .muted { color:#8a8fa3; font-size:13px; margin-bottom:18px; }
+form.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin:18px 0 22px; }
+input, select, button { padding:11px; border-radius:8px; border:1px solid #2a2a3a; background:#181824; color:#e2e8f0; font-size:14px; }
+button { background:#7c3aed; border:none; cursor:pointer; font-weight:700; } button:hover { background:#5b27b1; }
+button.delete { background:#ef4444; } button.green { background:#16a34a; } button.toggle { background:#334155; }
+table { width:100%; border-collapse:collapse; margin-top:12px; }
+th, td { padding:10px; border-bottom:1px solid #242436; text-align:left; font-size:13px; vertical-align:top; }
+th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; }
+.badge { padding:4px 8px; border-radius:99px; font-size:12px; font-weight:700; }
+.active { background:#064e3b; color:#86efac; } .passive { background:#3f1d1d; color:#fca5a5; }
+a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
+.notice { background:#172554; color:#bfdbfe; padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
+.component { background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:10px; margin:8px 0; }
+.service-name { color:#dbeafe; font-size:12px; margin-top:4px; }
+@media (max-width: 900px) {
+  body { padding: 12px; }
+  .container { padding: 16px; border-radius: 12px; }
+  h1 { font-size:24px; }
+  form.grid { grid-template-columns: 1fr !important; gap:10px; }
+  input, select, button { width:100%; min-height:44px; font-size:16px; }
+  table { display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
+  th, td { padding:10px 9px; }
+  .component { overflow-wrap:anywhere; }
+  .actions form { display:block; margin:4px 0; }
+}
+@media (max-width: 520px) {
+  body { padding:8px; }
+  .container { padding:12px; }
+  .muted, .notice { font-size:12px; line-height:1.45; }
+}
+</style>
+</head>
+<body><div class="container">
+<h1>Boostera Paket Sistemi</h1>
+<div class="muted">Tek Itemsatış ilanından birden fazla panel siparişi oluşturur. Aynı müşteri linki paket içindeki tüm bileşenlere gönderilir.</div>
+<div class="notice">Örnek: TikTok paket ilanı → izlenme + beğeni + favori. Raporlarda tek satış sayılır, pending tarafında her SMM ID ayrı takip edilir.</div>
+<p><a href="/admin">← Admin Paneline Dön</a></p>
+
+<h2>Paket Oluştur / Güncelle</h2>
+<form class="grid" method="post" action="/admin/packages/add">
+  <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\\d+$" required maxlength="20">
+  <input name="name" placeholder="Paket adı (örn: TikTok Fenomen Paket)" required maxlength="120">
+  <select name="platform" required>
+    <option value="tiktok">TikTok</option>
+    <option value="instagram">Instagram</option>
+    <option value="youtube">YouTube</option>
+    <option value="x">X/Twitter</option>
+    <option value="twitch">Twitch</option>
+    <option value="kick">Kick</option>
+    <option value="other">Diğer</option>
+  </select>
+  <button type="submit">Paket Kaydet</button>
+</form>
+
+<h2>Paketler</h2>
+<table>
+<thead><tr><th>İlan ID</th><th>Paket</th><th>Platform</th><th>Durum</th><th>Bileşen Ekle</th><th>Bileşenler</th><th>İşlem</th></tr></thead>
+<tbody>
+{% for advert_id, package in packages.items() %}
+<tr>
+<td>{{ advert_id|e }}</td>
+<td>{{ package.name|e }}</td>
+<td>{{ package.platform|e }}</td>
+<td><span class="badge {{ 'active' if package.active else 'passive' }}">{{ 'Aktif' if package.active else 'Pasif' }}</span></td>
+<td>
+  <form method="post" action="/admin/packages/add-component" style="min-width:330px;">
+    <input type="hidden" name="advert_id" value="{{ advert_id|e }}">
+    <input name="name" placeholder="Bileşen adı: İzlenme / Beğeni" required maxlength="80" style="width:100%;margin-bottom:6px;">
+    <select name="panel" required style="width:100%;margin-bottom:6px;">
+      {% for key, panel in panels.items() %}<option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>{% endfor %}
+    </select>
+    <input name="service_id" placeholder="Panel Servis ID" pattern="^\\d+$" required maxlength="20" style="width:100%;margin-bottom:6px;">
+    <input name="quantity" type="number" min="1" max="1000000" placeholder="Adet" required style="width:100%;margin-bottom:6px;">
+    <select name="platform" required style="width:100%;margin-bottom:6px;">
+      <option value="{{ package.platform|e }}">Paket platformu: {{ package.platform|e }}</option>
+      <option value="instagram">Instagram</option><option value="tiktok">TikTok</option><option value="youtube">YouTube</option><option value="x">X/Twitter</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="other">Diğer</option>
+    </select>
+    <button class="green" type="submit">Bileşen Ekle</button>
+  </form>
+</td>
+<td>
+  {% for comp in package.components %}
+    <div class="component">
+      <b>{{ comp.name|e }}</b><br>
+      Panel: {{ comp.panel_name|e }} | ID: {{ comp.service_id|e }} | Adet: {{ comp.quantity|e }} | Platform: {{ comp.platform|e }}
+      <div class="service-name">{{ comp.panel_service_name or 'Panel servis adı güncellenmedi' }}</div>
+      <form method="post" action="/admin/packages/delete-component" onsubmit="return confirm('Bileşen silinsin mi?')" style="margin-top:6px;">
+        <input type="hidden" name="advert_id" value="{{ advert_id|e }}">
+        <input type="hidden" name="component_id" value="{{ comp.id|e }}">
+        <button class="delete" type="submit">Bileşeni Sil</button>
+      </form>
+    </div>
+  {% else %}
+    <span style="color:#8a8fa3;">Bileşen yok.</span>
+  {% endfor %}
+</td>
+<td class="actions">
+  <form method="post" action="/admin/packages/toggle"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
+  <form method="post" action="/admin/packages/delete" onsubmit="return confirm('Paket tamamen silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="delete" type="submit">Sil</button></form>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="7" style="text-align:center;color:#8a8fa3;">Paket yok.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div></body></html>
+"""
+
+
+def build_packages_for_admin() -> dict:
+    packages = {}
+    for advert_id, package in get_package_configs(include_inactive=True).items():
+        row = dict(package)
+        comps = []
+        for comp in package.get("components", []) or []:
+            comp = normalize_package_component(comp)
+            panel_key = comp.get("panel")
+            panel = get_panel_config(panel_key)
+            comp_row = dict(comp)
+            comp_row["panel_name"] = panel.get("name", panel_key)
+            comp_row["panel_service_name"] = get_cached_panel_service_name(panel_key, comp.get("service_id"))
+            comps.append(comp_row)
+        row["components"] = comps
+        packages[advert_id] = row
+    return packages
+
+
+@app.get("/admin/packages", response_class=HTMLResponse)
+def admin_packages(user: str = Depends(get_current_admin)):
+    template = Template(ADMIN_PACKAGES_HTML)
+    return HTMLResponse(template.render(packages=build_packages_for_admin(), panels=PANEL_MAP))
+
+
+@app.post("/admin/packages/add")
+def admin_package_add(advert_id: str = Form(...), name: str = Form(...), platform: str = Form("tiktok"), user: str = Depends(get_current_admin)):
+    try:
+        set_package(advert_id, name, platform, True)
+        log("success", "admin_package_saved", advert_id=advert_id, name=name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RedirectResponse("/admin/packages", status_code=303)
+
+
+@app.post("/admin/packages/delete")
+def admin_package_delete(advert_id: str = Form(...), user: str = Depends(get_current_admin)):
+    delete_package(advert_id)
+    log("warning", "admin_package_deleted", advert_id=advert_id)
+    return RedirectResponse("/admin/packages", status_code=303)
+
+
+@app.post("/admin/packages/toggle")
+def admin_package_toggle(advert_id: str = Form(...), user: str = Depends(get_current_admin)):
+    toggle_package(advert_id)
+    log("info", "admin_package_toggled", advert_id=advert_id)
+    return RedirectResponse("/admin/packages", status_code=303)
+
+
+@app.post("/admin/packages/add-component")
+def admin_package_add_component(
+    advert_id: str = Form(...),
+    name: str = Form(...),
+    panel: str = Form(...),
+    service_id: str = Form(...),
+    quantity: int = Form(...),
+    platform: str = Form("tiktok"),
+    user: str = Depends(get_current_admin),
+):
+    try:
+        comp = add_package_component(advert_id, name, panel, service_id, quantity, platform)
+        panel_service_name = fetch_panel_service_name_by_id(panel, service_id)
+        if panel_service_name:
+            cache_panel_service_name(panel, service_id, panel_service_name)
+        log("success", "admin_package_component_added", advert_id=advert_id, panel=panel, service_id=service_id, component=comp.get("name"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RedirectResponse("/admin/packages", status_code=303)
+
+
+@app.post("/admin/packages/delete-component")
+def admin_package_delete_component(advert_id: str = Form(...), component_id: str = Form(...), user: str = Depends(get_current_admin)):
+    delete_package_component(advert_id, component_id)
+    log("warning", "admin_package_component_deleted", advert_id=advert_id, component_id=component_id)
+    return RedirectResponse("/admin/packages", status_code=303)
 
 ADMIN_MANUAL_ORDER_HTML = """
 <!DOCTYPE html>
@@ -2039,11 +2568,28 @@ input:focus, select:focus, textarea:focus { border-color:#7c3aed; outline:none; 
 button { background:#7c3aed; border:none; cursor:pointer; font-weight:700; }
 button:hover { background:#5b27b1; }
 .notice { background:#172554; color:#bfdbfe; padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
+.service-name { max-width:360px; white-space:normal; line-height:1.35; color:#dbeafe; }
+.service-name.missing { color:#8a8fa3; font-style:italic; }
 .ok { background:#064e3b; color:#86efac; padding:10px 12px; border-radius:8px; margin-bottom:14px; }
 .err { background:#3f1d1d; color:#fca5a5; padding:10px 12px; border-radius:8px; margin-bottom:14px; }
 .full { grid-column:1/-1; }
 label { display:flex; flex-direction:column; gap:6px; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
 small { color:#8a8fa3; text-transform:none; letter-spacing:0; font-size:12px; }
+
+@media (max-width: 900px) {
+  body { padding: 12px; }
+  .container { padding: 16px; border-radius: 12px; }
+  h1 { font-size:24px; }
+  form.grid { grid-template-columns: 1fr !important; gap:10px; }
+  textarea { min-height:96px; }
+  input, select, button, textarea { width:100%; min-height:44px; font-size:16px; }
+  label { font-size:11px; }
+}
+@media (max-width: 520px) {
+  body { padding:8px; }
+  .container { padding:12px; }
+  .muted, .notice { font-size:12px; line-height:1.45; }
+}
 </style>
 </head>
 <body>
@@ -2208,7 +2754,19 @@ th, td { padding:12px; border-bottom:1px solid #242436; text-align:left; font-si
 th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
 .badge { padding:4px 8px; border-radius:99px; font-size:12px; font-weight:700; }
 .active { background:#064e3b; color:#86efac; } .cancelled { background:#3f1d1d; color:#fca5a5; }
-@media (max-width: 900px) { table { display:block; overflow-x:auto; white-space:nowrap; } }
+@media (max-width: 900px) {
+  body { padding:12px; }
+  .container { padding:16px; border-radius:12px; }
+  h1 { font-size:24px; }
+  table { display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
+  th, td { padding:10px 9px; font-size:12px; }
+  button { min-height:40px; width:100%; }
+}
+@media (max-width: 520px) {
+  body { padding:8px; }
+  .container { padding:12px; }
+  .muted { font-size:12px; line-height:1.45; }
+}
 </style>
 </head>
 <body>
@@ -2294,7 +2852,19 @@ table { width:100%; border-collapse:collapse; margin-top:20px; }
 th, td { padding:12px; border-bottom:1px solid #242436; text-align:left; font-size:14px; vertical-align:top; }
 th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
 .badge { padding:4px 8px; border-radius:99px; font-size:12px; font-weight:700; background:#3f1d1d; color:#fca5a5; }
-@media (max-width: 900px) { table { display:block; overflow-x:auto; white-space:nowrap; } }
+@media (max-width: 900px) {
+  body { padding:12px; }
+  .container { padding:16px; border-radius:12px; }
+  h1 { font-size:24px; }
+  table { display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
+  th, td { padding:10px 9px; font-size:12px; }
+  button { min-height:40px; width:100%; }
+}
+@media (max-width: 520px) {
+  body { padding:8px; }
+  .container { padding:12px; }
+  .muted { font-size:12px; line-height:1.45; }
+}
 </style>
 </head>
 <body>
@@ -2609,8 +3179,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .history-link:hover { text-decoration:underline; }
   .price-badge { font-size:11px; padding:5px 9px; border-radius:999px; font-family:'JetBrains Mono',monospace; font-weight:700; white-space:nowrap; background:rgba(245,158,11,0.16); color:var(--warning); }
 
-  @media (max-width: 1050px) { .grid-4 { grid-template-columns: repeat(2, 1fr); } .grid-2 { grid-template-columns: 1fr; } }
-  @media (max-width: 600px) { header { padding: 16px; align-items:flex-start; flex-direction:column; } .container { padding: 18px; } .grid-4 { grid-template-columns: 1fr; } .filter-box { width:100%; justify-content:space-between; } select { flex:1; } }
+  @media (max-width: 1050px) {
+    .grid-4 { grid-template-columns: repeat(2, 1fr); }
+    .grid-2 { grid-template-columns: 1fr; }
+    .container { padding: 24px; }
+  }
+  @media (max-width: 700px) {
+    header { padding: 14px; align-items:stretch; flex-direction:column; gap:12px; }
+    .logo { font-size:20px; }
+    .top-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; width:100%; }
+    .top-actions .last-updated { grid-column:1/-1; order:10; text-align:center; }
+    .refresh-btn, .link-btn { justify-content:center; min-height:42px; width:100%; padding:9px 10px; font-size:11px; }
+    .container { padding: 14px; }
+    .filters { display:grid; grid-template-columns:1fr; gap:10px; }
+    .filter-box { width:100%; justify-content:space-between; padding:10px; }
+    .filter-box label { font-size:10px; }
+    select { flex:1; min-height:42px; font-size:14px; }
+    .grid-4 { grid-template-columns: 1fr; gap:12px; margin-bottom:16px; }
+    .grid-2 { gap:14px; margin-bottom:16px; }
+    .card { padding:14px; border-radius:12px; }
+    .stat-value { font-size:26px; }
+    .chart-wrap { height:240px; }
+    .order-row { align-items:flex-start; flex-direction:column; gap:6px; }
+    .badge { align-self:flex-start; }
+    .history-row { grid-template-columns:1fr; gap:8px; }
+    .history-meta { display:grid; grid-template-columns:1fr; gap:5px; }
+    .history-link { max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+    .price-badge { justify-self:flex-start; width:max-content; }
+    .log-entry { display:grid; grid-template-columns:auto auto 1fr; gap:6px; }
+    .log-meta { display:block; margin-top:3px; }
+  }
+  @media (max-width: 420px) {
+    .top-actions { grid-template-columns:1fr; }
+    .container { padding:10px; }
+    .card-title { align-items:flex-start; flex-direction:column; }
+    .chart-wrap { height:220px; }
+  }
 </style>
 </head>
 <body>
@@ -3371,6 +3975,101 @@ async def itemsatis_webhook(request: Request):
         save_state()
         send_telegram(f"Yeni CS2 5 yıllık hesap siparişi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\n\n{get_lzt_links()}")
         return {"ok": True, "type": "cs2", "order_id": order_id}
+
+    all_packages = get_package_configs()
+    if advert_id in all_packages:
+        package = all_packages[advert_id]
+        package_name = get_package_display_name(advert_id, package, product_name)
+        package_platform = normalize_text(package.get("platform", "tiktok")) or "tiktok"
+        customer_link = find_order_link(data, package_platform)
+
+        if not customer_link:
+            add_failed_order(order_id, advert_id, package_name, "Paket sipariş linki bulunamadı")
+            notify_customer_order_failed(order_id, package_name)
+            send_telegram(
+                f"Paket sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nPaket: {package_name}\nPlatform: {package_platform}\nMüşteri: {buyer}"
+            )
+            return {"ok": False, "error": "package_link_not_found"}
+
+        if is_blacklisted(customer_link) or is_blacklisted(buyer):
+            add_failed_order(order_id, advert_id, package_name, "Blacklist engeli", customer_link, link=customer_link)
+            send_telegram(f"Blacklisted paket sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}")
+            return {"ok": False, "error": "blacklisted"}
+
+        normalized_link = normalize_link_for_check(customer_link, package_platform)
+        duplicate_link_key = f"package:{advert_id}:{normalized_link}"
+        order_key = make_order_key(order_id, advert_id, buyer, customer_link, package_platform)
+
+        if order_key in PROCESSED_ORDERS:
+            return {"ignored": True, "reason": "duplicate_package_order"}
+        if duplicate_link_key in PROCESSED_LINKS:
+            return {"ignored": True, "reason": "duplicate_package_link"}
+
+        success_rows = []
+        failed_rows = []
+        components = package.get("components", []) or []
+
+        for component in components:
+            component = normalize_package_component(component)
+            if not component.get("active", True):
+                continue
+            component_name = component.get("name") or "Paket Bileşeni"
+            service = get_service_config(component)
+            component_label = f"{package_name} - {component_name}"
+
+            if not service.get("api_url") or not service.get("api_key"):
+                failed_rows.append((component_name, service.get("panel", "Panel"), "Panel bilgileri eksik"))
+                add_failed_order(order_id, advert_id, component_label, "Panel bilgileri eksik", service.get("panel_key", ""), link=customer_link, panel=service.get("panel", ""))
+                continue
+
+            smm_result = create_panel_order(
+                service["api_url"],
+                service["api_key"],
+                service["service_id"],
+                customer_link,
+                service["quantity"],
+                service.get("panel", ""),
+            )
+
+            if "error" in smm_result:
+                error_text = str(smm_result.get("error") or smm_result)
+                failed_rows.append((component_name, service.get("panel", "Panel"), error_text))
+                add_failed_order(order_id, advert_id, component_label, "Paket panel sipariş hatası", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""))
+                continue
+
+            smm_order_id = smm_result.get("order", "Bilinmiyor")
+            add_pending_order(
+                order_id,
+                advert_id,
+                component_label,
+                service["panel"],
+                service["api_url"],
+                service["api_key"],
+                smm_order_id,
+                customer_link,
+                service_id=service.get("service_id", ""),
+                quantity=service.get("quantity", ""),
+                platform=service.get("platform", ""),
+                panel_key=service.get("panel_key", ""),
+                price=0,
+            )
+            success_rows.append((component_name, service.get("panel", "Panel"), smm_order_id))
+
+        if success_rows:
+            PROCESSED_LINKS.add(duplicate_link_key)
+            PROCESSED_ORDERS.add(order_key)
+            save_state()
+            notify_customer_order_started(order_id, package_name, customer_link)
+
+        success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id}" for name, panel, smm_id in success_rows]) or "Yok"
+        failed_text = "\n".join([f"❌ {name} | {panel} | {err}" for name, panel, err in failed_rows]) or "Yok"
+        send_telegram(
+            f"Paket sipariş işlendi.\n\nPaket: {package_name}\nItemsatış ID: {order_id}\nLink: {customer_link}\n\nBaşarılı:\n{success_text}\n\nHatalı:\n{failed_text}"
+        )
+
+        if not success_rows:
+            return {"ok": False, "type": "package_order", "error": "all_package_components_failed", "failed_count": len(failed_rows)}
+        return {"ok": True, "type": "package_order", "success_count": len(success_rows), "failed_count": len(failed_rows)}
 
     all_services = get_all_services()
     if advert_id in all_services:
