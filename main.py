@@ -44,7 +44,7 @@ except Exception:
 
     logger = _FallbackLogger()
 
-app = FastAPI()
+app = FastAPI(title="Boostera API", description="Boostera private SMM automation panel", version="2.0.0", docs_url=None, redoc_url=None)
 security = HTTPBasic()
 
 # Optional favicon/static assets. If the static folder is not in the repo, bot still starts.
@@ -2124,23 +2124,182 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
   .badge { display:inline-block; margin-top:4px; }
 }
 
-/* Boostera global responsive polish */
-@media (max-width: 900px) {
-  html { -webkit-text-size-adjust: 100%; }
-  body { padding: 10px !important; }
-  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
-  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
-  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
-  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  th, td { white-space: normal; overflow-wrap: anywhere; }
-  a { overflow-wrap: anywhere; }
+
+
+
+/* ─────────────────────────────────────────────
+   Boostera Professional Responsive UI Patch
+   Works across dashboard, admin, package, manual and order pages.
+   ───────────────────────────────────────────── */
+:root {
+  --boostera-bg: #080912;
+  --boostera-surface: #11131f;
+  --boostera-surface-2: #171927;
+  --boostera-border: #272b3d;
+  --boostera-border-soft: rgba(148,163,184,.14);
+  --boostera-text: #f1f5f9;
+  --boostera-muted: #94a3b8;
+  --boostera-primary: #8b5cf6;
+  --boostera-primary-2: #6d28d9;
+  --boostera-green: #16a34a;
+  --boostera-red: #ef4444;
+  --boostera-blue: #2563eb;
+  --boostera-card-shadow: 0 18px 50px rgba(0,0,0,.26);
 }
-@media (max-width: 520px) {
-  body { padding: 6px !important; }
-  h1 { font-size: 24px !important; line-height: 1.15 !important; }
-  h2 { font-size: 18px !important; }
-  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
-  input, select, button, .btn, .rbtn { width: 100% !important; }
+html { -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+body {
+  background:
+    radial-gradient(circle at 0 0, rgba(139,92,246,.16), transparent 34%),
+    radial-gradient(circle at 100% 0, rgba(34,211,238,.08), transparent 30%),
+    var(--boostera-bg) !important;
+}
+body, input, select, textarea, button { font-family: Inter, Arial, sans-serif; }
+.container, .wrap, .shell, .card, .package-card, .component-card, .component-form {
+  box-shadow: var(--boostera-card-shadow);
+}
+.container, .shell, .card {
+  border-color: var(--boostera-border-soft) !important;
+}
+a { color: #c4b5fd; }
+button, .btn, .rbtn, .link-btn, input, select, textarea {
+  min-height: 46px;
+  border-radius: 12px !important;
+}
+input, select, textarea {
+  background: var(--boostera-surface-2) !important;
+  border: 1px solid var(--boostera-border) !important;
+  color: var(--boostera-text) !important;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--boostera-primary) !important;
+  box-shadow: 0 0 0 3px rgba(139,92,246,.18) !important;
+}
+button, .btn, .rbtn, .link-btn {
+  touch-action: manipulation;
+  white-space: normal;
+  line-height: 1.2;
+}
+button:not(.delete):not(.red):not(.green):not(.slate), .btn:not(.red):not(.green):not(.slate) {
+  background: linear-gradient(135deg, var(--boostera-primary), var(--boostera-primary-2));
+}
+button.delete, button.red, .btn.red { background: linear-gradient(135deg, #f43f5e, #dc2626) !important; }
+button.green, .btn.green { background: linear-gradient(135deg, #22c55e, #15803d) !important; }
+button.slate, .btn.slate, button.toggle { background: #334155 !important; }
+.notice, .muted, .small { line-height: 1.55; }
+.service-name, .component-name, .pkg-title, .rdet, .order-detail, .log-meta, td, a {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: hidden;
+  border-radius: 14px;
+}
+th { position: sticky; top: 0; z-index: 1; }
+tr:hover td { background: rgba(139,92,246,.035); }
+.toolbar, .top-actions, .pkg-actions { gap: 10px; }
+.toolbar a, .toolbar form, .pkg-actions form { min-width: 0; }
+.packages { gap: 18px !important; }
+.package-card {
+  background: linear-gradient(180deg, rgba(20,23,37,.98), rgba(12,14,23,.98)) !important;
+  border: 1px solid var(--boostera-border-soft) !important;
+}
+.package-head { align-items: stretch !important; }
+.pkg-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
+.pkg-actions form { flex: 0 1 150px; }
+.pkg-body { align-items: start; }
+.components-grid { align-items: stretch; }
+.component-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.component-card form { margin-top: auto; }
+.component-line { line-height: 1.45; }
+.pill, .badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+}
+.empty { background: rgba(15,23,42,.42); }
+
+@media (max-width: 1100px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .grid-2, .pkg-body { grid-template-columns: 1fr !important; }
+  .form-grid, form.grid, .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .form-grid .wide { grid-column: span 2; }
+}
+@media (max-width: 760px) {
+  body { padding: 0 !important; }
+  header {
+    position: relative !important;
+    padding: 14px 12px !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .logo { font-size: 20px !important; }
+  .container, .wrap {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 12px !important;
+  }
+  .shell, .card, .container, .package-card, .component-card, .component-form {
+    border-radius: 16px !important;
+    padding: 14px !important;
+  }
+  h1 { font-size: 26px !important; line-height: 1.15 !important; }
+  h2 { font-size: 19px !important; }
+  .grid-4, .grid-2, .form-grid, form.grid, .grid, .components-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .form-grid .wide { grid-column: auto !important; }
+  .toolbar, .top-actions, .filters, .pkg-actions {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar a, .toolbar form, .toolbar button,
+  .top-actions a, .top-actions button,
+  .pkg-actions form, .pkg-actions button,
+  .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    justify-content: center !important;
+  }
+  input, select, textarea, button, .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    min-height: 50px !important;
+    font-size: 16px !important;
+  }
+  table {
+    display: block !important;
+    width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+  th, td { padding: 11px 10px !important; font-size: 13px !important; }
+  .package-head { grid-template-columns: 1fr !important; }
+  .pkg-meta { gap: 6px !important; }
+  .pill { font-size: 11px !important; padding: 5px 9px !important; }
+  .component-card { gap: 8px !important; }
+  .service-name { font-size: 13px !important; line-height: 1.45 !important; }
+  .row { align-items: flex-start !important; gap: 10px !important; }
+  .row > div { min-width: 0 !important; }
+}
+@media (max-width: 430px) {
+  .container, .wrap { padding: 8px !important; }
+  .shell, .card, .container, .package-card, .component-card, .component-form { padding: 12px !important; }
+  .notice { font-size: 13px !important; }
+  .muted { font-size: 13px !important; }
+  .stat-value, .sv { font-size: 24px !important; }
 }
 
 </style>
@@ -2387,23 +2546,182 @@ ADMIN_PACKAGES_HTML = """
 @media(max-width:720px){.wrap{width:100%;margin:0}.shell{border-radius:0;border-left:0;border-right:0;padding:16px}.topbar{padding:12px 14px;margin:0}.form-grid{grid-template-columns:1fr}.form-grid .wide{grid-column:auto}h1{font-size:25px}.package-head{grid-template-columns:1fr}.pkg-actions{display:grid;grid-template-columns:1fr 1fr;width:100%}.packages{gap:12px}.package-card{border-radius:16px;padding:14px}.components-grid{grid-template-columns:1fr}input,select,button,.btn{min-height:48px;font-size:16px}.notice{font-size:13px}.pkg-meta{gap:6px}.pill{font-size:11px}}
 @media(max-width:420px){.pkg-actions{grid-template-columns:1fr}.shell{padding:12px}.package-card{padding:12px}.component-card,.component-form{padding:12px}}
 
-/* Boostera global responsive polish */
-@media (max-width: 900px) {
-  html { -webkit-text-size-adjust: 100%; }
-  body { padding: 10px !important; }
-  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
-  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
-  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
-  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  th, td { white-space: normal; overflow-wrap: anywhere; }
-  a { overflow-wrap: anywhere; }
+
+
+
+/* ─────────────────────────────────────────────
+   Boostera Professional Responsive UI Patch
+   Works across dashboard, admin, package, manual and order pages.
+   ───────────────────────────────────────────── */
+:root {
+  --boostera-bg: #080912;
+  --boostera-surface: #11131f;
+  --boostera-surface-2: #171927;
+  --boostera-border: #272b3d;
+  --boostera-border-soft: rgba(148,163,184,.14);
+  --boostera-text: #f1f5f9;
+  --boostera-muted: #94a3b8;
+  --boostera-primary: #8b5cf6;
+  --boostera-primary-2: #6d28d9;
+  --boostera-green: #16a34a;
+  --boostera-red: #ef4444;
+  --boostera-blue: #2563eb;
+  --boostera-card-shadow: 0 18px 50px rgba(0,0,0,.26);
 }
-@media (max-width: 520px) {
-  body { padding: 6px !important; }
-  h1 { font-size: 24px !important; line-height: 1.15 !important; }
-  h2 { font-size: 18px !important; }
-  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
-  input, select, button, .btn, .rbtn { width: 100% !important; }
+html { -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+body {
+  background:
+    radial-gradient(circle at 0 0, rgba(139,92,246,.16), transparent 34%),
+    radial-gradient(circle at 100% 0, rgba(34,211,238,.08), transparent 30%),
+    var(--boostera-bg) !important;
+}
+body, input, select, textarea, button { font-family: Inter, Arial, sans-serif; }
+.container, .wrap, .shell, .card, .package-card, .component-card, .component-form {
+  box-shadow: var(--boostera-card-shadow);
+}
+.container, .shell, .card {
+  border-color: var(--boostera-border-soft) !important;
+}
+a { color: #c4b5fd; }
+button, .btn, .rbtn, .link-btn, input, select, textarea {
+  min-height: 46px;
+  border-radius: 12px !important;
+}
+input, select, textarea {
+  background: var(--boostera-surface-2) !important;
+  border: 1px solid var(--boostera-border) !important;
+  color: var(--boostera-text) !important;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--boostera-primary) !important;
+  box-shadow: 0 0 0 3px rgba(139,92,246,.18) !important;
+}
+button, .btn, .rbtn, .link-btn {
+  touch-action: manipulation;
+  white-space: normal;
+  line-height: 1.2;
+}
+button:not(.delete):not(.red):not(.green):not(.slate), .btn:not(.red):not(.green):not(.slate) {
+  background: linear-gradient(135deg, var(--boostera-primary), var(--boostera-primary-2));
+}
+button.delete, button.red, .btn.red { background: linear-gradient(135deg, #f43f5e, #dc2626) !important; }
+button.green, .btn.green { background: linear-gradient(135deg, #22c55e, #15803d) !important; }
+button.slate, .btn.slate, button.toggle { background: #334155 !important; }
+.notice, .muted, .small { line-height: 1.55; }
+.service-name, .component-name, .pkg-title, .rdet, .order-detail, .log-meta, td, a {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: hidden;
+  border-radius: 14px;
+}
+th { position: sticky; top: 0; z-index: 1; }
+tr:hover td { background: rgba(139,92,246,.035); }
+.toolbar, .top-actions, .pkg-actions { gap: 10px; }
+.toolbar a, .toolbar form, .pkg-actions form { min-width: 0; }
+.packages { gap: 18px !important; }
+.package-card {
+  background: linear-gradient(180deg, rgba(20,23,37,.98), rgba(12,14,23,.98)) !important;
+  border: 1px solid var(--boostera-border-soft) !important;
+}
+.package-head { align-items: stretch !important; }
+.pkg-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
+.pkg-actions form { flex: 0 1 150px; }
+.pkg-body { align-items: start; }
+.components-grid { align-items: stretch; }
+.component-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.component-card form { margin-top: auto; }
+.component-line { line-height: 1.45; }
+.pill, .badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+}
+.empty { background: rgba(15,23,42,.42); }
+
+@media (max-width: 1100px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .grid-2, .pkg-body { grid-template-columns: 1fr !important; }
+  .form-grid, form.grid, .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .form-grid .wide { grid-column: span 2; }
+}
+@media (max-width: 760px) {
+  body { padding: 0 !important; }
+  header {
+    position: relative !important;
+    padding: 14px 12px !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .logo { font-size: 20px !important; }
+  .container, .wrap {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 12px !important;
+  }
+  .shell, .card, .container, .package-card, .component-card, .component-form {
+    border-radius: 16px !important;
+    padding: 14px !important;
+  }
+  h1 { font-size: 26px !important; line-height: 1.15 !important; }
+  h2 { font-size: 19px !important; }
+  .grid-4, .grid-2, .form-grid, form.grid, .grid, .components-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .form-grid .wide { grid-column: auto !important; }
+  .toolbar, .top-actions, .filters, .pkg-actions {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar a, .toolbar form, .toolbar button,
+  .top-actions a, .top-actions button,
+  .pkg-actions form, .pkg-actions button,
+  .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    justify-content: center !important;
+  }
+  input, select, textarea, button, .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    min-height: 50px !important;
+    font-size: 16px !important;
+  }
+  table {
+    display: block !important;
+    width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+  th, td { padding: 11px 10px !important; font-size: 13px !important; }
+  .package-head { grid-template-columns: 1fr !important; }
+  .pkg-meta { gap: 6px !important; }
+  .pill { font-size: 11px !important; padding: 5px 9px !important; }
+  .component-card { gap: 8px !important; }
+  .service-name { font-size: 13px !important; line-height: 1.45 !important; }
+  .row { align-items: flex-start !important; gap: 10px !important; }
+  .row > div { min-width: 0 !important; }
+}
+@media (max-width: 430px) {
+  .container, .wrap { padding: 8px !important; }
+  .shell, .card, .container, .package-card, .component-card, .component-form { padding: 12px !important; }
+  .notice { font-size: 13px !important; }
+  .muted { font-size: 13px !important; }
+  .stat-value, .sv { font-size: 24px !important; }
 }
 
 </style>
@@ -2626,23 +2944,182 @@ small { color:#8a8fa3; text-transform:none; letter-spacing:0; font-size:12px; }
   .muted, .notice { font-size:12px; line-height:1.45; }
 }
 
-/* Boostera global responsive polish */
-@media (max-width: 900px) {
-  html { -webkit-text-size-adjust: 100%; }
-  body { padding: 10px !important; }
-  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
-  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
-  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
-  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  th, td { white-space: normal; overflow-wrap: anywhere; }
-  a { overflow-wrap: anywhere; }
+
+
+
+/* ─────────────────────────────────────────────
+   Boostera Professional Responsive UI Patch
+   Works across dashboard, admin, package, manual and order pages.
+   ───────────────────────────────────────────── */
+:root {
+  --boostera-bg: #080912;
+  --boostera-surface: #11131f;
+  --boostera-surface-2: #171927;
+  --boostera-border: #272b3d;
+  --boostera-border-soft: rgba(148,163,184,.14);
+  --boostera-text: #f1f5f9;
+  --boostera-muted: #94a3b8;
+  --boostera-primary: #8b5cf6;
+  --boostera-primary-2: #6d28d9;
+  --boostera-green: #16a34a;
+  --boostera-red: #ef4444;
+  --boostera-blue: #2563eb;
+  --boostera-card-shadow: 0 18px 50px rgba(0,0,0,.26);
 }
-@media (max-width: 520px) {
-  body { padding: 6px !important; }
-  h1 { font-size: 24px !important; line-height: 1.15 !important; }
-  h2 { font-size: 18px !important; }
-  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
-  input, select, button, .btn, .rbtn { width: 100% !important; }
+html { -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+body {
+  background:
+    radial-gradient(circle at 0 0, rgba(139,92,246,.16), transparent 34%),
+    radial-gradient(circle at 100% 0, rgba(34,211,238,.08), transparent 30%),
+    var(--boostera-bg) !important;
+}
+body, input, select, textarea, button { font-family: Inter, Arial, sans-serif; }
+.container, .wrap, .shell, .card, .package-card, .component-card, .component-form {
+  box-shadow: var(--boostera-card-shadow);
+}
+.container, .shell, .card {
+  border-color: var(--boostera-border-soft) !important;
+}
+a { color: #c4b5fd; }
+button, .btn, .rbtn, .link-btn, input, select, textarea {
+  min-height: 46px;
+  border-radius: 12px !important;
+}
+input, select, textarea {
+  background: var(--boostera-surface-2) !important;
+  border: 1px solid var(--boostera-border) !important;
+  color: var(--boostera-text) !important;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--boostera-primary) !important;
+  box-shadow: 0 0 0 3px rgba(139,92,246,.18) !important;
+}
+button, .btn, .rbtn, .link-btn {
+  touch-action: manipulation;
+  white-space: normal;
+  line-height: 1.2;
+}
+button:not(.delete):not(.red):not(.green):not(.slate), .btn:not(.red):not(.green):not(.slate) {
+  background: linear-gradient(135deg, var(--boostera-primary), var(--boostera-primary-2));
+}
+button.delete, button.red, .btn.red { background: linear-gradient(135deg, #f43f5e, #dc2626) !important; }
+button.green, .btn.green { background: linear-gradient(135deg, #22c55e, #15803d) !important; }
+button.slate, .btn.slate, button.toggle { background: #334155 !important; }
+.notice, .muted, .small { line-height: 1.55; }
+.service-name, .component-name, .pkg-title, .rdet, .order-detail, .log-meta, td, a {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: hidden;
+  border-radius: 14px;
+}
+th { position: sticky; top: 0; z-index: 1; }
+tr:hover td { background: rgba(139,92,246,.035); }
+.toolbar, .top-actions, .pkg-actions { gap: 10px; }
+.toolbar a, .toolbar form, .pkg-actions form { min-width: 0; }
+.packages { gap: 18px !important; }
+.package-card {
+  background: linear-gradient(180deg, rgba(20,23,37,.98), rgba(12,14,23,.98)) !important;
+  border: 1px solid var(--boostera-border-soft) !important;
+}
+.package-head { align-items: stretch !important; }
+.pkg-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
+.pkg-actions form { flex: 0 1 150px; }
+.pkg-body { align-items: start; }
+.components-grid { align-items: stretch; }
+.component-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.component-card form { margin-top: auto; }
+.component-line { line-height: 1.45; }
+.pill, .badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+}
+.empty { background: rgba(15,23,42,.42); }
+
+@media (max-width: 1100px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .grid-2, .pkg-body { grid-template-columns: 1fr !important; }
+  .form-grid, form.grid, .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .form-grid .wide { grid-column: span 2; }
+}
+@media (max-width: 760px) {
+  body { padding: 0 !important; }
+  header {
+    position: relative !important;
+    padding: 14px 12px !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .logo { font-size: 20px !important; }
+  .container, .wrap {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 12px !important;
+  }
+  .shell, .card, .container, .package-card, .component-card, .component-form {
+    border-radius: 16px !important;
+    padding: 14px !important;
+  }
+  h1 { font-size: 26px !important; line-height: 1.15 !important; }
+  h2 { font-size: 19px !important; }
+  .grid-4, .grid-2, .form-grid, form.grid, .grid, .components-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .form-grid .wide { grid-column: auto !important; }
+  .toolbar, .top-actions, .filters, .pkg-actions {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar a, .toolbar form, .toolbar button,
+  .top-actions a, .top-actions button,
+  .pkg-actions form, .pkg-actions button,
+  .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    justify-content: center !important;
+  }
+  input, select, textarea, button, .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    min-height: 50px !important;
+    font-size: 16px !important;
+  }
+  table {
+    display: block !important;
+    width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+  th, td { padding: 11px 10px !important; font-size: 13px !important; }
+  .package-head { grid-template-columns: 1fr !important; }
+  .pkg-meta { gap: 6px !important; }
+  .pill { font-size: 11px !important; padding: 5px 9px !important; }
+  .component-card { gap: 8px !important; }
+  .service-name { font-size: 13px !important; line-height: 1.45 !important; }
+  .row { align-items: flex-start !important; gap: 10px !important; }
+  .row > div { min-width: 0 !important; }
+}
+@media (max-width: 430px) {
+  .container, .wrap { padding: 8px !important; }
+  .shell, .card, .container, .package-card, .component-card, .component-form { padding: 12px !important; }
+  .notice { font-size: 13px !important; }
+  .muted { font-size: 13px !important; }
+  .stat-value, .sv { font-size: 24px !important; }
 }
 
 </style>
@@ -2823,23 +3300,182 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
   .muted { font-size:12px; line-height:1.45; }
 }
 
-/* Boostera global responsive polish */
-@media (max-width: 900px) {
-  html { -webkit-text-size-adjust: 100%; }
-  body { padding: 10px !important; }
-  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
-  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
-  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
-  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  th, td { white-space: normal; overflow-wrap: anywhere; }
-  a { overflow-wrap: anywhere; }
+
+
+
+/* ─────────────────────────────────────────────
+   Boostera Professional Responsive UI Patch
+   Works across dashboard, admin, package, manual and order pages.
+   ───────────────────────────────────────────── */
+:root {
+  --boostera-bg: #080912;
+  --boostera-surface: #11131f;
+  --boostera-surface-2: #171927;
+  --boostera-border: #272b3d;
+  --boostera-border-soft: rgba(148,163,184,.14);
+  --boostera-text: #f1f5f9;
+  --boostera-muted: #94a3b8;
+  --boostera-primary: #8b5cf6;
+  --boostera-primary-2: #6d28d9;
+  --boostera-green: #16a34a;
+  --boostera-red: #ef4444;
+  --boostera-blue: #2563eb;
+  --boostera-card-shadow: 0 18px 50px rgba(0,0,0,.26);
 }
-@media (max-width: 520px) {
-  body { padding: 6px !important; }
-  h1 { font-size: 24px !important; line-height: 1.15 !important; }
-  h2 { font-size: 18px !important; }
-  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
-  input, select, button, .btn, .rbtn { width: 100% !important; }
+html { -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+body {
+  background:
+    radial-gradient(circle at 0 0, rgba(139,92,246,.16), transparent 34%),
+    radial-gradient(circle at 100% 0, rgba(34,211,238,.08), transparent 30%),
+    var(--boostera-bg) !important;
+}
+body, input, select, textarea, button { font-family: Inter, Arial, sans-serif; }
+.container, .wrap, .shell, .card, .package-card, .component-card, .component-form {
+  box-shadow: var(--boostera-card-shadow);
+}
+.container, .shell, .card {
+  border-color: var(--boostera-border-soft) !important;
+}
+a { color: #c4b5fd; }
+button, .btn, .rbtn, .link-btn, input, select, textarea {
+  min-height: 46px;
+  border-radius: 12px !important;
+}
+input, select, textarea {
+  background: var(--boostera-surface-2) !important;
+  border: 1px solid var(--boostera-border) !important;
+  color: var(--boostera-text) !important;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--boostera-primary) !important;
+  box-shadow: 0 0 0 3px rgba(139,92,246,.18) !important;
+}
+button, .btn, .rbtn, .link-btn {
+  touch-action: manipulation;
+  white-space: normal;
+  line-height: 1.2;
+}
+button:not(.delete):not(.red):not(.green):not(.slate), .btn:not(.red):not(.green):not(.slate) {
+  background: linear-gradient(135deg, var(--boostera-primary), var(--boostera-primary-2));
+}
+button.delete, button.red, .btn.red { background: linear-gradient(135deg, #f43f5e, #dc2626) !important; }
+button.green, .btn.green { background: linear-gradient(135deg, #22c55e, #15803d) !important; }
+button.slate, .btn.slate, button.toggle { background: #334155 !important; }
+.notice, .muted, .small { line-height: 1.55; }
+.service-name, .component-name, .pkg-title, .rdet, .order-detail, .log-meta, td, a {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: hidden;
+  border-radius: 14px;
+}
+th { position: sticky; top: 0; z-index: 1; }
+tr:hover td { background: rgba(139,92,246,.035); }
+.toolbar, .top-actions, .pkg-actions { gap: 10px; }
+.toolbar a, .toolbar form, .pkg-actions form { min-width: 0; }
+.packages { gap: 18px !important; }
+.package-card {
+  background: linear-gradient(180deg, rgba(20,23,37,.98), rgba(12,14,23,.98)) !important;
+  border: 1px solid var(--boostera-border-soft) !important;
+}
+.package-head { align-items: stretch !important; }
+.pkg-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
+.pkg-actions form { flex: 0 1 150px; }
+.pkg-body { align-items: start; }
+.components-grid { align-items: stretch; }
+.component-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.component-card form { margin-top: auto; }
+.component-line { line-height: 1.45; }
+.pill, .badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+}
+.empty { background: rgba(15,23,42,.42); }
+
+@media (max-width: 1100px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .grid-2, .pkg-body { grid-template-columns: 1fr !important; }
+  .form-grid, form.grid, .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .form-grid .wide { grid-column: span 2; }
+}
+@media (max-width: 760px) {
+  body { padding: 0 !important; }
+  header {
+    position: relative !important;
+    padding: 14px 12px !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .logo { font-size: 20px !important; }
+  .container, .wrap {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 12px !important;
+  }
+  .shell, .card, .container, .package-card, .component-card, .component-form {
+    border-radius: 16px !important;
+    padding: 14px !important;
+  }
+  h1 { font-size: 26px !important; line-height: 1.15 !important; }
+  h2 { font-size: 19px !important; }
+  .grid-4, .grid-2, .form-grid, form.grid, .grid, .components-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .form-grid .wide { grid-column: auto !important; }
+  .toolbar, .top-actions, .filters, .pkg-actions {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar a, .toolbar form, .toolbar button,
+  .top-actions a, .top-actions button,
+  .pkg-actions form, .pkg-actions button,
+  .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    justify-content: center !important;
+  }
+  input, select, textarea, button, .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    min-height: 50px !important;
+    font-size: 16px !important;
+  }
+  table {
+    display: block !important;
+    width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+  th, td { padding: 11px 10px !important; font-size: 13px !important; }
+  .package-head { grid-template-columns: 1fr !important; }
+  .pkg-meta { gap: 6px !important; }
+  .pill { font-size: 11px !important; padding: 5px 9px !important; }
+  .component-card { gap: 8px !important; }
+  .service-name { font-size: 13px !important; line-height: 1.45 !important; }
+  .row { align-items: flex-start !important; gap: 10px !important; }
+  .row > div { min-width: 0 !important; }
+}
+@media (max-width: 430px) {
+  .container, .wrap { padding: 8px !important; }
+  .shell, .card, .container, .package-card, .component-card, .component-form { padding: 12px !important; }
+  .notice { font-size: 13px !important; }
+  .muted { font-size: 13px !important; }
+  .stat-value, .sv { font-size: 24px !important; }
 }
 
 </style>
@@ -2941,23 +3577,182 @@ th { background:#181824; color:#a8adbd; font-size:12px; text-transform:uppercase
   .muted { font-size:12px; line-height:1.45; }
 }
 
-/* Boostera global responsive polish */
-@media (max-width: 900px) {
-  html { -webkit-text-size-adjust: 100%; }
-  body { padding: 10px !important; }
-  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
-  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
-  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
-  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  th, td { white-space: normal; overflow-wrap: anywhere; }
-  a { overflow-wrap: anywhere; }
+
+
+
+/* ─────────────────────────────────────────────
+   Boostera Professional Responsive UI Patch
+   Works across dashboard, admin, package, manual and order pages.
+   ───────────────────────────────────────────── */
+:root {
+  --boostera-bg: #080912;
+  --boostera-surface: #11131f;
+  --boostera-surface-2: #171927;
+  --boostera-border: #272b3d;
+  --boostera-border-soft: rgba(148,163,184,.14);
+  --boostera-text: #f1f5f9;
+  --boostera-muted: #94a3b8;
+  --boostera-primary: #8b5cf6;
+  --boostera-primary-2: #6d28d9;
+  --boostera-green: #16a34a;
+  --boostera-red: #ef4444;
+  --boostera-blue: #2563eb;
+  --boostera-card-shadow: 0 18px 50px rgba(0,0,0,.26);
 }
-@media (max-width: 520px) {
-  body { padding: 6px !important; }
-  h1 { font-size: 24px !important; line-height: 1.15 !important; }
-  h2 { font-size: 18px !important; }
-  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
-  input, select, button, .btn, .rbtn { width: 100% !important; }
+html { -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+body {
+  background:
+    radial-gradient(circle at 0 0, rgba(139,92,246,.16), transparent 34%),
+    radial-gradient(circle at 100% 0, rgba(34,211,238,.08), transparent 30%),
+    var(--boostera-bg) !important;
+}
+body, input, select, textarea, button { font-family: Inter, Arial, sans-serif; }
+.container, .wrap, .shell, .card, .package-card, .component-card, .component-form {
+  box-shadow: var(--boostera-card-shadow);
+}
+.container, .shell, .card {
+  border-color: var(--boostera-border-soft) !important;
+}
+a { color: #c4b5fd; }
+button, .btn, .rbtn, .link-btn, input, select, textarea {
+  min-height: 46px;
+  border-radius: 12px !important;
+}
+input, select, textarea {
+  background: var(--boostera-surface-2) !important;
+  border: 1px solid var(--boostera-border) !important;
+  color: var(--boostera-text) !important;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--boostera-primary) !important;
+  box-shadow: 0 0 0 3px rgba(139,92,246,.18) !important;
+}
+button, .btn, .rbtn, .link-btn {
+  touch-action: manipulation;
+  white-space: normal;
+  line-height: 1.2;
+}
+button:not(.delete):not(.red):not(.green):not(.slate), .btn:not(.red):not(.green):not(.slate) {
+  background: linear-gradient(135deg, var(--boostera-primary), var(--boostera-primary-2));
+}
+button.delete, button.red, .btn.red { background: linear-gradient(135deg, #f43f5e, #dc2626) !important; }
+button.green, .btn.green { background: linear-gradient(135deg, #22c55e, #15803d) !important; }
+button.slate, .btn.slate, button.toggle { background: #334155 !important; }
+.notice, .muted, .small { line-height: 1.55; }
+.service-name, .component-name, .pkg-title, .rdet, .order-detail, .log-meta, td, a {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: hidden;
+  border-radius: 14px;
+}
+th { position: sticky; top: 0; z-index: 1; }
+tr:hover td { background: rgba(139,92,246,.035); }
+.toolbar, .top-actions, .pkg-actions { gap: 10px; }
+.toolbar a, .toolbar form, .pkg-actions form { min-width: 0; }
+.packages { gap: 18px !important; }
+.package-card {
+  background: linear-gradient(180deg, rgba(20,23,37,.98), rgba(12,14,23,.98)) !important;
+  border: 1px solid var(--boostera-border-soft) !important;
+}
+.package-head { align-items: stretch !important; }
+.pkg-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
+.pkg-actions form { flex: 0 1 150px; }
+.pkg-body { align-items: start; }
+.components-grid { align-items: stretch; }
+.component-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.component-card form { margin-top: auto; }
+.component-line { line-height: 1.45; }
+.pill, .badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+}
+.empty { background: rgba(15,23,42,.42); }
+
+@media (max-width: 1100px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .grid-2, .pkg-body { grid-template-columns: 1fr !important; }
+  .form-grid, form.grid, .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .form-grid .wide { grid-column: span 2; }
+}
+@media (max-width: 760px) {
+  body { padding: 0 !important; }
+  header {
+    position: relative !important;
+    padding: 14px 12px !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .logo { font-size: 20px !important; }
+  .container, .wrap {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 12px !important;
+  }
+  .shell, .card, .container, .package-card, .component-card, .component-form {
+    border-radius: 16px !important;
+    padding: 14px !important;
+  }
+  h1 { font-size: 26px !important; line-height: 1.15 !important; }
+  h2 { font-size: 19px !important; }
+  .grid-4, .grid-2, .form-grid, form.grid, .grid, .components-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .form-grid .wide { grid-column: auto !important; }
+  .toolbar, .top-actions, .filters, .pkg-actions {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar a, .toolbar form, .toolbar button,
+  .top-actions a, .top-actions button,
+  .pkg-actions form, .pkg-actions button,
+  .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    justify-content: center !important;
+  }
+  input, select, textarea, button, .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    min-height: 50px !important;
+    font-size: 16px !important;
+  }
+  table {
+    display: block !important;
+    width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+  th, td { padding: 11px 10px !important; font-size: 13px !important; }
+  .package-head { grid-template-columns: 1fr !important; }
+  .pkg-meta { gap: 6px !important; }
+  .pill { font-size: 11px !important; padding: 5px 9px !important; }
+  .component-card { gap: 8px !important; }
+  .service-name { font-size: 13px !important; line-height: 1.45 !important; }
+  .row { align-items: flex-start !important; gap: 10px !important; }
+  .row > div { min-width: 0 !important; }
+}
+@media (max-width: 430px) {
+  .container, .wrap { padding: 8px !important; }
+  .shell, .card, .container, .package-card, .component-card, .component-form { padding: 12px !important; }
+  .notice { font-size: 13px !important; }
+  .muted { font-size: 13px !important; }
+  .stat-value, .sv { font-size: 24px !important; }
 }
 
 </style>
@@ -3311,23 +4106,182 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .chart-wrap { height:220px; }
   }
 
-/* Boostera global responsive polish */
-@media (max-width: 900px) {
-  html { -webkit-text-size-adjust: 100%; }
-  body { padding: 10px !important; }
-  .container, .wrap, .shell { width: 100% !important; max-width: 100% !important; margin-left: 0 !important; margin-right: 0 !important; }
-  input, select, textarea, button, .btn, .rbtn { min-height: 46px !important; font-size: 15px !important; }
-  form.grid, .grid, .form-grid { grid-template-columns: 1fr !important; }
-  table { display: block; width: 100% !important; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  th, td { white-space: normal; overflow-wrap: anywhere; }
-  a { overflow-wrap: anywhere; }
+
+
+
+/* ─────────────────────────────────────────────
+   Boostera Professional Responsive UI Patch
+   Works across dashboard, admin, package, manual and order pages.
+   ───────────────────────────────────────────── */
+:root {
+  --boostera-bg: #080912;
+  --boostera-surface: #11131f;
+  --boostera-surface-2: #171927;
+  --boostera-border: #272b3d;
+  --boostera-border-soft: rgba(148,163,184,.14);
+  --boostera-text: #f1f5f9;
+  --boostera-muted: #94a3b8;
+  --boostera-primary: #8b5cf6;
+  --boostera-primary-2: #6d28d9;
+  --boostera-green: #16a34a;
+  --boostera-red: #ef4444;
+  --boostera-blue: #2563eb;
+  --boostera-card-shadow: 0 18px 50px rgba(0,0,0,.26);
 }
-@media (max-width: 520px) {
-  body { padding: 6px !important; }
-  h1 { font-size: 24px !important; line-height: 1.15 !important; }
-  h2 { font-size: 18px !important; }
-  .container, .card, .shell { border-radius: 12px !important; padding: 12px !important; }
-  input, select, button, .btn, .rbtn { width: 100% !important; }
+html { -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+body {
+  background:
+    radial-gradient(circle at 0 0, rgba(139,92,246,.16), transparent 34%),
+    radial-gradient(circle at 100% 0, rgba(34,211,238,.08), transparent 30%),
+    var(--boostera-bg) !important;
+}
+body, input, select, textarea, button { font-family: Inter, Arial, sans-serif; }
+.container, .wrap, .shell, .card, .package-card, .component-card, .component-form {
+  box-shadow: var(--boostera-card-shadow);
+}
+.container, .shell, .card {
+  border-color: var(--boostera-border-soft) !important;
+}
+a { color: #c4b5fd; }
+button, .btn, .rbtn, .link-btn, input, select, textarea {
+  min-height: 46px;
+  border-radius: 12px !important;
+}
+input, select, textarea {
+  background: var(--boostera-surface-2) !important;
+  border: 1px solid var(--boostera-border) !important;
+  color: var(--boostera-text) !important;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--boostera-primary) !important;
+  box-shadow: 0 0 0 3px rgba(139,92,246,.18) !important;
+}
+button, .btn, .rbtn, .link-btn {
+  touch-action: manipulation;
+  white-space: normal;
+  line-height: 1.2;
+}
+button:not(.delete):not(.red):not(.green):not(.slate), .btn:not(.red):not(.green):not(.slate) {
+  background: linear-gradient(135deg, var(--boostera-primary), var(--boostera-primary-2));
+}
+button.delete, button.red, .btn.red { background: linear-gradient(135deg, #f43f5e, #dc2626) !important; }
+button.green, .btn.green { background: linear-gradient(135deg, #22c55e, #15803d) !important; }
+button.slate, .btn.slate, button.toggle { background: #334155 !important; }
+.notice, .muted, .small { line-height: 1.55; }
+.service-name, .component-name, .pkg-title, .rdet, .order-detail, .log-meta, td, a {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: hidden;
+  border-radius: 14px;
+}
+th { position: sticky; top: 0; z-index: 1; }
+tr:hover td { background: rgba(139,92,246,.035); }
+.toolbar, .top-actions, .pkg-actions { gap: 10px; }
+.toolbar a, .toolbar form, .pkg-actions form { min-width: 0; }
+.packages { gap: 18px !important; }
+.package-card {
+  background: linear-gradient(180deg, rgba(20,23,37,.98), rgba(12,14,23,.98)) !important;
+  border: 1px solid var(--boostera-border-soft) !important;
+}
+.package-head { align-items: stretch !important; }
+.pkg-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
+.pkg-actions form { flex: 0 1 150px; }
+.pkg-body { align-items: start; }
+.components-grid { align-items: stretch; }
+.component-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.component-card form { margin-top: auto; }
+.component-line { line-height: 1.45; }
+.pill, .badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+}
+.empty { background: rgba(15,23,42,.42); }
+
+@media (max-width: 1100px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .grid-2, .pkg-body { grid-template-columns: 1fr !important; }
+  .form-grid, form.grid, .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .form-grid .wide { grid-column: span 2; }
+}
+@media (max-width: 760px) {
+  body { padding: 0 !important; }
+  header {
+    position: relative !important;
+    padding: 14px 12px !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+  }
+  .logo { font-size: 20px !important; }
+  .container, .wrap {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 12px !important;
+  }
+  .shell, .card, .container, .package-card, .component-card, .component-form {
+    border-radius: 16px !important;
+    padding: 14px !important;
+  }
+  h1 { font-size: 26px !important; line-height: 1.15 !important; }
+  h2 { font-size: 19px !important; }
+  .grid-4, .grid-2, .form-grid, form.grid, .grid, .components-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .form-grid .wide { grid-column: auto !important; }
+  .toolbar, .top-actions, .filters, .pkg-actions {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar a, .toolbar form, .toolbar button,
+  .top-actions a, .top-actions button,
+  .pkg-actions form, .pkg-actions button,
+  .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    justify-content: center !important;
+  }
+  input, select, textarea, button, .btn, .rbtn, .link-btn {
+    width: 100% !important;
+    min-height: 50px !important;
+    font-size: 16px !important;
+  }
+  table {
+    display: block !important;
+    width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+  th, td { padding: 11px 10px !important; font-size: 13px !important; }
+  .package-head { grid-template-columns: 1fr !important; }
+  .pkg-meta { gap: 6px !important; }
+  .pill { font-size: 11px !important; padding: 5px 9px !important; }
+  .component-card { gap: 8px !important; }
+  .service-name { font-size: 13px !important; line-height: 1.45 !important; }
+  .row { align-items: flex-start !important; gap: 10px !important; }
+  .row > div { min-width: 0 !important; }
+}
+@media (max-width: 430px) {
+  .container, .wrap { padding: 8px !important; }
+  .shell, .card, .container, .package-card, .component-card, .component-form { padding: 12px !important; }
+  .notice { font-size: 13px !important; }
+  .muted { font-size: 13px !important; }
+  .stat-value, .sv { font-size: 24px !important; }
 }
 
 </style>
