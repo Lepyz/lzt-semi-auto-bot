@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import csv
+import io
 import time
 import hashlib
 import asyncio
@@ -9,7 +11,7 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from jinja2 import Template
 from fastapi.staticfiles import StaticFiles
@@ -187,6 +189,8 @@ LAST_MONTHLY_REPORT_DATE = ""
 PRODUCT_NAME_CACHE = {}
 PANEL_SERVICE_NAME_CACHE = {}
 SALES_HISTORY = {}
+ORDER_HISTORY = []
+BLACKLIST = set()
 
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
 LOG_HISTORY = []
@@ -448,7 +452,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, SALES_HISTORY
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, SALES_HISTORY, ORDER_HISTORY, BLACKLIST
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -468,6 +472,8 @@ def load_state():
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
     SALES_HISTORY = redis_get_json("sales_history", {})
+    ORDER_HISTORY = redis_get_json("order_history", [])
+    BLACKLIST = set(redis_get_json("blacklist", []))
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
@@ -491,6 +497,8 @@ def save_state():
         redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
         redis_set_json("dynamic_services", DYNAMIC_SERVICES)
         redis_set_json("sales_history", SALES_HISTORY)
+        redis_set_json("order_history", ORDER_HISTORY[-500:])
+        redis_set_json("blacklist", list(BLACKLIST))
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -762,6 +770,63 @@ def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price,
     return True
 
 
+def is_blacklisted(value: str) -> bool:
+    value = str(value or "").lower().strip()
+    if not value:
+        return False
+    return value in BLACKLIST or any(str(item).lower().strip() and str(item).lower().strip() in value for item in BLACKLIST)
+
+
+def blacklist_add(value: str):
+    value = str(value or "").lower().strip()
+    if value:
+        with STATE_LOCK:
+            BLACKLIST.add(value)
+            save_state()
+
+
+def blacklist_remove(value: str):
+    value = str(value or "").lower().strip()
+    with STATE_LOCK:
+        BLACKLIST.discard(value)
+        save_state()
+
+
+def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0):
+    entry = {
+        "order_id": str(order_id),
+        "advert_id": str(advert_id),
+        "product_name": str(product_name),
+        "panel": str(panel),
+        "smm_order_id": str(smm_order_id),
+        "link": str(link),
+        "price": float(price or 0),
+        "completed_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with STATE_LOCK:
+        ORDER_HISTORY.append(entry)
+        if len(ORDER_HISTORY) > 500:
+            del ORDER_HISTORY[:-500]
+        save_state()
+
+
+def calculate_profit(sale_tl: float, cost_tl: float) -> dict:
+    sale_tl = float(sale_tl or 0)
+    cost_tl = float(cost_tl or 0)
+    commission = sale_tl * ITEMSATIS_COMMISSION_RATE
+    net_sale = sale_tl - commission
+    profit = net_sale - cost_tl
+    margin_pct = (profit / sale_tl * 100) if sale_tl > 0 else 0
+    return {
+        "sale_price": sale_tl,
+        "commission": commission,
+        "net_sale": net_sale,
+        "panel_cost": cost_tl,
+        "profit": profit,
+        "margin_pct": round(margin_pct, 2),
+    }
+
+
 def build_sales_report(title: str, stats: dict, empty_text: str):
     lines = [f"{title}\n"]
     total_count = 0
@@ -848,6 +913,7 @@ def add_pending_order(
     quantity="",
     platform="",
     panel_key="",
+    price=0,
 ):
     if not smm_order_id or str(smm_order_id) == "Bilinmiyor":
         return
@@ -869,6 +935,7 @@ def add_pending_order(
             "created_at": int(time.time()),
             "delay_alert_sent": False,
             "cancelled": False,
+            "price": float(price or 0),
         })
         log("info", "order_queued", order_id=order_id, smm_order_id=smm_order_id, product=product_name)
         save_state()
@@ -2330,6 +2397,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="logo">Boostera <span>SMM</span></div>
   <div class="top-actions">
     <a class="link-btn" href="/admin">Admin</a>
+    <a class="link-btn" href="/api/export">CSV İndir</a>
     <span class="last-updated" id="lastUpdated">—</span>
     <button class="refresh-btn" onclick="loadAll()">↻ Yenile</button>
   </div>
@@ -2396,6 +2464,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="card" style="margin-bottom:28px;">
+    <div class="card-title">
+      <span>Sipariş Geçmişi</span>
+      <span id="historyCount" style="color:var(--muted);font-size:11px"></span>
+    </div>
+    <div id="historyList"><div class="empty">Yükleniyor...</div></div>
+  </div>
+
   <div class="card">
     <div class="card-title">
       <span>Canlı Log</span>
@@ -2421,7 +2497,7 @@ function escapeHtml(value) {
 
 async function loadAll() {
   document.getElementById('lastUpdated').textContent = 'Güncelleniyor...';
-  await Promise.all([loadStatsAndChart(), loadPending(), loadFailed(), loadLogs()]);
+  await Promise.all([loadStatsAndChart(), loadPending(), loadFailed(), loadHistory(), loadLogs()]);
   const now = new Date().toLocaleTimeString('tr-TR');
   document.getElementById('lastUpdated').textContent = `Son güncelleme: ${now}`;
 }
@@ -2534,6 +2610,24 @@ async function loadFailed() {
         <div class="order-detail">${escapeHtml(o.reason)}${o.smm_order_id ? ' · SMM #' + escapeHtml(o.smm_order_id) : ''}${o.panel ? ' · ' + escapeHtml(o.panel) : ''}</div>
       </div>
       <span class="badge failed">hata</span>
+    </div>`).join('');
+}
+
+
+async function loadHistory() {
+  const r = await fetch('/api/history');
+  const d = await r.json();
+  const el = document.getElementById('historyList');
+  const orders = d.orders || [];
+  document.getElementById('historyCount').textContent = `${orders.length} kayıt`;
+  if (!orders.length) { el.innerHTML = '<div class="empty">Sipariş geçmişi yok</div>'; return; }
+  el.innerHTML = orders.slice(-12).reverse().map(o => `
+    <div class="order-row">
+      <div>
+        <div>${escapeHtml(o.product_name)}</div>
+        <div class="order-detail">${escapeHtml(o.completed_at)} · ${escapeHtml(o.panel)} #${escapeHtml(o.smm_order_id)} · ${escapeHtml(o.link)}</div>
+      </div>
+      <span class="badge pending">${money(o.price || 0)}</span>
     </div>`).join('');
 }
 
@@ -2655,6 +2749,60 @@ def api_logs(user: str = Depends(get_current_admin)):
     return {"logs": LOG_HISTORY}
 
 
+
+
+@app.get("/api/history")
+def api_history(user: str = Depends(get_current_admin)):
+    return {"orders": ORDER_HISTORY[-500:]}
+
+
+@app.get("/api/blacklist")
+def api_blacklist(user: str = Depends(get_current_admin)):
+    return {"items": sorted(BLACKLIST)}
+
+
+@app.get("/api/profit")
+def api_profit(sale: float = 0, cost: float = 0, user: str = Depends(get_current_admin)):
+    return calculate_profit(sale, cost)
+
+
+@app.get("/api/export")
+def api_export(user: str = Depends(get_current_admin)):
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["order_id", "advert_id", "product_name", "panel", "smm_order_id", "link", "price", "completed_at"],
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    for row in ORDER_HISTORY:
+        writer.writerow(row)
+    output.seek(0)
+    filename = f"boostera_orders_{now_tr().strftime('%Y%m%d_%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/check-panel-health")
+@app.head("/check-panel-health")
+def check_panel_health():
+    results = {}
+    for key, panel in PANEL_MAP.items():
+        if not panel.get("api_url") or not panel.get("api_key"):
+            continue
+        balance_data = panel_balance(panel["api_url"], panel["api_key"], panel.get("name", key))
+        if "error" in balance_data:
+            log("error", "panel_health_error", panel=key, error=balance_data.get("error"))
+            results[key] = {"ok": False, "error": balance_data.get("error")}
+        else:
+            check_low_balance(balance_data.get("balance", 0), balance_data.get("currency", ""), panel.get("name", key))
+            results[key] = {"ok": True, "balance": format_panel_balance_tl(balance_data)}
+    return {"ok": True, "panels": results}
+
+
 @app.get("/test")
 def test_message():
     return {"ok": True}
@@ -2769,6 +2917,15 @@ def check_orders():
                 f"Müşteriye değerlendirme mesajı gönderildi."
             )
             notify_customer_order_completed(item.get("itemsatis_order_id", ""), item.get("product_name", ""), item.get("link", ""))
+            add_order_history(
+                item.get("itemsatis_order_id", "Bilinmiyor"),
+                item.get("advert_id", ""),
+                item.get("product_name", "Bilinmeyen Ürün"),
+                item.get("panel", ""),
+                item.get("smm_order_id", ""),
+                item.get("link", ""),
+                item.get("price", 0),
+            )
             completed_indexes.append(index)
             changed = True
 
@@ -2995,6 +3152,13 @@ async def itemsatis_webhook(request: Request):
             send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
             return {"ok": False, "error": "order_link_not_found"}
 
+        if is_blacklisted(customer_link) or is_blacklisted(buyer):
+            add_failed_order(order_id, advert_id, service_name, "Blacklist engeli", customer_link, link=customer_link, panel=service.get("panel", ""))
+            send_telegram(
+                f"Blacklisted sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}"
+            )
+            return {"ok": False, "error": "blacklisted"}
+
         normalized_link = normalize_link_for_check(customer_link, platform)
         duplicate_link_key = f"{advert_id}:{normalized_link}"
         order_key = make_order_key(order_id, advert_id, buyer, customer_link, platform)
@@ -3048,6 +3212,7 @@ async def itemsatis_webhook(request: Request):
             quantity=service.get("quantity", ""),
             platform=service.get("platform", ""),
             panel_key=service.get("panel_key", ""),
+            price=price,
         )
         save_state()
 
@@ -3095,6 +3260,9 @@ async def telegram_webhook(request: Request):
             "/services - Servis eşleştirmeleri\n"
             "/admin - Web servis yönetim paneli\n"
             "/cancel smm_id - Siparişi iptal et\n"
+            "/blacklist add değer - Kara listeye ekle\n"
+            "/blacklist remove değer - Kara listeden çıkar\n"
+            "/blacklist list - Kara listeyi göster\n"
             "/report - Bugünkü özet\n"
             "/week-report - Haftalık özet\n"
             "/month-report - Aylık özet\n"
@@ -3186,6 +3354,31 @@ async def telegram_webhook(request: Request):
     # YENİ: /cancel komutu
     if command == "/cancel":
         handle_cancel_command(text)
+        return {"ok": True}
+
+
+    if command == "/blacklist":
+        parts = text.split(maxsplit=2)
+        action = parts[1].lower() if len(parts) > 1 else "list"
+        if action == "list":
+            if not BLACKLIST:
+                send_telegram("Kara liste boş.")
+            else:
+                send_telegram("Kara Liste:\n" + "\n".join(f"- {item}" for item in sorted(BLACKLIST)))
+            return {"ok": True}
+        if len(parts) < 3:
+            send_telegram("Kullanım: /blacklist add değer veya /blacklist remove değer")
+            return {"ok": True}
+        value = parts[2].strip()
+        if action == "add":
+            blacklist_add(value)
+            send_telegram(f"Kara listeye eklendi: {value}")
+            return {"ok": True}
+        if action == "remove":
+            blacklist_remove(value)
+            send_telegram(f"Kara listeden çıkarıldı: {value}")
+            return {"ok": True}
+        send_telegram("Kullanım: /blacklist add/remove/list")
         return {"ok": True}
 
     if command == "/report":
