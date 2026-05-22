@@ -719,22 +719,31 @@ def build_sales_report(title: str, stats: dict, empty_text: str):
 
 
 def reset_sales_stats(scope: str = "daily"):
-    global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS, RECORDED_SALES
+    global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS, RECORDED_SALES, SALES_HISTORY
     scope = str(scope or "daily").lower().strip()
-    if scope == "daily":
-        DAILY_STATS = {}
-    elif scope == "weekly":
-        WEEKLY_STATS = {}
-    elif scope == "monthly":
-        MONTHLY_STATS = {}
-    elif scope == "all":
-        DAILY_STATS = {}
-        WEEKLY_STATS = {}
-        MONTHLY_STATS = {}
-        RECORDED_SALES = set()
-    else:
-        return False
-    save_state()
+    now = now_tr()
+
+    with STATE_LOCK:
+        if scope == "daily":
+            DAILY_STATS = {}
+            SALES_HISTORY.pop(now.strftime("%Y-%m-%d"), None)
+        elif scope == "weekly":
+            WEEKLY_STATS = {}
+            week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+            SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) < week_start}
+        elif scope == "monthly":
+            MONTHLY_STATS = {}
+            month_start = now.replace(day=1).strftime("%Y-%m-%d")
+            SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) < month_start}
+        elif scope == "all":
+            DAILY_STATS = {}
+            WEEKLY_STATS = {}
+            MONTHLY_STATS = {}
+            SALES_HISTORY = {}
+            RECORDED_SALES = set()
+        else:
+            return False
+        save_state()
     return True
 
 
@@ -811,9 +820,33 @@ def get_event(data: dict) -> str:
     return normalize_text(get_nested(data, "event", "type", "action", "details.event", "data.event"))
 
 
+def is_generic_itemsatis_title(value: str) -> bool:
+    """Itemsatış webhooklarında gerçek ilan adı yerine gelen genel başlıkları filtreler."""
+    text = normalize_text(value)
+    generic_values = {
+        "ilanınız satıldı",
+        "ilaniniz satildi",
+        "advert sold",
+        "advert_sold",
+        "satıldı",
+        "satildi",
+        "order sold",
+        "sipariş",
+        "siparis",
+    }
+    return text in generic_values
+
+
 def get_order_id(data: dict) -> str:
-    return str(get_nested(data, "order_id", "id", "purchaseId", "purchase_id",
-                          "data.order_id", "data.id", "details.order_id") or "Bilinmiyor")
+    value = get_nested(
+        data,
+        "order_id", "id", "purchaseId", "purchase_id", "sale_id", "transaction_id",
+        "order.id", "order.order_id", "order.purchase_id",
+        "purchase.id", "purchase.order_id", "purchase.purchase_id",
+        "data.order_id", "data.id", "data.purchaseId", "data.purchase_id", "data.order.id",
+        "details.order_id", "details.id", "details.purchaseId", "details.purchase_id", "details.order.id",
+    )
+    return str(value or "Bilinmiyor")
 
 
 def get_advert_id(data: dict) -> str:
@@ -822,24 +855,35 @@ def get_advert_id(data: dict) -> str:
 
 
 def get_product_name(data: dict) -> str:
-    """Itemsatış ilan adını mümkün olan tüm alanlardan yakalar."""
-    value = get_nested(
-        data,
-        "product_name", "product", "product.title", "product.name",
-        "title", "name",
+    """Itemsatış ilan adını mümkün olan tüm alanlardan yakalar; genel webhook başlıklarını ürün adı sanmaz."""
+    candidate_paths = [
+        # En güvenilir ilan/advert alanları
         "advert.title", "advert.name", "advert.subject",
         "details.advert.title", "details.advert.name", "details.advert.subject",
         "data.advert.title", "data.advert.name", "data.advert.subject",
-        "details.product_name", "details.product", "details.product.title", "details.product.name",
-        "data.product_name", "data.product", "data.product.title", "data.product.name",
-        "order.product_name", "order.product", "order.advert.title", "order.advert.name",
-        "purchase.product_name", "purchase.product", "purchase.advert.title", "purchase.advert.name",
-    )
+        "order.advert.title", "order.advert.name", "order.advert.subject",
+        "purchase.advert.title", "purchase.advert.name", "purchase.advert.subject",
 
-    if isinstance(value, dict):
-        value = value.get("title") or value.get("name") or value.get("subject") or ""
+        # Ürün alanları
+        "product_name", "product.title", "product.name",
+        "details.product_name", "details.product.title", "details.product.name",
+        "data.product_name", "data.product.title", "data.product.name",
+        "order.product_name", "order.product.title", "order.product.name",
+        "purchase.product_name", "purchase.product.title", "purchase.product.name",
 
-    return str(value or "").strip()
+        # Daha düşük güvenilir genel alanlar en sonda
+        "title", "name", "details.title", "data.title",
+    ]
+
+    for path in candidate_paths:
+        value = get_nested(data, path)
+        if isinstance(value, dict):
+            value = value.get("title") or value.get("name") or value.get("subject") or ""
+        value = str(value or "").strip()
+        if value and not is_generic_itemsatis_title(value):
+            return value
+
+    return ""
 
 
 def cache_itemsatis_product_name(advert_id: str, product_name: str):
@@ -856,15 +900,20 @@ def cache_itemsatis_product_name(advert_id: str, product_name: str):
 
 
 def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
-    """Günlük/haftalık/aylık rapor için sadece Itemsatış ilan adını önceliklendirir."""
+    """Rapor için gerçek Itemsatış ilan adını kullanır; genel webhook başlığını kullanmaz."""
     product_name = str(product_name or "").strip()
-    if product_name:
+    if product_name and not is_generic_itemsatis_title(product_name):
         cache_itemsatis_product_name(advert_id, product_name)
         return product_name
 
     cached_name = str(PRODUCT_NAME_CACHE.get(str(advert_id or ""), "")).strip()
-    if cached_name:
+    if cached_name and not is_generic_itemsatis_title(cached_name):
         return cached_name
+
+    service = get_all_services(include_inactive=True).get(str(advert_id or ""), {})
+    configured_name = str((service or {}).get("name") or "").strip()
+    if configured_name and not is_generic_itemsatis_title(configured_name):
+        return configured_name
 
     if str(advert_id or "") == CS2_ADVERT_ID:
         return "CS2 5 Yıllık Hesap"
@@ -876,11 +925,23 @@ def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
 
 
 def get_buyer(data: dict) -> str:
-    buyer = get_nested(data, "buyer", "buyer.username", "username", "customer",
-                       "customer.username", "details.customer.username", "data.customer.username")
+    buyer = get_nested(
+        data,
+        "buyer", "buyer.username", "buyer.name", "buyer.user_name",
+        "customer", "customer.username", "customer.name", "customer.user_name",
+        "user", "user.username", "user.name",
+        "details.buyer", "details.buyer.username", "details.buyer.name",
+        "details.customer", "details.customer.username", "details.customer.name",
+        "data.buyer", "data.buyer.username", "data.buyer.name",
+        "data.customer", "data.customer.username", "data.customer.name",
+        "order.buyer", "order.buyer.username", "order.customer.username",
+    )
     if isinstance(buyer, dict):
-        return str(buyer.get("username") or buyer.get("name") or buyer.get("id") or "Bilinmiyor")
-    return str(buyer or "Bilinmiyor")
+        return str(buyer.get("username") or buyer.get("name") or buyer.get("user_name") or buyer.get("id") or "Bilinmiyor")
+    buyer = str(buyer or "").strip()
+    if is_generic_itemsatis_title(buyer):
+        return "Bilinmiyor"
+    return buyer or "Bilinmiyor"
 
 
 def collect_strings(obj, results=None):
@@ -1522,6 +1583,9 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
   <form method="post" action="/admin/update-services" style="display:inline;">
     <button class="green" type="submit">Servis Fiyatlarını Kontrol Et</button>
   </form>
+  <form method="post" action="/admin/reset-dashboard" style="display:inline;" onsubmit="return confirm('Günlük dashboard verisi sıfırlansın mı?')">
+    <button class="delete" type="submit">Bugünü Sıfırla</button>
+  </form>
 </div>
 
 <form class="grid" method="post" action="/admin/add-service">
@@ -1622,8 +1686,11 @@ def admin_add_service(
 
 @app.post("/admin/delete-service")
 def admin_delete_service(advert_id: str = Form(...), user: str = Depends(get_current_admin)):
-    delete_dynamic_service(advert_id)
-    log("warning", "admin_service_deleted", advert_id=advert_id)
+    removed = delete_dynamic_service(advert_id)
+    if removed:
+        log("warning", "admin_service_deleted", advert_id=advert_id)
+    else:
+        log("warning", "admin_service_delete_skipped", advert_id=advert_id, reason="dynamic_service_not_found")
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1638,6 +1705,14 @@ def admin_toggle_service(advert_id: str = Form(...), user: str = Depends(get_cur
 def admin_update_services(user: str = Depends(get_current_admin)):
     """Admin panelden servis fiyat kontrolünü manuel başlatır."""
     check_services()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/reset-dashboard")
+def admin_reset_dashboard(user: str = Depends(get_current_admin)):
+    """Admin panelden bugünkü dashboard/rapor verisini sıfırlar."""
+    reset_sales_stats("daily")
+    log("warning", "admin_dashboard_reset", user=user)
     return RedirectResponse("/admin", status_code=303)
 
 
