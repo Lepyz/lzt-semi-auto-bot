@@ -2401,6 +2401,7 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
 <p><a href="/admin">← Admin Paneline Dön</a></p>
 
 <h2>Paket Oluştur / Güncelle</h2>
+<div class="notice">Paket tek başına panel/servis bilmez. Aşağıda ilk bileşeni de girersen paket hemen hangi panelden hangi servisi çekeceğini öğrenir. Sonradan pakete ek bileşenleri tablodan ekleyebilirsin.</div>
 <form class="grid" method="post" action="/admin/packages/add">
   <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\\d+$" required maxlength="20">
   <input name="name" placeholder="Paket adı (örn: TikTok Fenomen Paket)" required maxlength="120">
@@ -2413,7 +2414,22 @@ a { color:#a78bfa; text-decoration:none; } .actions form { display:inline; }
     <option value="kick">Kick</option>
     <option value="other">Diğer</option>
   </select>
-  <button type="submit">Paket Kaydet</button>
+  <input name="first_component_name" placeholder="İlk bileşen adı: İzlenme / Beğeni" required maxlength="80">
+  <select name="first_panel" required>
+    {% for key, panel in panels.items() %}<option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>{% endfor %}
+  </select>
+  <input name="first_service_id" placeholder="İlk panel servis ID" pattern="^\\d+$" required maxlength="20">
+  <input name="first_quantity" type="number" min="1" max="1000000" placeholder="İlk adet" required>
+  <select name="first_platform" required>
+    <option value="tiktok">TikTok</option>
+    <option value="instagram">Instagram</option>
+    <option value="youtube">YouTube</option>
+    <option value="x">X/Twitter</option>
+    <option value="twitch">Twitch</option>
+    <option value="kick">Kick</option>
+    <option value="other">Diğer</option>
+  </select>
+  <button type="submit">Paketi ve İlk Bileşeni Kaydet</button>
 </form>
 
 <h2>Paketler</h2>
@@ -2497,10 +2513,24 @@ def admin_packages(user: str = Depends(get_current_admin)):
 
 
 @app.post("/admin/packages/add")
-def admin_package_add(advert_id: str = Form(...), name: str = Form(...), platform: str = Form("tiktok"), user: str = Depends(get_current_admin)):
+def admin_package_add(
+    advert_id: str = Form(...),
+    name: str = Form(...),
+    platform: str = Form("tiktok"),
+    first_component_name: str = Form(...),
+    first_panel: str = Form(...),
+    first_service_id: str = Form(...),
+    first_quantity: int = Form(...),
+    first_platform: str = Form("tiktok"),
+    user: str = Depends(get_current_admin),
+):
     try:
         set_package(advert_id, name, platform, True)
-        log("success", "admin_package_saved", advert_id=advert_id, name=name)
+        comp = add_package_component(advert_id, first_component_name, first_panel, first_service_id, first_quantity, first_platform)
+        panel_service_name = fetch_panel_service_name_by_id(first_panel, first_service_id)
+        if panel_service_name:
+            cache_panel_service_name(first_panel, first_service_id, panel_service_name)
+        log("success", "admin_package_saved", advert_id=advert_id, name=name, first_component=comp.get("name"))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     return RedirectResponse("/admin/packages", status_code=303)
