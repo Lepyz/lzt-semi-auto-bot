@@ -1228,29 +1228,54 @@ def collect_strings(obj, results=None):
 
 
 def find_order_link(data: dict, platform: str = "") -> str:
+    """Müşterinin girdiği gerçek sosyal medya linkini bulur.
+
+    ÖNEMLİ GÜVENLİK KURALI:
+    Itemsatış webhook içinde ilan görseli gibi CDN linkleri de gelebiliyor.
+    Paket sisteminde bu CDN linki yanlışlıkla panele gönderilmesin diye,
+    platform belli ise sadece o platformun domainlerini kabul ederiz.
+    Link bulunamazsa boş döner ve sipariş panele gönderilmez.
+    """
     platform = normalize_text(platform)
 
     priority_paths = [
+        # Önce müşterinin doldurduğu post_datas alanları
         "post_datas.Profil Linki",
         "post_datas.Link",
         "post_datas.Video Linki",
         "post_datas.Gönderi Linki",
         "post_datas.Kanal Linki",
+        "post_datas.TikTok Linki",
+        "post_datas.Instagram Linki",
+        "post_datas.YouTube Linki",
+        "post_datas.Youtube Linki",
         "details.post_datas.Profil Linki",
         "details.post_datas.Link",
         "details.post_datas.Video Linki",
         "details.post_datas.Gönderi Linki",
         "details.post_datas.Kanal Linki",
+        "details.post_datas.TikTok Linki",
+        "details.post_datas.Instagram Linki",
+        "details.post_datas.YouTube Linki",
+        "details.post_datas.Youtube Linki",
         "data.post_datas.Profil Linki",
         "data.post_datas.Link",
         "data.post_datas.Video Linki",
         "data.post_datas.Gönderi Linki",
         "data.post_datas.Kanal Linki",
+        "data.post_datas.TikTok Linki",
+        "data.post_datas.Instagram Linki",
+        "data.post_datas.YouTube Linki",
+        "data.post_datas.Youtube Linki",
+        # Sonra açık link alanları
         "url", "link", "profile_link", "account_link", "video_link", "post_link",
         "instagram", "instagram_link", "tiktok", "tiktok_link", "youtube", "youtube_link",
-        "note", "message", "content", "description", "order_note", "customer_note",
-        "details.url", "details.link", "details.note", "details.message", "details.content", "details.description",
-        "data.url", "data.link", "data.note", "data.message", "data.content", "data.description",
+        "details.url", "details.link", "details.instagram_link", "details.tiktok_link", "details.youtube_link",
+        "data.url", "data.link", "data.instagram_link", "data.tiktok_link", "data.youtube_link",
+        # Not alanları en son; burada ilan görseli/linki de olabilir, bu yüzden domain filtresi uygulanır.
+        "note", "message", "order_note", "customer_note",
+        "details.note", "details.message", "details.order_note", "details.customer_note",
+        "data.note", "data.message", "data.order_note", "data.customer_note",
     ]
 
     platform_domains = {
@@ -1265,59 +1290,144 @@ def find_order_link(data: dict, platform: str = "") -> str:
         "telegram": ["t.me", "telegram.me"],
     }
 
-    def looks_like_link(value: str) -> bool:
+    blocked_url_markers = [
+        "cdn.itemsatis.com",
+        "itemsatis.com/uploads",
+        "/uploads/",
+        "post_images",
+        "product_images",
+        "advert_images",
+        "ilan-resim",
+    ]
+    blocked_extensions = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico", ".avif")
+
+    def clean_candidate(value: str) -> str:
+        v = str(value or "").strip()
+        # Noktalama/HTML kırıntılarını temizle
+        return v.strip().strip("'\"<>.,;)])}")
+
+    def is_asset_or_itemsatis_image(value: str) -> bool:
         v = str(value or "").strip().lower()
         if not v:
-            return False
-        if platform == "instagram" and v.startswith("@"):
             return True
-        if v.startswith("http://") or v.startswith("https://"):
+        if any(marker in v for marker in blocked_url_markers):
             return True
-        domains = platform_domains.get(platform, [])
-        if domains and any(domain in v for domain in domains):
-            return True
-        if not domains and "." in v and " " not in v:
+        no_query = v.split("?")[0]
+        if no_query.endswith(blocked_extensions):
             return True
         return False
 
-    for path in priority_paths:
-        value = get_nested(data, path)
-        if isinstance(value, str) and looks_like_link(value):
-            return normalize_panel_link(value, platform)
+    def has_allowed_platform_domain(value: str) -> bool:
+        v = str(value or "").lower()
+        domains = platform_domains.get(platform, [])
+        return bool(domains and any(domain in v for domain in domains))
+
+    def looks_like_link(value: str) -> bool:
+        v = clean_candidate(value).lower()
+        if not v:
+            return False
+        if is_asset_or_itemsatis_image(v):
+            return False
+
+        domains = platform_domains.get(platform, [])
+
+        # Instagram kullanıcı adı desteklenir.
+        if platform == "instagram" and v.startswith("@") and len(v) > 2:
+            return True
+
+        # Platform belliyse sadece o platformun domainleri kabul edilir.
+        # Böylece cdn.itemsatis.com ilan görseli TikTok linki sanılmaz.
+        if domains:
+            return any(domain in v for domain in domains)
+
+        # Platform other/general ise asset olmayan genel URL kabul edilir.
+        if v.startswith("http://") or v.startswith("https://"):
+            return True
+        if "." in v and " " not in v:
+            return True
+        return False
+
+    # Öncelikli alanlarda tek alan direkt link ise al.
+    # Önemli: Itemsatış bazen asıl alanları raw string içindeki dict olarak gönderir;
+    # bu yüzden hem ana payload hem raw içindeki gömülü payload taranır.
+    for payload in payload_variants(data):
+        for path in priority_paths:
+            value = get_nested(payload, path)
+            if isinstance(value, str) and looks_like_link(value):
+                return normalize_panel_link(clean_candidate(value), platform)
 
     all_strings = collect_strings(data)
     joined = "\n".join(all_strings)
 
+    # Platform belliyse önce sadece o platformun domainini ara.
+    domains = platform_domains.get(platform, [])
     if platform == "instagram":
         match = re.search(r"(https?://)?(www\.)?instagram\.com/[A-Za-z0-9._/\-?=&%]+", joined, re.IGNORECASE)
         if match:
-            return normalize_panel_link(match.group(0), platform)
+            candidate = clean_candidate(match.group(0))
+            if not is_asset_or_itemsatis_image(candidate):
+                return normalize_panel_link(candidate, platform)
         for text in all_strings:
-            text = text.strip()
+            text = clean_candidate(text)
             if text.startswith("@") and len(text) > 2:
                 return normalize_panel_link(text, platform)
         return ""
 
-    # Genel link yakalama: YouTube/TikTok vb. linklerin ? sonrasını KESMEZ.
-    match = re.search(r"https?://[^\s<>'\"]+", joined, re.IGNORECASE)
-    if match:
-        return normalize_panel_link(match.group(0), platform)
-
-    domains = platform_domains.get(platform, [])
     if domains:
         domain_pattern = "|".join(re.escape(d) for d in domains)
-        match = re.search(rf"(?:www\.)?(?:{domain_pattern})/[^\s<>'\"]+", joined, re.IGNORECASE)
+        match = re.search(rf"(?:https?://)?(?:www\.)?(?:{domain_pattern})/[^\s<>'\"]+", joined, re.IGNORECASE)
         if match:
-            value = match.group(0)
+            value = clean_candidate(match.group(0))
             if not value.startswith("http"):
                 value = "https://" + value
-            return normalize_panel_link(value, platform)
+            if not is_asset_or_itemsatis_image(value):
+                return normalize_panel_link(value, platform)
+        return ""
+
+    # Platform bilinmiyorsa genel URL ara ama ilan görseli/CDN linklerini reddet.
+    for match in re.finditer(r"https?://[^\s<>'\"]+", joined, re.IGNORECASE):
+        candidate = clean_candidate(match.group(0))
+        if not is_asset_or_itemsatis_image(candidate):
+            return normalize_panel_link(candidate, platform)
 
     return ""
 
 
 def find_instagram_link(data: dict) -> str:
     return find_order_link(data, "instagram")
+
+
+def find_package_order_link(data: dict, package: dict) -> tuple[str, str]:
+    """Paket siparişlerinde müşteri linkini güvenli şekilde bulur.
+
+    Paketlerde Itemsatış webhook'u ilan görseli/CDN URL'si de taşıyabiliyor.
+    Bu yüzden önce paket platformu ve aktif bileşen platformları denenir; platform
+    domaini eşleşmeyen URL kesinlikle panele gönderilmez. Böylece müşterinin gerçek
+    TikTok/Instagram/YouTube linki varken cdn.itemsatis.com görsel linki seçilmez.
+    """
+    platforms = []
+
+    def add_platform(value):
+        value = normalize_text(value or "")
+        if value and value not in platforms:
+            platforms.append(value)
+
+    add_platform((package or {}).get("platform"))
+    for component in (package or {}).get("components", []) or []:
+        comp = normalize_package_component(component)
+        if comp.get("active", True):
+            add_platform(comp.get("platform"))
+
+    # Sosyal platformları önce dene. other/general en sona kalsın.
+    preferred = [p for p in platforms if p not in ["other", "general", ""]]
+    fallback = [p for p in platforms if p in ["other", "general", ""]]
+
+    for platform in preferred + fallback:
+        link = find_order_link(data, platform)
+        if link:
+            return link, platform
+
+    return "", (platforms[0] if platforms else "")
 
 def normalize_panel_key(panel_key: str) -> str:
     key = normalize_text(panel_key).replace(" ", "").replace("-", "")
@@ -5798,24 +5908,27 @@ async def itemsatis_webhook(request: Request):
         package = all_packages[advert_id]
         package_name = get_package_display_name(advert_id, package, product_name)
         package_platform = normalize_text(package.get("platform", "tiktok")) or "tiktok"
-        customer_link = find_order_link(data, package_platform)
+        customer_link, detected_link_platform = find_package_order_link(data, package)
 
         if not customer_link:
             add_failed_order(order_id, advert_id, package_name, "Paket sipariş linki bulunamadı")
             notify_customer_order_failed(order_id, package_name)
             send_telegram(
-                f"Paket sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nPaket: {package_name}\nPlatform: {package_platform}\nMüşteri: {buyer}"
+                f"Paket sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nPaket: {package_name}\nPlatform: {package_platform}\nMüşteri: {buyer}\n\n"
+                f"Bot hiçbir panel siparişi açmadı. Itemsatış müşteri bilgi alanında gerçek sosyal medya linki olduğundan emin ol."
             )
             return {"ok": False, "error": "package_link_not_found"}
+
+        log("info", "package_customer_link_detected", advert_id=advert_id, platform=detected_link_platform, link=customer_link)
 
         if is_blacklisted(customer_link) or is_blacklisted(buyer):
             add_failed_order(order_id, advert_id, package_name, "Blacklist engeli", customer_link, link=customer_link)
             send_telegram(f"Blacklisted paket sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}")
             return {"ok": False, "error": "blacklisted"}
 
-        normalized_link = normalize_link_for_check(customer_link, package_platform)
+        normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
         duplicate_link_key = f"package:{advert_id}:{normalized_link}"
-        order_key = make_order_key(order_id, advert_id, buyer, customer_link, package_platform)
+        order_key = make_order_key(order_id, advert_id, buyer, customer_link, detected_link_platform or package_platform)
 
         if order_key in PROCESSED_ORDERS:
             return {"ignored": True, "reason": "duplicate_package_order"}
@@ -5839,11 +5952,12 @@ async def itemsatis_webhook(request: Request):
                 add_failed_order(order_id, advert_id, component_label, "Panel bilgileri eksik", service.get("panel_key", ""), link=customer_link, panel=service.get("panel", ""))
                 continue
 
+            component_link = normalize_panel_link(customer_link, service.get("platform", detected_link_platform or package_platform))
             smm_result = create_panel_order(
                 service["api_url"],
                 service["api_key"],
                 service["service_id"],
-                customer_link,
+                component_link,
                 service["quantity"],
                 service.get("panel", ""),
             )
@@ -5863,7 +5977,7 @@ async def itemsatis_webhook(request: Request):
                 service["api_url"],
                 service["api_key"],
                 smm_order_id,
-                customer_link,
+                component_link,
                 service_id=service.get("service_id", ""),
                 quantity=service.get("quantity", ""),
                 platform=service.get("platform", ""),
