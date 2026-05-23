@@ -1052,8 +1052,20 @@ def get_event(data: dict) -> str:
 
 
 def is_generic_itemsatis_title(value: str) -> bool:
-    """Itemsatış webhooklarında gerçek ilan adı yerine gelen genel başlıkları filtreler."""
+    """Itemsatış webhooklarında gerçek ilan adı yerine gelen genel başlıkları filtreler.
+    Türkçe büyük İ gibi karakterlerde Python lower() birleşik nokta üretebildiği için
+    ASCII sadeleştirme de yapılır.
+    """
     text = normalize_text(value)
+    simplified = (
+        text.replace("i̇", "i")
+        .replace("ı", "i")
+        .replace("ğ", "g")
+        .replace("ü", "u")
+        .replace("ş", "s")
+        .replace("ö", "o")
+        .replace("ç", "c")
+    )
     generic_values = {
         "ilanınız satıldı",
         "ilaniniz satildi",
@@ -1065,7 +1077,16 @@ def is_generic_itemsatis_title(value: str) -> bool:
         "sipariş",
         "siparis",
     }
-    return text in generic_values
+    generic_simplified = {
+        item.replace("ı", "i")
+        .replace("ğ", "g")
+        .replace("ü", "u")
+        .replace("ş", "s")
+        .replace("ö", "o")
+        .replace("ç", "c")
+        for item in generic_values
+    }
+    return text in generic_values or simplified in generic_simplified
 
 
 def get_order_id(data: dict) -> str:
@@ -1707,7 +1728,7 @@ def delete_package_component(advert_id: str, component_id: str) -> bool:
 
 def get_package_display_name(advert_id: str, package: dict, product_name: str = "") -> str:
     name = str(product_name or "").strip()
-    if name and not is_generic_title(name):
+    if name and not is_generic_itemsatis_title(name):
         return name
     name = str((package or {}).get("name") or "").strip()
     if name:
@@ -2108,6 +2129,7 @@ ADMIN_HTML = """
 }
 * { box-sizing: border-box; }
 html { min-height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; }
+html { background: var(--bg); }
 body {
   margin: 0;
   min-height: 100vh;
@@ -2316,6 +2338,12 @@ tr:hover td { background: rgba(139,92,246,.035); }
 .tab { padding:7px 12px; border-radius:10px; cursor:pointer; color:var(--muted); font-size:12px; font-weight:900; background:rgba(15,23,42,.48); }
 .tab.active { background: var(--primary); color:#fff; }
 
+
+/* mobile-card-fix-sentinel */
+html, body { max-width: 100%; overflow-x: hidden; }
+.table-wrap, .card, .package-card, .component-card { max-width: 100%; }
+.table-wrap { width: 100%; }
+
 /* Responsive */
 @media (max-width: 1180px) {
   .g4, .grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -2334,8 +2362,20 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .toolbar, .top-actions, .filters, .pkg-actions { display: grid; grid-template-columns: 1fr; width: 100%; gap: 9px; }
   .toolbar a, .toolbar form, .toolbar button, .top-actions a, .top-actions form, .pkg-actions form, .pkg-actions button, .btn, .rbtn, .link-btn { width: 100%; justify-content: center; }
   input, select, textarea, button, .btn, .rbtn, .link-btn { min-height: 50px; font-size: 16px; width: 100%; }
-  table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-  th, td { padding: 11px 10px; font-size: 13px; }
+  .table-wrap { overflow: visible; border: 0; background: transparent; }
+  table { display: block; overflow: visible; white-space: normal; background: transparent; border: 0; border-radius: 0; }
+  thead { display: none; }
+  tbody { display: grid; gap: 12px; }
+  tr { display: block; border: 1px solid var(--border); border-radius: 18px; background: rgba(13,16,28,.88); overflow: hidden; box-shadow: var(--shadow-soft); }
+  tr:hover td { background: transparent; }
+  th { display: none; }
+  td { display: grid; grid-template-columns: minmax(112px, 38%) minmax(0,1fr); gap: 10px; align-items: start; padding: 12px 13px; border-bottom: 1px solid rgba(148,163,184,.10); font-size: 14px; white-space: normal; min-width: 0; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.3; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İŞLEM"], td[data-label="İşlem"], td[data-label="BİLEŞEN EKLE"], td[data-label="Bileşen Ekle"] { grid-template-columns: 1fr; }
+  td[data-label="İŞLEM"]::before, td[data-label="İşlem"]::before, td[data-label="BİLEŞEN EKLE"]::before, td[data-label="Bileşen Ekle"]::before { margin-bottom: 4px; }
+  td form, td .inline-form { width: 100%; display: grid; gap: 8px; margin: 0; }
+  td button, td .btn, td .rbtn { width: 100%; }
   .package-head { grid-template-columns: 1fr; }
   .pkg-actions { justify-content: stretch; }
   .pkg-meta { gap: 6px; }
@@ -2345,12 +2385,38 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .bar-wrap { height: 74px; }
 }
 @media (max-width: 430px) {
+
+  td { grid-template-columns: 1fr; gap: 5px; }
+  td::before { margin-bottom: 2px; }
   .wrap, .container, .shell { padding: 10px; }
   .card, .package-card, .component-card, .component-form { padding: 12px; border-radius: 16px; }
   h1 { font-size: 24px; }
   .sv, .stat-value { font-size: 26px; }
   .notice, .muted { font-size: 13px; }
 }
+
+
+/* === Boostera final mobile table/card fix === */
+@media (max-width: 780px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  .container, .wrap, .shell, header, .topbar { max-width: 100%; overflow-x: hidden; }
+  .table-wrap { overflow: visible; border: 0; }
+  table { width: 100%; display: block; background: transparent; border: 0; border-radius: 0; overflow: visible; white-space: normal; }
+  thead { display: none !important; }
+  tbody { display: grid !important; gap: 12px; width: 100%; }
+  tr { display: grid !important; width: 100%; background: linear-gradient(180deg, rgba(21,24,39,.97), rgba(13,16,28,.97)); border: 1px solid var(--border); border-radius: 18px; padding: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+  td { display: grid !important; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; align-items: start; width: 100%; min-width: 0; max-width: 100%; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.10); white-space: normal !important; overflow-wrap: anywhere; word-break: break-word; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.35; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İşlem"], td[data-label="İŞLEM"], td[data-label="Bileşen Ekle"], td[data-label="BİLEŞEN EKLE"] { grid-template-columns: 1fr; }
+  td[data-label="İşlem"]::before, td[data-label="İŞLEM"]::before, td[data-label="Bileşen Ekle"]::before, td[data-label="BİLEŞEN EKLE"]::before { margin-bottom: 4px; }
+  td form, td .inline-form, .actions form { width: 100%; display: grid; gap: 8px; margin: 0 0 8px 0; }
+  .service-name { max-width: 100%; }
+  .pkg-body, .package-head { grid-template-columns: 1fr !important; }
+  .components-grid { grid-template-columns: 1fr !important; }
+  .component-card, .package-card, .card { max-width: 100%; overflow: hidden; }
+}
+
 </style>
 </head>
 <body>
@@ -2433,6 +2499,42 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 </tbody>
 </table>
 </div>
+
+<script>
+(function(){
+  function applyTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){return (th.textContent||'').trim();});
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(heads[i] && !cell.getAttribute('data-label')) cell.setAttribute('data-label', heads[i]);
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyTableLabels); else applyTableLabels();
+})();
+</script>
+
+<script>
+(function(){
+  function applyMobileTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
+            cell.setAttribute('data-label', heads[i]);
+          }
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
+  else applyMobileTableLabels();
+})();
+</script>
+
 </body>
 </html>
 """
@@ -2613,6 +2715,7 @@ ADMIN_PACKAGES_HTML = """
 }
 * { box-sizing: border-box; }
 html { min-height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; }
+html { background: var(--bg); }
 body {
   margin: 0;
   min-height: 100vh;
@@ -2821,6 +2924,12 @@ tr:hover td { background: rgba(139,92,246,.035); }
 .tab { padding:7px 12px; border-radius:10px; cursor:pointer; color:var(--muted); font-size:12px; font-weight:900; background:rgba(15,23,42,.48); }
 .tab.active { background: var(--primary); color:#fff; }
 
+
+/* mobile-card-fix-sentinel */
+html, body { max-width: 100%; overflow-x: hidden; }
+.table-wrap, .card, .package-card, .component-card { max-width: 100%; }
+.table-wrap { width: 100%; }
+
 /* Responsive */
 @media (max-width: 1180px) {
   .g4, .grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -2839,8 +2948,20 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .toolbar, .top-actions, .filters, .pkg-actions { display: grid; grid-template-columns: 1fr; width: 100%; gap: 9px; }
   .toolbar a, .toolbar form, .toolbar button, .top-actions a, .top-actions form, .pkg-actions form, .pkg-actions button, .btn, .rbtn, .link-btn { width: 100%; justify-content: center; }
   input, select, textarea, button, .btn, .rbtn, .link-btn { min-height: 50px; font-size: 16px; width: 100%; }
-  table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-  th, td { padding: 11px 10px; font-size: 13px; }
+  .table-wrap { overflow: visible; border: 0; background: transparent; }
+  table { display: block; overflow: visible; white-space: normal; background: transparent; border: 0; border-radius: 0; }
+  thead { display: none; }
+  tbody { display: grid; gap: 12px; }
+  tr { display: block; border: 1px solid var(--border); border-radius: 18px; background: rgba(13,16,28,.88); overflow: hidden; box-shadow: var(--shadow-soft); }
+  tr:hover td { background: transparent; }
+  th { display: none; }
+  td { display: grid; grid-template-columns: minmax(112px, 38%) minmax(0,1fr); gap: 10px; align-items: start; padding: 12px 13px; border-bottom: 1px solid rgba(148,163,184,.10); font-size: 14px; white-space: normal; min-width: 0; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.3; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İŞLEM"], td[data-label="İşlem"], td[data-label="BİLEŞEN EKLE"], td[data-label="Bileşen Ekle"] { grid-template-columns: 1fr; }
+  td[data-label="İŞLEM"]::before, td[data-label="İşlem"]::before, td[data-label="BİLEŞEN EKLE"]::before, td[data-label="Bileşen Ekle"]::before { margin-bottom: 4px; }
+  td form, td .inline-form { width: 100%; display: grid; gap: 8px; margin: 0; }
+  td button, td .btn, td .rbtn { width: 100%; }
   .package-head { grid-template-columns: 1fr; }
   .pkg-actions { justify-content: stretch; }
   .pkg-meta { gap: 6px; }
@@ -2850,12 +2971,38 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .bar-wrap { height: 74px; }
 }
 @media (max-width: 430px) {
+
+  td { grid-template-columns: 1fr; gap: 5px; }
+  td::before { margin-bottom: 2px; }
   .wrap, .container, .shell { padding: 10px; }
   .card, .package-card, .component-card, .component-form { padding: 12px; border-radius: 16px; }
   h1 { font-size: 24px; }
   .sv, .stat-value { font-size: 26px; }
   .notice, .muted { font-size: 13px; }
 }
+
+
+/* === Boostera final mobile table/card fix === */
+@media (max-width: 780px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  .container, .wrap, .shell, header, .topbar { max-width: 100%; overflow-x: hidden; }
+  .table-wrap { overflow: visible; border: 0; }
+  table { width: 100%; display: block; background: transparent; border: 0; border-radius: 0; overflow: visible; white-space: normal; }
+  thead { display: none !important; }
+  tbody { display: grid !important; gap: 12px; width: 100%; }
+  tr { display: grid !important; width: 100%; background: linear-gradient(180deg, rgba(21,24,39,.97), rgba(13,16,28,.97)); border: 1px solid var(--border); border-radius: 18px; padding: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+  td { display: grid !important; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; align-items: start; width: 100%; min-width: 0; max-width: 100%; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.10); white-space: normal !important; overflow-wrap: anywhere; word-break: break-word; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.35; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İşlem"], td[data-label="İŞLEM"], td[data-label="Bileşen Ekle"], td[data-label="BİLEŞEN EKLE"] { grid-template-columns: 1fr; }
+  td[data-label="İşlem"]::before, td[data-label="İŞLEM"]::before, td[data-label="Bileşen Ekle"]::before, td[data-label="BİLEŞEN EKLE"]::before { margin-bottom: 4px; }
+  td form, td .inline-form, .actions form { width: 100%; display: grid; gap: 8px; margin: 0 0 8px 0; }
+  .service-name { max-width: 100%; }
+  .pkg-body, .package-head { grid-template-columns: 1fr !important; }
+  .components-grid { grid-template-columns: 1fr !important; }
+  .component-card, .package-card, .card { max-width: 100%; overflow: hidden; }
+}
+
 </style>
 </head>
 <body>
@@ -2939,6 +3086,42 @@ tr:hover td { background: rgba(139,92,246,.035); }
 {% else %}<div class="empty">Henüz paket yok.</div>{% endfor %}
 </div>
 </section></main>
+
+<script>
+(function(){
+  function applyTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){return (th.textContent||'').trim();});
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(heads[i] && !cell.getAttribute('data-label')) cell.setAttribute('data-label', heads[i]);
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyTableLabels); else applyTableLabels();
+})();
+</script>
+
+<script>
+(function(){
+  function applyMobileTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
+            cell.setAttribute('data-label', heads[i]);
+          }
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
+  else applyMobileTableLabels();
+})();
+</script>
+
 </body>
 </html>
 """
@@ -3066,6 +3249,7 @@ ADMIN_MANUAL_ORDER_HTML = """
 }
 * { box-sizing: border-box; }
 html { min-height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; }
+html { background: var(--bg); }
 body {
   margin: 0;
   min-height: 100vh;
@@ -3274,6 +3458,12 @@ tr:hover td { background: rgba(139,92,246,.035); }
 .tab { padding:7px 12px; border-radius:10px; cursor:pointer; color:var(--muted); font-size:12px; font-weight:900; background:rgba(15,23,42,.48); }
 .tab.active { background: var(--primary); color:#fff; }
 
+
+/* mobile-card-fix-sentinel */
+html, body { max-width: 100%; overflow-x: hidden; }
+.table-wrap, .card, .package-card, .component-card { max-width: 100%; }
+.table-wrap { width: 100%; }
+
 /* Responsive */
 @media (max-width: 1180px) {
   .g4, .grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -3292,8 +3482,20 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .toolbar, .top-actions, .filters, .pkg-actions { display: grid; grid-template-columns: 1fr; width: 100%; gap: 9px; }
   .toolbar a, .toolbar form, .toolbar button, .top-actions a, .top-actions form, .pkg-actions form, .pkg-actions button, .btn, .rbtn, .link-btn { width: 100%; justify-content: center; }
   input, select, textarea, button, .btn, .rbtn, .link-btn { min-height: 50px; font-size: 16px; width: 100%; }
-  table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-  th, td { padding: 11px 10px; font-size: 13px; }
+  .table-wrap { overflow: visible; border: 0; background: transparent; }
+  table { display: block; overflow: visible; white-space: normal; background: transparent; border: 0; border-radius: 0; }
+  thead { display: none; }
+  tbody { display: grid; gap: 12px; }
+  tr { display: block; border: 1px solid var(--border); border-radius: 18px; background: rgba(13,16,28,.88); overflow: hidden; box-shadow: var(--shadow-soft); }
+  tr:hover td { background: transparent; }
+  th { display: none; }
+  td { display: grid; grid-template-columns: minmax(112px, 38%) minmax(0,1fr); gap: 10px; align-items: start; padding: 12px 13px; border-bottom: 1px solid rgba(148,163,184,.10); font-size: 14px; white-space: normal; min-width: 0; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.3; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İŞLEM"], td[data-label="İşlem"], td[data-label="BİLEŞEN EKLE"], td[data-label="Bileşen Ekle"] { grid-template-columns: 1fr; }
+  td[data-label="İŞLEM"]::before, td[data-label="İşlem"]::before, td[data-label="BİLEŞEN EKLE"]::before, td[data-label="Bileşen Ekle"]::before { margin-bottom: 4px; }
+  td form, td .inline-form { width: 100%; display: grid; gap: 8px; margin: 0; }
+  td button, td .btn, td .rbtn { width: 100%; }
   .package-head { grid-template-columns: 1fr; }
   .pkg-actions { justify-content: stretch; }
   .pkg-meta { gap: 6px; }
@@ -3303,12 +3505,38 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .bar-wrap { height: 74px; }
 }
 @media (max-width: 430px) {
+
+  td { grid-template-columns: 1fr; gap: 5px; }
+  td::before { margin-bottom: 2px; }
   .wrap, .container, .shell { padding: 10px; }
   .card, .package-card, .component-card, .component-form { padding: 12px; border-radius: 16px; }
   h1 { font-size: 24px; }
   .sv, .stat-value { font-size: 26px; }
   .notice, .muted { font-size: 13px; }
 }
+
+
+/* === Boostera final mobile table/card fix === */
+@media (max-width: 780px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  .container, .wrap, .shell, header, .topbar { max-width: 100%; overflow-x: hidden; }
+  .table-wrap { overflow: visible; border: 0; }
+  table { width: 100%; display: block; background: transparent; border: 0; border-radius: 0; overflow: visible; white-space: normal; }
+  thead { display: none !important; }
+  tbody { display: grid !important; gap: 12px; width: 100%; }
+  tr { display: grid !important; width: 100%; background: linear-gradient(180deg, rgba(21,24,39,.97), rgba(13,16,28,.97)); border: 1px solid var(--border); border-radius: 18px; padding: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+  td { display: grid !important; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; align-items: start; width: 100%; min-width: 0; max-width: 100%; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.10); white-space: normal !important; overflow-wrap: anywhere; word-break: break-word; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.35; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İşlem"], td[data-label="İŞLEM"], td[data-label="Bileşen Ekle"], td[data-label="BİLEŞEN EKLE"] { grid-template-columns: 1fr; }
+  td[data-label="İşlem"]::before, td[data-label="İŞLEM"]::before, td[data-label="Bileşen Ekle"]::before, td[data-label="BİLEŞEN EKLE"]::before { margin-bottom: 4px; }
+  td form, td .inline-form, .actions form { width: 100%; display: grid; gap: 8px; margin: 0 0 8px 0; }
+  .service-name { max-width: 100%; }
+  .pkg-body, .package-head { grid-template-columns: 1fr !important; }
+  .components-grid { grid-template-columns: 1fr !important; }
+  .component-card, .package-card, .card { max-width: 100%; overflow: hidden; }
+}
+
 </style>
 </head>
 <body>
@@ -3354,6 +3582,42 @@ tr:hover td { background: rgba(139,92,246,.035); }
   <button class="full" type="submit" onclick="return confirm('Bu sipariş seçilen dış panele gönderilecek. Devam edilsin mi?')">Siparişi Panele Gönder</button>
 </form>
 </div>
+
+<script>
+(function(){
+  function applyTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){return (th.textContent||'').trim();});
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(heads[i] && !cell.getAttribute('data-label')) cell.setAttribute('data-label', heads[i]);
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyTableLabels); else applyTableLabels();
+})();
+</script>
+
+<script>
+(function(){
+  function applyMobileTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
+            cell.setAttribute('data-label', heads[i]);
+          }
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
+  else applyMobileTableLabels();
+})();
+</script>
+
 </body>
 </html>
 """
@@ -3486,6 +3750,7 @@ ADMIN_PENDING_HTML = """
 }
 * { box-sizing: border-box; }
 html { min-height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; }
+html { background: var(--bg); }
 body {
   margin: 0;
   min-height: 100vh;
@@ -3694,6 +3959,12 @@ tr:hover td { background: rgba(139,92,246,.035); }
 .tab { padding:7px 12px; border-radius:10px; cursor:pointer; color:var(--muted); font-size:12px; font-weight:900; background:rgba(15,23,42,.48); }
 .tab.active { background: var(--primary); color:#fff; }
 
+
+/* mobile-card-fix-sentinel */
+html, body { max-width: 100%; overflow-x: hidden; }
+.table-wrap, .card, .package-card, .component-card { max-width: 100%; }
+.table-wrap { width: 100%; }
+
 /* Responsive */
 @media (max-width: 1180px) {
   .g4, .grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -3712,8 +3983,20 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .toolbar, .top-actions, .filters, .pkg-actions { display: grid; grid-template-columns: 1fr; width: 100%; gap: 9px; }
   .toolbar a, .toolbar form, .toolbar button, .top-actions a, .top-actions form, .pkg-actions form, .pkg-actions button, .btn, .rbtn, .link-btn { width: 100%; justify-content: center; }
   input, select, textarea, button, .btn, .rbtn, .link-btn { min-height: 50px; font-size: 16px; width: 100%; }
-  table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-  th, td { padding: 11px 10px; font-size: 13px; }
+  .table-wrap { overflow: visible; border: 0; background: transparent; }
+  table { display: block; overflow: visible; white-space: normal; background: transparent; border: 0; border-radius: 0; }
+  thead { display: none; }
+  tbody { display: grid; gap: 12px; }
+  tr { display: block; border: 1px solid var(--border); border-radius: 18px; background: rgba(13,16,28,.88); overflow: hidden; box-shadow: var(--shadow-soft); }
+  tr:hover td { background: transparent; }
+  th { display: none; }
+  td { display: grid; grid-template-columns: minmax(112px, 38%) minmax(0,1fr); gap: 10px; align-items: start; padding: 12px 13px; border-bottom: 1px solid rgba(148,163,184,.10); font-size: 14px; white-space: normal; min-width: 0; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.3; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İŞLEM"], td[data-label="İşlem"], td[data-label="BİLEŞEN EKLE"], td[data-label="Bileşen Ekle"] { grid-template-columns: 1fr; }
+  td[data-label="İŞLEM"]::before, td[data-label="İşlem"]::before, td[data-label="BİLEŞEN EKLE"]::before, td[data-label="Bileşen Ekle"]::before { margin-bottom: 4px; }
+  td form, td .inline-form { width: 100%; display: grid; gap: 8px; margin: 0; }
+  td button, td .btn, td .rbtn { width: 100%; }
   .package-head { grid-template-columns: 1fr; }
   .pkg-actions { justify-content: stretch; }
   .pkg-meta { gap: 6px; }
@@ -3723,12 +4006,38 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .bar-wrap { height: 74px; }
 }
 @media (max-width: 430px) {
+
+  td { grid-template-columns: 1fr; gap: 5px; }
+  td::before { margin-bottom: 2px; }
   .wrap, .container, .shell { padding: 10px; }
   .card, .package-card, .component-card, .component-form { padding: 12px; border-radius: 16px; }
   h1 { font-size: 24px; }
   .sv, .stat-value { font-size: 26px; }
   .notice, .muted { font-size: 13px; }
 }
+
+
+/* === Boostera final mobile table/card fix === */
+@media (max-width: 780px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  .container, .wrap, .shell, header, .topbar { max-width: 100%; overflow-x: hidden; }
+  .table-wrap { overflow: visible; border: 0; }
+  table { width: 100%; display: block; background: transparent; border: 0; border-radius: 0; overflow: visible; white-space: normal; }
+  thead { display: none !important; }
+  tbody { display: grid !important; gap: 12px; width: 100%; }
+  tr { display: grid !important; width: 100%; background: linear-gradient(180deg, rgba(21,24,39,.97), rgba(13,16,28,.97)); border: 1px solid var(--border); border-radius: 18px; padding: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+  td { display: grid !important; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; align-items: start; width: 100%; min-width: 0; max-width: 100%; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.10); white-space: normal !important; overflow-wrap: anywhere; word-break: break-word; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.35; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İşlem"], td[data-label="İŞLEM"], td[data-label="Bileşen Ekle"], td[data-label="BİLEŞEN EKLE"] { grid-template-columns: 1fr; }
+  td[data-label="İşlem"]::before, td[data-label="İŞLEM"]::before, td[data-label="Bileşen Ekle"]::before, td[data-label="BİLEŞEN EKLE"]::before { margin-bottom: 4px; }
+  td form, td .inline-form, .actions form { width: 100%; display: grid; gap: 8px; margin: 0 0 8px 0; }
+  .service-name { max-width: 100%; }
+  .pkg-body, .package-head { grid-template-columns: 1fr !important; }
+  .components-grid { grid-template-columns: 1fr !important; }
+  .component-card, .package-card, .card { max-width: 100%; overflow: hidden; }
+}
+
 </style>
 </head>
 <body>
@@ -3764,6 +4073,42 @@ tr:hover td { background: rgba(139,92,246,.035); }
 </tbody>
 </table>
 </div>
+
+<script>
+(function(){
+  function applyTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){return (th.textContent||'').trim();});
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(heads[i] && !cell.getAttribute('data-label')) cell.setAttribute('data-label', heads[i]);
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyTableLabels); else applyTableLabels();
+})();
+</script>
+
+<script>
+(function(){
+  function applyMobileTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
+            cell.setAttribute('data-label', heads[i]);
+          }
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
+  else applyMobileTableLabels();
+})();
+</script>
+
 </body>
 </html>
 """
@@ -3828,6 +4173,7 @@ ADMIN_FAILED_HTML = """
 }
 * { box-sizing: border-box; }
 html { min-height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; }
+html { background: var(--bg); }
 body {
   margin: 0;
   min-height: 100vh;
@@ -4036,6 +4382,12 @@ tr:hover td { background: rgba(139,92,246,.035); }
 .tab { padding:7px 12px; border-radius:10px; cursor:pointer; color:var(--muted); font-size:12px; font-weight:900; background:rgba(15,23,42,.48); }
 .tab.active { background: var(--primary); color:#fff; }
 
+
+/* mobile-card-fix-sentinel */
+html, body { max-width: 100%; overflow-x: hidden; }
+.table-wrap, .card, .package-card, .component-card { max-width: 100%; }
+.table-wrap { width: 100%; }
+
 /* Responsive */
 @media (max-width: 1180px) {
   .g4, .grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -4054,8 +4406,20 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .toolbar, .top-actions, .filters, .pkg-actions { display: grid; grid-template-columns: 1fr; width: 100%; gap: 9px; }
   .toolbar a, .toolbar form, .toolbar button, .top-actions a, .top-actions form, .pkg-actions form, .pkg-actions button, .btn, .rbtn, .link-btn { width: 100%; justify-content: center; }
   input, select, textarea, button, .btn, .rbtn, .link-btn { min-height: 50px; font-size: 16px; width: 100%; }
-  table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-  th, td { padding: 11px 10px; font-size: 13px; }
+  .table-wrap { overflow: visible; border: 0; background: transparent; }
+  table { display: block; overflow: visible; white-space: normal; background: transparent; border: 0; border-radius: 0; }
+  thead { display: none; }
+  tbody { display: grid; gap: 12px; }
+  tr { display: block; border: 1px solid var(--border); border-radius: 18px; background: rgba(13,16,28,.88); overflow: hidden; box-shadow: var(--shadow-soft); }
+  tr:hover td { background: transparent; }
+  th { display: none; }
+  td { display: grid; grid-template-columns: minmax(112px, 38%) minmax(0,1fr); gap: 10px; align-items: start; padding: 12px 13px; border-bottom: 1px solid rgba(148,163,184,.10); font-size: 14px; white-space: normal; min-width: 0; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.3; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İŞLEM"], td[data-label="İşlem"], td[data-label="BİLEŞEN EKLE"], td[data-label="Bileşen Ekle"] { grid-template-columns: 1fr; }
+  td[data-label="İŞLEM"]::before, td[data-label="İşlem"]::before, td[data-label="BİLEŞEN EKLE"]::before, td[data-label="Bileşen Ekle"]::before { margin-bottom: 4px; }
+  td form, td .inline-form { width: 100%; display: grid; gap: 8px; margin: 0; }
+  td button, td .btn, td .rbtn { width: 100%; }
   .package-head { grid-template-columns: 1fr; }
   .pkg-actions { justify-content: stretch; }
   .pkg-meta { gap: 6px; }
@@ -4065,12 +4429,38 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .bar-wrap { height: 74px; }
 }
 @media (max-width: 430px) {
+
+  td { grid-template-columns: 1fr; gap: 5px; }
+  td::before { margin-bottom: 2px; }
   .wrap, .container, .shell { padding: 10px; }
   .card, .package-card, .component-card, .component-form { padding: 12px; border-radius: 16px; }
   h1 { font-size: 24px; }
   .sv, .stat-value { font-size: 26px; }
   .notice, .muted { font-size: 13px; }
 }
+
+
+/* === Boostera final mobile table/card fix === */
+@media (max-width: 780px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  .container, .wrap, .shell, header, .topbar { max-width: 100%; overflow-x: hidden; }
+  .table-wrap { overflow: visible; border: 0; }
+  table { width: 100%; display: block; background: transparent; border: 0; border-radius: 0; overflow: visible; white-space: normal; }
+  thead { display: none !important; }
+  tbody { display: grid !important; gap: 12px; width: 100%; }
+  tr { display: grid !important; width: 100%; background: linear-gradient(180deg, rgba(21,24,39,.97), rgba(13,16,28,.97)); border: 1px solid var(--border); border-radius: 18px; padding: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+  td { display: grid !important; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; align-items: start; width: 100%; min-width: 0; max-width: 100%; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.10); white-space: normal !important; overflow-wrap: anywhere; word-break: break-word; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.35; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İşlem"], td[data-label="İŞLEM"], td[data-label="Bileşen Ekle"], td[data-label="BİLEŞEN EKLE"] { grid-template-columns: 1fr; }
+  td[data-label="İşlem"]::before, td[data-label="İŞLEM"]::before, td[data-label="Bileşen Ekle"]::before, td[data-label="BİLEŞEN EKLE"]::before { margin-bottom: 4px; }
+  td form, td .inline-form, .actions form { width: 100%; display: grid; gap: 8px; margin: 0 0 8px 0; }
+  .service-name { max-width: 100%; }
+  .pkg-body, .package-head { grid-template-columns: 1fr !important; }
+  .components-grid { grid-template-columns: 1fr !important; }
+  .component-card, .package-card, .card { max-width: 100%; overflow: hidden; }
+}
+
 </style>
 </head>
 <body>
@@ -4104,6 +4494,42 @@ tr:hover td { background: rgba(139,92,246,.035); }
 </tbody>
 </table>
 </div>
+
+<script>
+(function(){
+  function applyTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){return (th.textContent||'').trim();});
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(heads[i] && !cell.getAttribute('data-label')) cell.setAttribute('data-label', heads[i]);
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyTableLabels); else applyTableLabels();
+})();
+</script>
+
+<script>
+(function(){
+  function applyMobileTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
+            cell.setAttribute('data-label', heads[i]);
+          }
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
+  else applyMobileTableLabels();
+})();
+</script>
+
 </body>
 </html>
 """
@@ -4215,6 +4641,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 }
 * { box-sizing: border-box; }
 html { min-height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; }
+html { background: var(--bg); }
 body {
   margin: 0;
   min-height: 100vh;
@@ -4423,6 +4850,12 @@ tr:hover td { background: rgba(139,92,246,.035); }
 .tab { padding:7px 12px; border-radius:10px; cursor:pointer; color:var(--muted); font-size:12px; font-weight:900; background:rgba(15,23,42,.48); }
 .tab.active { background: var(--primary); color:#fff; }
 
+
+/* mobile-card-fix-sentinel */
+html, body { max-width: 100%; overflow-x: hidden; }
+.table-wrap, .card, .package-card, .component-card { max-width: 100%; }
+.table-wrap { width: 100%; }
+
 /* Responsive */
 @media (max-width: 1180px) {
   .g4, .grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -4441,8 +4874,20 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .toolbar, .top-actions, .filters, .pkg-actions { display: grid; grid-template-columns: 1fr; width: 100%; gap: 9px; }
   .toolbar a, .toolbar form, .toolbar button, .top-actions a, .top-actions form, .pkg-actions form, .pkg-actions button, .btn, .rbtn, .link-btn { width: 100%; justify-content: center; }
   input, select, textarea, button, .btn, .rbtn, .link-btn { min-height: 50px; font-size: 16px; width: 100%; }
-  table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-  th, td { padding: 11px 10px; font-size: 13px; }
+  .table-wrap { overflow: visible; border: 0; background: transparent; }
+  table { display: block; overflow: visible; white-space: normal; background: transparent; border: 0; border-radius: 0; }
+  thead { display: none; }
+  tbody { display: grid; gap: 12px; }
+  tr { display: block; border: 1px solid var(--border); border-radius: 18px; background: rgba(13,16,28,.88); overflow: hidden; box-shadow: var(--shadow-soft); }
+  tr:hover td { background: transparent; }
+  th { display: none; }
+  td { display: grid; grid-template-columns: minmax(112px, 38%) minmax(0,1fr); gap: 10px; align-items: start; padding: 12px 13px; border-bottom: 1px solid rgba(148,163,184,.10); font-size: 14px; white-space: normal; min-width: 0; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.3; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İŞLEM"], td[data-label="İşlem"], td[data-label="BİLEŞEN EKLE"], td[data-label="Bileşen Ekle"] { grid-template-columns: 1fr; }
+  td[data-label="İŞLEM"]::before, td[data-label="İşlem"]::before, td[data-label="BİLEŞEN EKLE"]::before, td[data-label="Bileşen Ekle"]::before { margin-bottom: 4px; }
+  td form, td .inline-form { width: 100%; display: grid; gap: 8px; margin: 0; }
+  td button, td .btn, td .rbtn { width: 100%; }
   .package-head { grid-template-columns: 1fr; }
   .pkg-actions { justify-content: stretch; }
   .pkg-meta { gap: 6px; }
@@ -4452,12 +4897,38 @@ tr:hover td { background: rgba(139,92,246,.035); }
   .bar-wrap { height: 74px; }
 }
 @media (max-width: 430px) {
+
+  td { grid-template-columns: 1fr; gap: 5px; }
+  td::before { margin-bottom: 2px; }
   .wrap, .container, .shell { padding: 10px; }
   .card, .package-card, .component-card, .component-form { padding: 12px; border-radius: 16px; }
   h1 { font-size: 24px; }
   .sv, .stat-value { font-size: 26px; }
   .notice, .muted { font-size: 13px; }
 }
+
+
+/* === Boostera final mobile table/card fix === */
+@media (max-width: 780px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  .container, .wrap, .shell, header, .topbar { max-width: 100%; overflow-x: hidden; }
+  .table-wrap { overflow: visible; border: 0; }
+  table { width: 100%; display: block; background: transparent; border: 0; border-radius: 0; overflow: visible; white-space: normal; }
+  thead { display: none !important; }
+  tbody { display: grid !important; gap: 12px; width: 100%; }
+  tr { display: grid !important; width: 100%; background: linear-gradient(180deg, rgba(21,24,39,.97), rgba(13,16,28,.97)); border: 1px solid var(--border); border-radius: 18px; padding: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+  td { display: grid !important; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; align-items: start; width: 100%; min-width: 0; max-width: 100%; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.10); white-space: normal !important; overflow-wrap: anywhere; word-break: break-word; }
+  td:last-child { border-bottom: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.35; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td[data-label="İşlem"], td[data-label="İŞLEM"], td[data-label="Bileşen Ekle"], td[data-label="BİLEŞEN EKLE"] { grid-template-columns: 1fr; }
+  td[data-label="İşlem"]::before, td[data-label="İŞLEM"]::before, td[data-label="Bileşen Ekle"]::before, td[data-label="BİLEŞEN EKLE"]::before { margin-bottom: 4px; }
+  td form, td .inline-form, .actions form { width: 100%; display: grid; gap: 8px; margin: 0 0 8px 0; }
+  .service-name { max-width: 100%; }
+  .pkg-body, .package-head { grid-template-columns: 1fr !important; }
+  .components-grid { grid-template-columns: 1fr !important; }
+  .component-card, .package-card, .card { max-width: 100%; overflow: hidden; }
+}
+
 </style>
 </head>
 <body>
@@ -4735,6 +5206,42 @@ viewType.addEventListener('change', loadStatsAndChart);
 loadAll();
 setInterval(loadAll, 30000);
 </script>
+
+<script>
+(function(){
+  function applyTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){return (th.textContent||'').trim();});
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(heads[i] && !cell.getAttribute('data-label')) cell.setAttribute('data-label', heads[i]);
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyTableLabels); else applyTableLabels();
+})();
+</script>
+
+<script>
+(function(){
+  function applyMobileTableLabels(){
+    document.querySelectorAll('table').forEach(function(table){
+      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
+      table.querySelectorAll('tbody tr').forEach(function(row){
+        Array.from(row.children).forEach(function(cell, i){
+          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
+            cell.setAttribute('data-label', heads[i]);
+          }
+        });
+      });
+    });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
+  else applyMobileTableLabels();
+})();
+</script>
+
 </body>
 </html>
 """
