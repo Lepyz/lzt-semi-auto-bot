@@ -2682,6 +2682,7 @@ def admin_add_service(
 ):
     try:
         set_dynamic_service(advert_id, panel, service_id, quantity, platform, True)
+        prime_service_price_cache(panel, service_id, f"Itemsatış ilanı {advert_id}")
         log("success", "admin_service_saved", advert_id=advert_id, panel=panel, service_id=service_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -3278,6 +3279,7 @@ def admin_package_add(
         panel_service_name = fetch_panel_service_name_by_id(first_panel, first_service_id)
         if panel_service_name:
             cache_panel_service_name(first_panel, first_service_id, panel_service_name)
+        prime_service_price_cache(first_panel, first_service_id, f"Paket: {name} / {first_component_name}")
         log("success", "admin_package_saved", advert_id=advert_id, name=name, first_component=comp.get("name"))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -3313,6 +3315,8 @@ def admin_package_add_component(
         panel_service_name = fetch_panel_service_name_by_id(panel, service_id)
         if panel_service_name:
             cache_panel_service_name(panel, service_id, panel_service_name)
+        package_name = str((PACKAGE_CONFIGS.get(str(advert_id), {}) or {}).get("name") or f"Paket {advert_id}")
+        prime_service_price_cache(panel, service_id, f"Paket: {package_name} / {name}")
         log("success", "admin_package_component_added", advert_id=advert_id, panel=panel, service_id=service_id, component=comp.get("name"))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -5739,21 +5743,31 @@ def monthly_report():
 
 
 def get_price_check_targets(include_inactive: bool = False):
-    """Normal servisler + paket bileşenleri için fiyat/servis varlık kontrol hedefleri."""
-    targets = []
-    seen = set()
+    """Normal servisler + paket bileşenleri için fiyat/servis varlık kontrol hedefleri.
+    Aynı panel:service_id birden fazla yerde kullanılıyorsa tek kez kontrol eder,
+    fakat tüm kullanım yerlerini context içinde birleştirir.
+    """
+    targets_by_key = {}
+
+    def add_target(service: dict, context: str, advert_id: str = ""):
+        if not service or not service.get("service_id"):
+            return
+        key = f'{service.get("panel_key")}:{service.get("service_id")}'
+        if key not in targets_by_key:
+            item = dict(service)
+            item["contexts"] = []
+            item["advert_ids"] = []
+            targets_by_key[key] = item
+        if context and context not in targets_by_key[key]["contexts"]:
+            targets_by_key[key]["contexts"].append(context)
+        if advert_id and str(advert_id) not in targets_by_key[key]["advert_ids"]:
+            targets_by_key[key]["advert_ids"].append(str(advert_id))
+        targets_by_key[key]["context"] = " | ".join(targets_by_key[key]["contexts"])
+        targets_by_key[key]["advert_id"] = ",".join(targets_by_key[key]["advert_ids"])
 
     for advert_id, raw_service in get_all_services(include_inactive=include_inactive).items():
         service = get_service_config(raw_service)
-        if not service.get("service_id"):
-            continue
-        key = f'{service.get("panel_key")}:{service.get("service_id")}'
-        if key in seen:
-            continue
-        seen.add(key)
-        service["context"] = f"Itemsatış ilanı {advert_id}"
-        service["advert_id"] = str(advert_id)
-        targets.append(service)
+        add_target(service, f"Itemsatış ilanı {advert_id}", str(advert_id))
 
     for advert_id, package in get_package_configs(include_inactive=include_inactive).items():
         package_name = str(package.get("name") or f"Paket {advert_id}")
@@ -5767,17 +5781,93 @@ def get_price_check_targets(include_inactive: bool = False):
                 "quantity": comp.get("quantity"),
                 "platform": comp.get("platform"),
             })
-            if not service.get("service_id"):
-                continue
-            key = f'{service.get("panel_key")}:{service.get("service_id")}'
-            if key in seen:
-                continue
-            seen.add(key)
-            service["context"] = f"Paket: {package_name} / {comp.get('name')}"
-            service["advert_id"] = str(advert_id)
-            targets.append(service)
+            add_target(service, f"Paket: {package_name} / {comp.get('name')}", str(advert_id))
 
-    return targets
+    return list(targets_by_key.values())
+
+
+def normalize_panel_rate(value) -> str:
+    """Panel rate alanını karşılaştırma için normalize eder.
+    12,82 / 12.82 / '12.8200' gibi değerleri aynı kabul eder.
+    """
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = text.replace("₺", "").replace("TL", "").replace("TRY", "").replace("$", "").replace("USD", "")
+        text = text.replace(" ", "")
+        if "," in text and "." in text:
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", ".")
+        text = re.sub(r"[^0-9.\-]", "", text)
+        if not text:
+            return ""
+        return f"{float(text):.6f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value or "").strip()
+
+
+def prime_service_price_cache(panel_key: str, service_id: str, context: str = "") -> dict:
+    """Yeni eklenen normal/paket servis için fiyat takip başlangıç değerini cache'e alır.
+    Eğer aynı servis daha önce izleniyorsa ve rate farklıysa anında uyarı gönderir.
+    """
+    global SERVICE_PRICE_CACHE
+    panel_key = normalize_panel_key(panel_key)
+    service_id = str(service_id or "").strip()
+    if not panel_key or not service_id:
+        return {"ok": False, "error": "panel_key_or_service_id_missing"}
+    panel = get_panel_config(panel_key)
+    if not panel.get("api_url") or not panel.get("api_key"):
+        return {"ok": False, "error": "panel_config_missing"}
+
+    services_data = get_panel_services(panel["api_url"], panel["api_key"], panel.get("name", panel_key))
+    if isinstance(services_data, dict) and "error" in services_data:
+        return {"ok": False, "error": services_data.get("error")}
+    if not isinstance(services_data, list):
+        return {"ok": False, "error": "services_response_not_list"}
+
+    target_service = None
+    for item in services_data:
+        if isinstance(item, dict) and str(item.get("service")) == service_id:
+            target_service = item
+            break
+    if not target_service:
+        missing_key = f"missing:{panel_key}:{service_id}"
+        if not SERVICE_PRICE_CACHE.get(missing_key):
+            send_telegram(
+                f"Servis panelde bulunamadı.\n\n"
+                f"Panel: {panel.get('name', panel_key)}\n"
+                f"Servis ID: {service_id}\n"
+                f"Kullanım: {context or 'Yeni eklenen servis'}\n\n"
+                f"Bu servis ID panelde silinmiş/pasif olabilir."
+            )
+            SERVICE_PRICE_CACHE[missing_key] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+            save_state()
+        return {"ok": False, "error": "service_not_found"}
+
+    service_name = get_panel_service_display_name({"panel_key": panel_key, "panel": panel.get("name"), "service_id": service_id}, target_service)
+    current_rate_raw = str(target_service.get("rate", ""))
+    current_rate = normalize_panel_rate(current_rate_raw)
+    cache_key = f"{panel_key}:{service_id}"
+    old_rate = SERVICE_PRICE_CACHE.get(cache_key)
+    old_norm = normalize_panel_rate(old_rate)
+
+    if old_rate is not None and old_norm and current_rate and old_norm != current_rate:
+        send_telegram(
+            f"Servis fiyatı değişti.\n\n"
+            f"Panel Servisi: {service_name}\n"
+            f"Panel: {panel.get('name', panel_key)}\n"
+            f"Servis ID: {service_id}\n"
+            f"Kullanım: {context or 'Yeni eklenen servis'}\n"
+            f"Eski: {old_rate} → Yeni: {current_rate_raw}\n\n"
+            f"Bu servis ID'sini kullanan ilanı veya paketi kontrol et."
+        )
+
+    SERVICE_PRICE_CACHE[cache_key] = current_rate_raw
+    SERVICE_PRICE_CACHE.pop(f"missing:{cache_key}", None)
+    save_state()
+    return {"ok": True, "rate": current_rate_raw, "service_name": service_name}
 
 
 @app.head("/check-services")
@@ -5811,7 +5901,8 @@ def check_services():
 
         if not target_service:
             # Servis panelden silindiyse ya da ID artık listede yoksa bir kez uyar.
-            if SERVICE_PRICE_CACHE.get(cache_key) is not None and not SERVICE_PRICE_CACHE.get(missing_key):
+            # Yeni eklenen paket bileşenlerinde cache daha önce yoksa bile uyarı verir.
+            if not SERVICE_PRICE_CACHE.get(missing_key):
                 panel_service_name = get_panel_service_display_name(service)
                 log("warning", "service_missing_from_panel", panel=service["panel"], service_id=service["service_id"], context=service.get("context"))
                 send_telegram(
@@ -5830,13 +5921,15 @@ def check_services():
         panel_service_name = get_panel_service_display_name(service, target_service)
         current_rate = str(target_service.get("rate", ""))
         old_rate = SERVICE_PRICE_CACHE.get(cache_key)
+        current_rate_norm = normalize_panel_rate(current_rate)
+        old_rate_norm = normalize_panel_rate(old_rate)
 
         if old_rate is None:
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             save_state()
             continue
 
-        if str(old_rate) != str(current_rate):
+        if old_rate_norm != current_rate_norm:
             log("warning", "service_price_changed", panel=service["panel"], service_id=service["service_id"],
                 service_name=panel_service_name, old=old_rate, new=current_rate, context=service.get("context"))
             send_telegram(
