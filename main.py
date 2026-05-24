@@ -193,6 +193,9 @@ PANEL_SERVICE_NAME_CACHE = {}
 SALES_HISTORY = {}
 ORDER_HISTORY = []
 BLACKLIST = set()
+FAVORITE_SERVICES = {}
+BALANCE_HISTORY = {}
+LINK_AUDIT_HISTORY = []
 
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
 LOG_HISTORY = []
@@ -490,7 +493,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -513,6 +516,9 @@ def load_state():
     SALES_HISTORY = redis_get_json("sales_history", {})
     ORDER_HISTORY = redis_get_json("order_history", [])
     BLACKLIST = set(redis_get_json("blacklist", []))
+    FAVORITE_SERVICES = redis_get_json("favorite_services", {})
+    BALANCE_HISTORY = redis_get_json("balance_history", {})
+    LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
@@ -544,6 +550,9 @@ def save_state():
             "sales_history": SALES_HISTORY,
             "order_history": ORDER_HISTORY[-500:],
             "blacklist": list(BLACKLIST),
+            "favorite_services": FAVORITE_SERVICES,
+            "balance_history": BALANCE_HISTORY,
+            "link_audit_history": LINK_AUDIT_HISTORY[-300:],
         }
 
         result = redis_mset_json(data_to_save)
@@ -2011,6 +2020,145 @@ def format_panel_balance_tl(balance_data: dict) -> str:
         return "Bilinmiyor"
     return format_tl_amount(balance_tl)
 
+
+def guess_panel_rate_currency(panel_key: str, rate_value="") -> str:
+    """Panel servis fiyatlarının para birimini tahmin eder. Mesajlarda her şeyi TL gösterir."""
+    text = str(rate_value or "").upper()
+    key = normalize_panel_key(panel_key)
+    if "TL" in text or "TRY" in text or "₺" in text:
+        return "TRY"
+    if "USD" in text or "$" in text or "USDT" in text:
+        return "USD"
+    # MedyaBayim TL çalışıyor; diğer global paneller çoğunlukla USD döndürüyor.
+    if key == "medyabayim":
+        return "TRY"
+    return "USD"
+
+
+def format_panel_rate_tl(panel_key: str, rate_value) -> str:
+    """Panel service rate değerini TL olarak formatlar. USD panelleri güncel kura göre çevirir."""
+    numeric = parse_numeric_balance(rate_value)
+    if numeric is None:
+        return "Bilinmiyor"
+    currency = guess_panel_rate_currency(panel_key, rate_value)
+    if currency == "USD":
+        numeric = numeric * get_usd_to_try_rate()
+    return format_tl_amount(numeric)
+
+
+def record_balance_history(panel_key: str, balance_data: dict):
+    """Panel bakiyesini günlük geçmişe yazar."""
+    global BALANCE_HISTORY
+    try:
+        panel_key = normalize_panel_key(panel_key)
+        balance_tl = convert_balance_to_try((balance_data or {}).get("balance"), (balance_data or {}).get("currency", ""))
+        if balance_tl is None:
+            return
+        today = now_tr().strftime("%Y-%m-%d")
+        BALANCE_HISTORY.setdefault(today, {})[panel_key] = {
+            "balance_tl": round(float(balance_tl), 2),
+            "panel_name": get_panel_config(panel_key).get("name", panel_key),
+            "updated_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        # Son 60 günü tut.
+        keep_from = (now_tr() - timedelta(days=60)).strftime("%Y-%m-%d")
+        BALANCE_HISTORY = {k: v for k, v in BALANCE_HISTORY.items() if str(k) >= keep_from}
+    except Exception as e:
+        log("warning", "balance_history_record_failed", error=str(e))
+
+
+def record_link_audit(order_id: str, advert_id: str, product_name: str, platform: str, link: str, status: str, note: str = ""):
+    """Webhook link yakalama geçmişi. Yanlış link olaylarını admin panelden izlemek için."""
+    global LINK_AUDIT_HISTORY
+    try:
+        LINK_AUDIT_HISTORY.append({
+            "ts": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+            "order_id": str(order_id),
+            "advert_id": str(advert_id),
+            "product_name": str(product_name),
+            "platform": str(platform),
+            "link": str(link or ""),
+            "status": str(status),
+            "note": str(note or ""),
+        })
+        if len(LINK_AUDIT_HISTORY) > 300:
+            del LINK_AUDIT_HISTORY[:-300]
+    except Exception as e:
+        log("warning", "link_audit_failed", error=str(e))
+
+
+def search_panel_services(panel_key: str, query: str = "", limit: int = 50):
+    """Panel services listesinden servis arar; API key döndürmez."""
+    panel_key = normalize_panel_key(panel_key)
+    panel = get_panel_config(panel_key)
+    if not panel.get("api_url") or not panel.get("api_key"):
+        return {"ok": False, "error": "Panel API bilgileri eksik", "items": []}
+    data = get_panel_services(panel["api_url"], panel["api_key"], panel.get("name", panel_key))
+    if isinstance(data, dict) and "error" in data:
+        return {"ok": False, "error": data.get("error"), "items": []}
+    if not isinstance(data, list):
+        return {"ok": False, "error": "Panel services cevabı liste değil", "items": []}
+    q = normalize_text(query)
+    items = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("service") or "")
+        name = extract_panel_service_name(item) or f"Panel Servisi {sid}"
+        category = str(item.get("category") or "")
+        rate = str(item.get("rate") or "")
+        haystack = normalize_text(" ".join([sid, name, category, rate]))
+        if q and q not in haystack:
+            continue
+        if sid and name:
+            cache_panel_service_name(panel_key, sid, name)
+        items.append({
+            "panel_key": panel_key,
+            "panel_name": panel.get("name", panel_key),
+            "service_id": sid,
+            "name": name,
+            "category": category,
+            "rate_tl": format_panel_rate_tl(panel_key, rate),
+            "rate_raw": rate,
+            "min": item.get("min", ""),
+            "max": item.get("max", ""),
+        })
+        if len(items) >= int(limit or 50):
+            break
+    return {"ok": True, "items": items, "panel_name": panel.get("name", panel_key)}
+
+
+def add_favorite_service(panel_key: str, service_id: str, name: str = "", platform: str = "other", quantity: int = 1000):
+    global FAVORITE_SERVICES
+    panel_key = normalize_panel_key(panel_key)
+    service_id = str(service_id or "").strip()
+    if not panel_key or not service_id:
+        raise ValueError("Panel ve servis ID gerekli")
+    if not str(quantity).isdigit() or int(quantity) <= 0:
+        quantity = 1000
+    key = f"{panel_key}:{service_id}"
+    service_name = str(name or get_cached_panel_service_name(panel_key, service_id) or fetch_panel_service_name_by_id(panel_key, service_id) or f"{get_panel_config(panel_key).get('name', panel_key)} Servis {service_id}").strip()
+    FAVORITE_SERVICES[key] = {
+        "panel": panel_key,
+        "service_id": service_id,
+        "name": service_name,
+        "platform": normalize_text(platform or "other") or "other",
+        "quantity": int(quantity),
+        "created_at": int(time.time()),
+    }
+    save_state()
+    return FAVORITE_SERVICES[key]
+
+
+def delete_favorite_service(favorite_key: str) -> bool:
+    global FAVORITE_SERVICES
+    favorite_key = str(favorite_key or "").strip()
+    if favorite_key in FAVORITE_SERVICES:
+        FAVORITE_SERVICES.pop(favorite_key, None)
+        save_state()
+        return True
+    return False
+
 def build_all_panel_balances_text() -> str:
     lines = ["Panel Bakiyeleri:\n"]
     used_usd_rate = False
@@ -2023,6 +2171,7 @@ def build_all_panel_balances_text() -> str:
         if "error" in balance_data:
             lines.append(f"{panel['name']}: Hatalı - {balance_data.get('error')}")
         else:
+            record_balance_history(key, balance_data)
             if get_balance_currency_label(balance_data.get("currency", "")):
                 used_usd_rate = True
             lines.append(f"{panel['name']}: {format_panel_balance_tl(balance_data)}")
@@ -2057,6 +2206,8 @@ def handle_panel_balance_command(text: str):
         send_telegram(f"{panel['name']} bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
         return
 
+    record_balance_history(panel["key"], balance_data)
+    save_state()
     currency_note = get_balance_currency_label(balance_data.get("currency", ""))
     extra = f"\n{currency_note}" if currency_note else ""
     send_telegram(
@@ -2600,6 +2751,9 @@ html, body { max-width: 100%; overflow-x: hidden; }
   <a href="/admin/failed-orders"><button type="button">Başarısız Siparişler</button></a>
   <a href="/admin/manual-order"><button type="button">Manuel SMM Sipariş</button></a>
   <a href="/admin/packages"><button type="button">Paketler</button></a>
+  <a href="/admin/service-search"><button type="button">Servis Ara</button></a>
+  <a href="/admin/favorites"><button type="button">Favoriler</button></a>
+  <a href="/admin/package-test"><button type="button">Paket Test</button></a>
   <form method="post" action="/admin/update-service-names" style="display:inline;">
     <button class="green" type="submit">Servis İsimlerini Güncelle</button>
   </form>
@@ -3720,6 +3874,16 @@ html, body { max-width: 100%; overflow-x: hidden; }
 {% if message %}<div class="ok">{{ message|e }}</div>{% endif %}
 {% if error %}<div class="err">{{ error|e }}</div>{% endif %}
 <div class="notice">Servis adını boş bırakırsan bot seçtiğin paneldeki servis ID'den gerçek servis adını çekmeye çalışır.</div>
+{% if favorites %}
+<div class="notice">Favori servis seçerek panel/servis/adet/platform alanlarını hızlıca doldurabilirsin.</div>
+<select id="favoriteSelect" onchange="fillFavorite()">
+  <option value="">Favori servis seç</option>
+  {% for key, fav in favorites.items() %}
+    <option value="{{ key|e }}" data-panel="{{ fav.panel|e }}" data-service="{{ fav.service_id|e }}" data-quantity="{{ fav.quantity|e }}" data-platform="{{ fav.platform|e }}" data-name="{{ fav.name|e }}">{{ fav.name|e }} | {{ fav.panel|e }} #{{ fav.service_id|e }}</option>
+  {% endfor %}
+</select>
+<script>function fillFavorite(){const s=document.getElementById('favoriteSelect');const o=s.options[s.selectedIndex];if(!o||!o.dataset.panel)return;document.querySelector('[name=panel]').value=o.dataset.panel;document.querySelector('[name=service_id]').value=o.dataset.service;document.querySelector('[name=quantity]').value=o.dataset.quantity;document.querySelector('[name=platform]').value=o.dataset.platform;document.querySelector('[name=product_name]').value=o.dataset.name;}</script>
+{% endif %}
 <form class="grid" method="post" action="/admin/manual-order">
   <label>Panel
     <select name="panel" required>
@@ -3803,7 +3967,7 @@ def admin_manual_order_page(
     user: str = Depends(get_current_admin),
 ):
     template = Template(ADMIN_MANUAL_ORDER_HTML)
-    return HTMLResponse(content=template.render(panels=PANEL_MAP, message=message, error=error))
+    return HTMLResponse(content=template.render(panels=PANEL_MAP, message=message, error=error, favorites=FAVORITE_SERVICES))
 
 
 @app.post("/admin/manual-order")
@@ -5521,6 +5685,21 @@ def api_blacklist(user: str = Depends(get_current_admin)):
     return {"items": sorted(BLACKLIST)}
 
 
+@app.get("/api/balance-history")
+def api_balance_history(user: str = Depends(get_current_admin)):
+    return {"history": BALANCE_HISTORY}
+
+
+@app.get("/api/link-audit")
+def api_link_audit(user: str = Depends(get_current_admin)):
+    return {"items": LINK_AUDIT_HISTORY[-300:]}
+
+
+@app.get("/api/favorites")
+def api_favorites(user: str = Depends(get_current_admin)):
+    return {"items": FAVORITE_SERVICES}
+
+
 @app.get("/api/profit")
 def api_profit(sale: float = 0, cost: float = 0, user: str = Depends(get_current_admin)):
     return calculate_profit(sale, cost)
@@ -5558,10 +5737,150 @@ def check_panel_health():
             log("error", "panel_health_error", panel=key, error=balance_data.get("error"))
             results[key] = {"ok": False, "error": balance_data.get("error")}
         else:
+            record_balance_history(key, balance_data)
             check_low_balance(balance_data.get("balance", 0), balance_data.get("currency", ""), panel.get("name", key))
             results[key] = {"ok": True, "balance": format_panel_balance_tl(balance_data)}
     return {"ok": True, "panels": results}
 
+
+
+ADMIN_TOOL_CSS = """
+<style>
+:root{--bg:#070814;--card:#111827;--muted:#94a3b8;--text:#f1f5f9;--border:rgba(148,163,184,.18);--primary:#8b5cf6;--green:#16a34a;--red:#ef4444}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 0 0,rgba(139,92,246,.16),transparent 30%),#070814;color:var(--text);font-family:Inter,system-ui,Arial,sans-serif}.wrap{width:min(1280px,calc(100% - 28px));margin:18px auto 40px}.card{background:rgba(17,24,39,.92);border:1px solid var(--border);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 14px 40px rgba(0,0,0,.28)}h1{margin:0 0 8px;font-size:clamp(26px,4vw,38px)}h2{font-size:20px;margin:20px 0 10px}.muted{color:var(--muted);font-size:13px}a{color:#c4b5fd;text-decoration:none}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}input,select,button{width:100%;min-height:48px;border-radius:13px;border:1px solid var(--border);background:#182033;color:var(--text);padding:11px 12px;font:inherit}button,.btn{background:linear-gradient(135deg,var(--primary),#6d28d9);border:0;font-weight:800;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}.btn.green,button.green{background:linear-gradient(135deg,#22c55e,#15803d)}.btn.red,button.red{background:linear-gradient(135deg,#ef4444,#dc2626)}.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}.toolbar a{background:#182033;border:1px solid var(--border);border-radius:12px;padding:10px 12px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:11px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top;overflow-wrap:anywhere}.table th{color:#cbd5e1;font-size:12px;text-transform:uppercase}.pill{display:inline-flex;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:12px;font-weight:800;padding:5px 9px}@media(max-width:720px){.wrap{width:100%;margin:0;padding:12px}.toolbar{display:grid}.card{border-radius:14px;padding:13px}.table,.table thead,.table tbody,.table tr,.table th,.table td{display:block;width:100%}.table thead{display:none}.table tr{background:#0f172a;border:1px solid var(--border);border-radius:14px;margin:10px 0;padding:8px}.table td{border:0;padding:7px 4px}.table td::before{content:attr(data-label);display:block;color:var(--muted);font-size:11px;text-transform:uppercase;font-weight:800;margin-bottom:2px}}
+</style>
+"""
+
+
+def simple_admin_page(title: str, body: str) -> HTMLResponse:
+    nav = """
+    <div class="toolbar">
+      <a href="/admin">Admin</a><a href="/">Dashboard</a><a href="/admin/service-search">Servis Ara</a>
+      <a href="/admin/favorites">Favoriler</a><a href="/admin/package-test">Paket Test</a>
+      <a href="/admin/balance-history">Bakiye Geçmişi</a><a href="/admin/link-audit">Link Geçmişi</a>
+      <a href="/admin/failed-actions">Hata Merkezi</a><a href="/admin/profit-calculator">Kâr Hesapla</a>
+    </div>
+    """
+    html = f"<!doctype html><html lang='tr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title>{ADMIN_TOOL_CSS}</head><body><main class='wrap'><h1>{title}</h1>{nav}{body}</main></body></html>"
+    return HTMLResponse(html)
+
+
+@app.get("/admin/service-search", response_class=HTMLResponse)
+def admin_service_search(panel: str = "medyabayim", q: str = "", user: str = Depends(get_current_admin)):
+    result = {"items": []}
+    if q:
+        result = search_panel_services(panel, q, 80)
+    rows = "".join([
+        f"<tr><td data-label='Panel'>{item['panel_name']}</td><td data-label='ID'>{item['service_id']}</td><td data-label='Servis'>{item['name']}</td><td data-label='Kategori'>{item['category']}</td><td data-label='Fiyat TL'>{item['rate_tl']}</td><td data-label='Min/Max'>{item.get('min','')} / {item.get('max','')}</td><td data-label='İşlem'><form method='post' action='/admin/favorites/add'><input type='hidden' name='panel' value='{item['panel_key']}'><input type='hidden' name='service_id' value='{item['service_id']}'><input type='hidden' name='name' value=\"{str(item['name']).replace(chr(34),'&quot;')}\"><input type='number' name='quantity' placeholder='Adet' value='1000'><select name='platform'><option>tiktok</option><option>instagram</option><option>youtube</option><option>x</option><option>twitch</option><option>kick</option><option>other</option></select><button class='green'>Favoriye Ekle</button></form></td></tr>"
+        for item in result.get("items", [])
+    ])
+    error = "" if result.get("ok", True) else f"<div class='card'>Hata: {result.get('error')}</div>"
+    body = f"""
+    <div class='card'><div class='muted'>Panel servislerini isim, ID veya kategoriyle ara. Sonuçlarda fiyatlar TL olarak gösterilir.</div>
+    <form class='grid' method='get'><select name='panel'>{''.join([f'<option value="{k}" {"selected" if k==normalize_panel_key(panel) else ""}>{v.get("name",k)} ({k})</option>' for k,v in PANEL_MAP.items()])}</select><input name='q' value='{q}' placeholder='Örn: tiktok views, takipçi, 123'><button>Ara</button></form></div>
+    {error}
+    <div class='card'><table class='table'><thead><tr><th>Panel</th><th>ID</th><th>Servis</th><th>Kategori</th><th>Fiyat TL</th><th>Min/Max</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Arama yap veya sonuç yok.</td></tr>'}</tbody></table></div>
+    """
+    return simple_admin_page("Panel Servis Arama", body)
+
+
+@app.get("/admin/favorites", response_class=HTMLResponse)
+def admin_favorites(user: str = Depends(get_current_admin)):
+    rows = "".join([
+        f"<tr><td data-label='Ad'>{v.get('name')}</td><td data-label='Panel'>{get_panel_config(v.get('panel')).get('name')}</td><td data-label='Servis ID'>{v.get('service_id')}</td><td data-label='Adet'>{v.get('quantity')}</td><td data-label='Platform'>{v.get('platform')}</td><td data-label='İşlem'><form method='post' action='/admin/favorites/delete'><input type='hidden' name='favorite_key' value='{k}'><button class='red'>Sil</button></form></td></tr>"
+        for k,v in sorted(FAVORITE_SERVICES.items())
+    ])
+    body = f"""
+    <div class='card'><div class='muted'>Sık kullandığın panel servislerini burada tut. Manuel sipariş ekranında bu bilgilerle hızlı işlem yapabilirsin.</div>
+    <form class='grid' method='post' action='/admin/favorites/add'><select name='panel'>{''.join([f'<option value="{k}">{v.get("name",k)} ({k})</option>' for k,v in PANEL_MAP.items()])}</select><input name='service_id' placeholder='Servis ID' required><input name='name' placeholder='Favori adı'><input type='number' name='quantity' value='1000'><select name='platform'><option>tiktok</option><option>instagram</option><option>youtube</option><option>x</option><option>twitch</option><option>kick</option><option>other</option></select><button class='green'>Favori Ekle</button></form></div>
+    <div class='card'><table class='table'><thead><tr><th>Ad</th><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Platform</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Favori yok.</td></tr>'}</tbody></table></div>
+    """
+    return simple_admin_page("Servis Favorileri", body)
+
+
+@app.post("/admin/favorites/add")
+def admin_favorites_add(panel: str = Form(...), service_id: str = Form(...), name: str = Form(""), quantity: int = Form(1000), platform: str = Form("other"), user: str = Depends(get_current_admin)):
+    add_favorite_service(panel, service_id, name, platform, quantity)
+    return RedirectResponse("/admin/favorites", status_code=303)
+
+
+@app.post("/admin/favorites/delete")
+def admin_favorites_delete(favorite_key: str = Form(...), user: str = Depends(get_current_admin)):
+    delete_favorite_service(favorite_key)
+    return RedirectResponse("/admin/favorites", status_code=303)
+
+
+@app.get("/admin/package-test", response_class=HTMLResponse)
+def admin_package_test(advert_id: str = "", link: str = "", user: str = Depends(get_current_admin)):
+    packages = get_package_configs(include_inactive=True)
+    options = "".join([f"<option value='{aid}' {'selected' if aid==advert_id else ''}>{pkg.get('name') or aid} - {aid}</option>" for aid,pkg in packages.items()])
+    result_html = ""
+    if advert_id and advert_id in packages:
+        pkg = packages[advert_id]
+        detected_link, detected_platform = find_package_order_link({"post_datas": {"Link": link}, "raw": link}, pkg)
+        rows = []
+        for comp in pkg.get("components", []) or []:
+            comp = normalize_package_component(comp)
+            service = get_service_config(comp)
+            comp_link = normalize_panel_link(detected_link, service.get("platform", detected_platform)) if detected_link else ""
+            status = "Hazır" if detected_link and service.get("api_url") and service.get("api_key") else "Eksik"
+            rows.append(f"<tr><td data-label='Bileşen'>{comp.get('name')}</td><td data-label='Panel'>{service.get('panel')}</td><td data-label='Servis ID'>{service.get('service_id')}</td><td data-label='Adet'>{service.get('quantity')}</td><td data-label='Link'>{comp_link or 'Link yok/geçersiz'}</td><td data-label='Durum'><span class='pill'>{status}</span></td></tr>")
+        result_html = f"<div class='card'><h2>Test Sonucu</h2><div class='muted'>Paket panele gönderilmedi. Sadece simülasyon yapıldı.</div><p>Yakalanan link: <b>{detected_link or 'Bulunamadı'}</b> · Platform: {detected_platform or '-'}</p><table class='table'><thead><tr><th>Bileşen</th><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Link</th><th>Durum</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    body = f"""
+    <div class='card'><div class='muted'>Gerçek sipariş açmadan paket bileşenlerini ve link yakalamayı test eder.</div><form class='grid' method='get'><select name='advert_id'>{options}</select><input name='link' value='{link}' placeholder='Test linki'><button>Paketi Test Et</button></form></div>{result_html}
+    """
+    return simple_admin_page("Paket Test", body)
+
+
+@app.get("/admin/profit-calculator", response_class=HTMLResponse)
+def admin_profit_calculator(sale: float = 0, cost: float = 0, user: str = Depends(get_current_admin)):
+    result = calculate_profit(sale, cost)
+    body = f"""
+    <div class='card'><form class='grid' method='get'><input type='number' step='0.01' name='sale' value='{sale}' placeholder='Satış TL'><input type='number' step='0.01' name='cost' value='{cost}' placeholder='Panel maliyeti TL'><button>Hesapla</button></form></div>
+    <div class='card'><h2>Sonuç</h2><p>Brüt satış: <b>{format_tl_amount(result['sale_price'])}</b></p><p>Itemsatış komisyonu: <b>{format_tl_amount(result['commission'])}</b></p><p>Panel maliyeti: <b>{format_tl_amount(result['panel_cost'])}</b></p><p>Net kâr: <b>{format_tl_amount(result['profit'])}</b> · Marj: <b>%{result['margin_pct']}</b></p></div>
+    """
+    return simple_admin_page("Kâr Hesaplayıcı", body)
+
+
+@app.get("/admin/balance-history", response_class=HTMLResponse)
+def admin_balance_history(user: str = Depends(get_current_admin)):
+    rows = []
+    for day, panels in sorted(BALANCE_HISTORY.items(), reverse=True):
+        for key, item in sorted((panels or {}).items()):
+            rows.append(f"<tr><td data-label='Tarih'>{day}</td><td data-label='Panel'>{item.get('panel_name', key)}</td><td data-label='Bakiye'>{format_tl_amount(item.get('balance_tl',0))}</td><td data-label='Güncelleme'>{item.get('updated_at','')}</td></tr>")
+    body = f"<div class='card'><div class='muted'>/balance, /balance-all veya panel health çalıştıkça bakiye geçmişi dolar.</div><table class='table'><thead><tr><th>Tarih</th><th>Panel</th><th>Bakiye</th><th>Güncelleme</th></tr></thead><tbody>{''.join(rows[:200]) or '<tr><td>Kayıt yok.</td></tr>'}</tbody></table></div>"
+    return simple_admin_page("Panel Bakiye Geçmişi", body)
+
+
+@app.get("/admin/link-audit", response_class=HTMLResponse)
+def admin_link_audit(user: str = Depends(get_current_admin)):
+    rows = "".join([f"<tr><td data-label='Saat'>{x.get('ts')}</td><td data-label='Sipariş'>{x.get('order_id')}</td><td data-label='Ürün'>{x.get('product_name')}</td><td data-label='Platform'>{x.get('platform')}</td><td data-label='Link'>{x.get('link')}</td><td data-label='Durum'>{x.get('status')}</td><td data-label='Not'>{x.get('note')}</td></tr>" for x in reversed(LINK_AUDIT_HISTORY[-200:])])
+    body = f"<div class='card'><div class='muted'>Botun siparişte hangi linki yakaladığını gösterir. Yanlış CDN/görsel link olaylarını burada takip edebilirsin.</div><table class='table'><thead><tr><th>Saat</th><th>Sipariş</th><th>Ürün</th><th>Platform</th><th>Link</th><th>Durum</th><th>Not</th></tr></thead><tbody>{rows or '<tr><td>Kayıt yok.</td></tr>'}</tbody></table></div>"
+    return simple_admin_page("Link Yakalama Geçmişi", body)
+
+
+@app.get("/admin/failed-actions", response_class=HTMLResponse)
+def admin_failed_actions(user: str = Depends(get_current_admin)):
+    rows = "".join([f"<tr><td data-label='Ürün'>{o.get('product_name')}</td><td data-label='Sipariş'>{o.get('order_id')}</td><td data-label='SMM'>{o.get('smm_order_id','-')}</td><td data-label='Panel'>{o.get('panel','-')}</td><td data-label='Sebep'>{o.get('reason')}</td><td data-label='Link'>{o.get('link','')}</td><td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'><input type='hidden' name='smm_order_id' value='{o.get('smm_order_id','')}'><button class='green'>Tamamlandı İşaretle</button></form><form method='post' action='/admin/failed/blacklist-link'><input type='hidden' name='link' value=\"{str(o.get('link','')).replace(chr(34),'&quot;')}\"><button class='red'>Linki Blacklist</button></form></td></tr>" for o in reversed(FAILED_ORDERS[-50:])])
+    body = f"<div class='card'><div class='muted'>Başarısız siparişler için hızlı çözüm merkezi.</div><table class='table'><thead><tr><th>Ürün</th><th>Sipariş</th><th>SMM</th><th>Panel</th><th>Sebep</th><th>Link</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Başarısız sipariş yok.</td></tr>'}</tbody></table></div>"
+    return simple_admin_page("Hatalı Sipariş Çözüm Merkezi", body)
+
+
+@app.post("/admin/failed/blacklist-link")
+def admin_failed_blacklist_link(link: str = Form(...), user: str = Depends(get_current_admin)):
+    if link:
+        blacklist_add(link)
+    return RedirectResponse("/admin/failed-actions", status_code=303)
+
+
+@app.post("/admin/failed/mark-completed")
+def admin_failed_mark_completed(smm_order_id: str = Form(""), user: str = Depends(get_current_admin)):
+    for item in FAILED_ORDERS:
+        if str(item.get("smm_order_id", "")) == str(smm_order_id):
+            item["manual_completed"] = True
+            add_order_history(item.get("order_id", "Bilinmiyor"), item.get("advert_id", ""), item.get("product_name", "Bilinmeyen Ürün"), item.get("panel", ""), item.get("smm_order_id", ""), item.get("link", ""), item.get("price", 0))
+            save_state()
+            break
+    return RedirectResponse("/admin/failed-actions", status_code=303)
 
 @app.get("/test")
 def test_message():
@@ -5919,7 +6238,8 @@ def prime_service_price_cache(panel_key: str, service_id: str, context: str = ""
             f"Panel: {panel.get('name', panel_key)}\n"
             f"Servis ID: {service_id}\n"
             f"Kullanım: {context or 'Yeni eklenen servis'}\n"
-            f"Eski: {old_rate} → Yeni: {current_rate_raw}\n\n"
+            f"Eski: {format_panel_rate_tl(panel_key, old_rate)} → Yeni: {format_panel_rate_tl(panel_key, current_rate_raw)}\n"
+            f"Not: Fiyatlar TL olarak gösterilmiştir.\n\n"
             f"Bu servis ID'sini kullanan ilanı veya paketi kontrol et."
         )
 
@@ -5997,7 +6317,8 @@ def check_services():
                 f"Panel: {service['panel']}\n"
                 f"Servis ID: {service['service_id']}\n"
                 f"Kullanım: {service.get('context', 'Bilinmiyor')}\n"
-                f"Eski: {old_rate} → Yeni: {current_rate}\n\n"
+                f"Eski: {format_panel_rate_tl(service.get('panel_key', service.get('panel', '')), old_rate)} → Yeni: {format_panel_rate_tl(service.get('panel_key', service.get('panel', '')), current_rate)}\n"
+                f"Not: Fiyatlar TL olarak gösterilmiştir.\n\n"
                 f"Bu servis ID'sini kullanan Itemsatış ilanlarını veya paketleri kontrol et."
             )
             SERVICE_PRICE_CACHE[cache_key] = current_rate
@@ -6063,6 +6384,7 @@ async def itemsatis_webhook(request: Request):
         customer_link, detected_link_platform = find_package_order_link(data, package)
 
         if not customer_link:
+            record_link_audit(order_id, advert_id, package_name, package_platform, "", "blocked", "Paket linki bulunamadı")
             add_failed_order(order_id, advert_id, package_name, "Paket sipariş linki bulunamadı")
             notify_customer_order_failed(order_id, package_name)
             send_telegram(
@@ -6072,6 +6394,8 @@ async def itemsatis_webhook(request: Request):
             return {"ok": False, "error": "package_link_not_found"}
 
         log("info", "package_customer_link_detected", advert_id=advert_id, platform=detected_link_platform, link=customer_link)
+        record_link_audit(order_id, advert_id, package_name, detected_link_platform or package_platform, customer_link, "ok", "Paket linki yakalandı")
+
 
         if is_blacklisted(customer_link) or is_blacklisted(buyer):
             add_failed_order(order_id, advert_id, package_name, "Blacklist engeli", customer_link, link=customer_link)
@@ -6162,10 +6486,13 @@ async def itemsatis_webhook(request: Request):
         customer_link = find_order_link(data, platform)
 
         if not customer_link:
+            record_link_audit(order_id, advert_id, service_name, platform, "", "blocked", "Sipariş linki bulunamadı")
             add_failed_order(order_id, advert_id, service_name, "Sipariş linki bulunamadı")
             notify_customer_order_failed(order_id, service_name)
             send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
             return {"ok": False, "error": "order_link_not_found"}
+
+        record_link_audit(order_id, advert_id, service_name, platform, customer_link, "ok", "Servis linki yakalandı")
 
         if is_blacklisted(customer_link) or is_blacklisted(buyer):
             add_failed_order(order_id, advert_id, service_name, "Blacklist engeli", customer_link, link=customer_link, panel=service.get("panel", ""))
