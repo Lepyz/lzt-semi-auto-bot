@@ -232,6 +232,8 @@ ANTI_LOSS_MIN_PROFIT_TL = float(os.getenv("ANTI_LOSS_MIN_PROFIT_TL", "0"))
 BULK_RETRY_MAX = int(os.getenv("BULK_RETRY_MAX", "30"))
 BULK_RETRY_DELAY_SECONDS = float(os.getenv("BULK_RETRY_DELAY_SECONDS", "2"))
 BALANCE_WARN_REPEAT_MINUTES = int(os.getenv("BALANCE_WARN_REPEAT_MINUTES", "60"))
+BALANCE_WARN_THRESHOLD_TL = float(os.getenv("BALANCE_WARN_THRESHOLD_TL", "100"))
+CHECK_BALANCE_INTERVAL_SECONDS = int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300"))
 VIP_ORDER_THRESHOLD = int(os.getenv("VIP_ORDER_THRESHOLD", "5"))
 BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "true").lower() == "true"
 BLACKLIST_AUTO_FAIL_COUNT = int(os.getenv("BLACKLIST_AUTO_FAIL_COUNT", "2"))
@@ -2667,34 +2669,85 @@ def get_panel_services(api_url, api_key, panel_name=""):
     return _panel_api_request(api_url, api_key, "services", panel_name=panel_name)
 
 
-def check_low_balance(balance, currency, panel_name="Panel"):
+def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""):
+    """Panel bakiyesi eşik altındaysa Telegram uyarısı gönderir.
+
+    Düzeltmeler:
+    - BALANCE_WARN_THRESHOLD_TL env değeri tanımlı.
+    - Aynı düşük bakiye uyarısını BALANCE_WARN_REPEAT_MINUTES aralığıyla tekrarlar.
+    - Bakiye eşik üstüne çıkınca alarm hafızasını temizler.
+    """
     try:
         balance_tl = convert_balance_to_try(balance, currency)
         if balance_tl is None:
-            return
+            log("warning", "balance_parse_failed", panel=panel_name, balance=balance, currency=currency)
+            return False
 
-        if balance_tl <= BALANCE_WARN_THRESHOLD_TL:
-            panel_key = normalize_panel_key(panel_name)
-            now_ts = int(time.time())
-            last_warn = int(BALANCE_WARN_LAST.get(panel_key, 0) or 0)
-            repeat_seconds = BALANCE_WARN_REPEAT_MINUTES * 60
+        key = normalize_panel_key(panel_key or panel_name)
+        now_ts = int(time.time())
+        threshold = float(BALANCE_WARN_THRESHOLD_TL)
+        repeat_seconds = max(60, int(BALANCE_WARN_REPEAT_MINUTES) * 60)
 
-            if last_warn and (now_ts - last_warn) < repeat_seconds:
-                log("info", "low_balance_warning_suppressed", panel=panel_name, balance_tl=balance_tl)
-                return
+        if balance_tl > threshold:
+            if key in BALANCE_WARN_LAST:
+                BALANCE_WARN_LAST.pop(key, None)
+                save_state()
+                log("info", "low_balance_recovered", panel=panel_name, balance_tl=round(balance_tl, 2), threshold=threshold)
+            return False
 
-            BALANCE_WARN_LAST[panel_key] = now_ts
-            save_state()
-            log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency, balance_tl=balance_tl)
-            send_telegram_alert(
-                f"{panel_name} bakiyesi {format_tl_amount(BALANCE_WARN_THRESHOLD_TL)} altına düştü.\n\n"
-                f"Kalan: {format_tl_amount(balance_tl)}\n\nLütfen kontrol et."
+        last_warn = int(BALANCE_WARN_LAST.get(key, 0) or 0)
+        if last_warn and (now_ts - last_warn) < repeat_seconds:
+            log(
+                "info",
+                "low_balance_warning_suppressed",
+                panel=panel_name,
+                balance_tl=round(balance_tl, 2),
+                threshold=threshold,
+                next_warn_seconds=repeat_seconds - (now_ts - last_warn),
             )
+            return False
+
+        BALANCE_WARN_LAST[key] = now_ts
+        save_state()
+        log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency, balance_tl=round(balance_tl, 2), threshold=threshold)
+        send_telegram_alert(
+            f"{panel_name} bakiyesi {format_tl_amount(threshold)} altına düştü.\n\n"
+            f"Kalan: {format_tl_amount(balance_tl)}\n"
+            f"Tekrar uyarı aralığı: {BALANCE_WARN_REPEAT_MINUTES} dk\n\n"
+            f"Lütfen panel bakiyesini kontrol et."
+        )
+        return True
     except Exception as e:
-        log("error", "balance_check_error", error=str(e))
+        log("error", "balance_check_error", panel=panel_name, error=str(e))
+        return False
 
 
-
+def check_all_panel_balances():
+    """Tüm panelleri kontrol eder; düşük bakiye uyarısını periyodik çalıştırır."""
+    results = {}
+    changed = False
+    for key in PANEL_MAP.keys():
+        panel = get_panel_config(key)
+        if not panel.get("api_url") or not panel.get("api_key"):
+            results[key] = {"ok": False, "error": "Eksik env"}
+            continue
+        balance_data = panel_balance(panel["api_url"], panel["api_key"], panel.get("name", key))
+        if isinstance(balance_data, dict) and "error" in balance_data:
+            log("error", "panel_balance_check_error", panel=key, error=balance_data.get("error"))
+            results[key] = {"ok": False, "error": balance_data.get("error")}
+            continue
+        record_balance_history(key, balance_data)
+        alerted = check_low_balance(
+            balance_data.get("balance", 0),
+            balance_data.get("currency", ""),
+            panel.get("name", key),
+            panel_key=key,
+        )
+        changed = True
+        results[key] = {"ok": True, "balance": format_panel_balance_tl(balance_data), "alerted": alerted}
+    if changed:
+        save_state()
+    return {"ok": True, "panels": results}
 
 
 async def periodic_runner(name: str, interval_seconds: int, func, initial_delay: int = 30):
@@ -2721,6 +2774,7 @@ async def startup_event():
     task_specs = {
         "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
         "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
+        "background_check_balances": (int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300")), check_all_panel_balances, 120),
     }
 
     for name, (interval, func, delay) in task_specs.items():
@@ -6136,19 +6190,7 @@ def api_export(user: str = Depends(get_current_admin)):
 @app.get("/check-panel-health")
 @app.head("/check-panel-health")
 def check_panel_health():
-    results = {}
-    for key, panel in PANEL_MAP.items():
-        if not panel.get("api_url") or not panel.get("api_key"):
-            continue
-        balance_data = panel_balance(panel["api_url"], panel["api_key"], panel.get("name", key))
-        if "error" in balance_data:
-            log("error", "panel_health_error", panel=key, error=balance_data.get("error"))
-            results[key] = {"ok": False, "error": balance_data.get("error")}
-        else:
-            record_balance_history(key, balance_data)
-            check_low_balance(balance_data.get("balance", 0), balance_data.get("currency", ""), panel.get("name", key))
-            results[key] = {"ok": True, "balance": format_panel_balance_tl(balance_data)}
-    return {"ok": True, "panels": results}
+    return check_all_panel_balances()
 
 
 
