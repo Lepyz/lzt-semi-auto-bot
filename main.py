@@ -237,7 +237,6 @@ CHECK_BALANCE_INTERVAL_SECONDS = int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS",
 VIP_ORDER_THRESHOLD = int(os.getenv("VIP_ORDER_THRESHOLD", "5"))
 BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "true").lower() == "true"
 BLACKLIST_AUTO_FAIL_COUNT = int(os.getenv("BLACKLIST_AUTO_FAIL_COUNT", "2"))
-BULK_RETRY_RUNNING = False
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
 PANEL_STATS = {}
@@ -5759,12 +5758,10 @@ def retry_failed_order_item(target: dict) -> dict:
 
 def bulk_retry_failed_orders_worker():
     """Retryable failed siparişleri arka planda sırayla yeniden dener; lock ile çift çalışmayı engeller."""
-    global BULK_RETRY_RUNNING
     if not _BULK_RETRY_LOCK.acquire(blocking=False):
         log("warning", "bulk_retry_already_running")
         return
 
-    BULK_RETRY_RUNNING = True
     success_count = 0
     failed_count = 0
     skipped_count = 0
@@ -5790,7 +5787,6 @@ def bulk_retry_failed_orders_worker():
         errors.append(str(e))
         log("error", "bulk_retry_error", error=str(e))
     finally:
-        BULK_RETRY_RUNNING = False
         _BULK_RETRY_LOCK.release()
         send_telegram(
             "Bulk retry tamamlandı.\n\n"
@@ -7480,6 +7476,7 @@ def process_itemsatis_webhook_payload(data: dict):
                               product_name=report_product_name, price=price)
         if sale_recorded:
             record_buyer_stats(buyer, price)
+            # record_itemsatis_sale bu sürümde Redis'e yazmaz; buyer stats ile birlikte tek save yeterlidir.
             save_state()
 
         log("info", "sale_received", order_id=order_id, product=report_product_name, buyer=buyer, price=price)
