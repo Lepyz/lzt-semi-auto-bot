@@ -9,6 +9,7 @@ import ast
 import asyncio
 import secrets
 import threading
+import html
 import requests
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -83,6 +84,9 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # Itemsatış API - müşteri mesajı göndermek için
 ITEMSATIS_API_KEY = os.getenv("ITEMSATIS_API_KEY", "")
 ITEMSATIS_API_URL = "https://itemsatis.com/api"
+ITEMSATIS_PROFILE_URL = os.getenv("ITEMSATIS_PROFILE_URL", "").strip()
+ITEMSATIS_ADVERT_CACHE_KEY = os.getenv("ITEMSATIS_ADVERT_CACHE_KEY", "itemsatis_advert_cache")
+ITEMSATIS_ADVERT_CACHE_MAX_AGE_SEC = int(os.getenv("ITEMSATIS_ADVERT_CACHE_MAX_AGE_SEC", "21600"))
 CUSTOMER_NOTIFY_ENABLED = os.getenv("CUSTOMER_NOTIFY_ENABLED", "false").lower() == "true"
 
 CS2_ADVERT_ID = "5282114"
@@ -153,29 +157,7 @@ PANEL_ALIASES = {
     "panel6": "panel6",
 }
 
-SMM_SERVICE_MAP = {
-    "5098093": {
-        "panel": "smmrush",
-        "service_id": "63",
-        "quantity": 1000,
-        "platform": "instagram",
-    },
-    "5191839": {
-        "panel": "medyabayim",
-        "service_id": "13743",
-        "quantity": 90,
-        "platform": "instagram",
-    },
-
-    # Servisleri sonra buraya ekleyeceğiz.
-    # Örnek:
-    # "ITEMSATIS_ILAN_ID": {
-    #     "panel": "panel3",  # smmrush / medyabayim / panel3 / panel4 / panel5 / panel6
-    #     "service_id": "PANEL_SERVIS_ID",
-    #     "quantity": 1000,
-    #     "platform": "tiktok",
-    # },
-}
+SMM_SERVICE_MAP = {}
 
 # /admin panelinden Redis'e kaydedilen dinamik ilan-servis eşleştirmeleri.
 # API key burada tutulmaz; panel API bilgileri PANEL_MAP ve Render Environment üzerinden gelir.
@@ -242,7 +224,6 @@ _BACKGROUND_TASKS = {}
 PANEL_STATS = {}
 BUYER_STATS = {}
 ORDER_NOTES = {}
-COMPLAINT_LOG = []
 LINK_FAIL_COUNT = {}
 
 # ─── PROFESYONEL PANEL DAYANIKLILIĞI: CIRCUIT BREAKER + REDIS QUEUE ──────────
@@ -260,9 +241,6 @@ QUEUE_CIRCUIT_RETRY_DELAY_SEC = int(os.getenv("QUEUE_CIRCUIT_RETRY_DELAY_SEC", "
 QUEUE_STUCK_RECOVERY_SEC = int(os.getenv("QUEUE_STUCK_RECOVERY_SEC", "600"))
 
 QUEUE_CONTEXT = threading.local()
-
-
-
 
 
 def validate_environment():
@@ -821,8 +799,6 @@ async def itemsatis_queue_worker():
             await asyncio.sleep(max(5, QUEUE_WORKER_SLEEP_SEC))
 
 
-
-
 def read_queue_items(key: str, limit: int = 100) -> list:
     """Redis queue/list içeriğini admin ve API için güvenli şekilde okur."""
     rows = []
@@ -992,7 +968,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, PANEL_STATS, BUYER_STATS, ORDER_NOTES, COMPLAINT_LOG, LINK_FAIL_COUNT
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, PANEL_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -1023,7 +999,6 @@ def load_state():
     PANEL_STATS = redis_get_json("panel_stats", {})
     BUYER_STATS = redis_get_json("buyer_stats", {})
     ORDER_NOTES = redis_get_json("order_notes", {})
-    COMPLAINT_LOG = redis_get_json("complaint_log", [])
     LINK_FAIL_COUNT = redis_get_json("link_fail_count", {})
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
@@ -1064,7 +1039,6 @@ def save_state():
             "panel_stats": PANEL_STATS,
             "buyer_stats": BUYER_STATS,
             "order_notes": ORDER_NOTES,
-            "complaint_log": COMPLAINT_LOG[-100:] if isinstance(COMPLAINT_LOG, list) else [],
             "link_fail_count": LINK_FAIL_COUNT,
         }
 
@@ -1382,8 +1356,6 @@ def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, li
         if len(ORDER_HISTORY) > 500:
             del ORDER_HISTORY[:-500]
         save_state()
-
-
 
 
 def record_buyer_stats(buyer: str, price: float = 0):
@@ -2024,9 +1996,6 @@ def find_order_link(data: dict, platform: str = "") -> str:
     return ""
 
 
-def find_instagram_link(data: dict) -> str:
-    return find_order_link(data, "instagram")
-
 
 def find_package_order_link(data: dict, package: dict) -> tuple[str, str]:
     """Paket siparişlerinde müşteri linkini güvenli şekilde bulur.
@@ -2093,20 +2062,6 @@ def get_service_config(service_or_advert_id) -> dict:
     service["platform"] = normalize_text(service.get("platform", "instagram")) or "general"
     return service
 
-
-def get_service_name(service: dict, advert_id: str = "", product_name: str = "") -> str:
-    """Öncelik Itemsatış ilan adı. SMM_SERVICE_MAP içinde name zorunlu değil."""
-    name = str(product_name or "").strip()
-    if name:
-        return name
-    name = str((service or {}).get("name") or "").strip()
-    if name:
-        return name
-    if str(advert_id or "") == CS2_ADVERT_ID:
-        return "CS2 5 Yıllık Hesap"
-    if advert_id:
-        return f"Itemsatış İlanı {advert_id}"
-    return "Bilinmeyen Ürün"
 
 
 def extract_panel_service_name(service_item: dict) -> str:
@@ -2326,8 +2281,6 @@ def toggle_dynamic_service(advert_id: str) -> bool:
     DYNAMIC_SERVICES[advert_id]["active"] = not current
     save_dynamic_services()
     return True
-
-
 
 
 def normalize_package_component(component: dict) -> dict:
@@ -2840,6 +2793,219 @@ def record_link_audit(order_id: str, advert_id: str, product_name: str, platform
         log("warning", "link_audit_failed", error=str(e))
 
 
+
+def _strip_html_tags(value: str) -> str:
+    """Scraper sonuçlarındaki HTML parçalarını sade metne çevirir."""
+    text_value = re.sub(r"<script.*?</script>|<style.*?</style>", " ", str(value or ""), flags=re.I | re.S)
+    text_value = re.sub(r"<[^>]+>", " ", text_value)
+    text_value = html.unescape(text_value)
+    return re.sub(r"\s+", " ", text_value).strip()
+
+
+def _itemsatis_advert_id_from_url(url: str) -> str:
+    """Itemsatış public ilan linkinden ilan ID yakalamaya çalışır."""
+    url = html.unescape(str(url or ""))
+    patterns = [
+        r"/(?:ilan|advert|urun|product)/(?:[^/]*?)(\d{5,})",
+        r"(?:ilan|advert|product|id)[=/\-_](\d{5,})",
+        r"[-_/](\d{5,})(?:[/?#]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url, re.I)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def parse_itemsatis_adverts_from_html(page_html: str, profile_url: str = "") -> list[dict]:
+    """Public Itemsatış profil HTML'inden ilan ID + ilan adı yakalar.
+
+    API olmadığı için bu fonksiyon best-effort çalışır. Site HTML yapısı değişirse cache/history fallback devreye girer.
+    """
+    page_html = str(page_html or "")
+    found = {}
+
+    # Önce ilan linki gibi görünen anchor'ları tara.
+    anchor_pattern = re.compile(r"<a\b(?P<attrs>[^>]*href=[^>]*)>(?P<body>.*?)</a>", re.I | re.S)
+    href_pattern = re.compile(r"href=[\"'](?P<href>[^\"']+)[\"']", re.I)
+    title_pattern = re.compile(r"(?:title|aria-label)=[\"'](?P<title>[^\"']+)[\"']", re.I)
+
+    for match in anchor_pattern.finditer(page_html):
+        attrs = match.group("attrs") or ""
+        body = match.group("body") or ""
+        href_match = href_pattern.search(attrs)
+        if not href_match:
+            continue
+        href = href_match.group("href")
+        advert_id = _itemsatis_advert_id_from_url(href)
+        if not advert_id:
+            continue
+
+        title = ""
+        title_match = title_pattern.search(attrs)
+        if title_match:
+            title = _strip_html_tags(title_match.group("title"))
+        if not title:
+            title = _strip_html_tags(body)
+        if not title or len(title) < 3:
+            title = PRODUCT_NAME_CACHE.get(advert_id, "") or f"Itemsatış İlanı {advert_id}"
+
+        if advert_id not in found:
+            link = href
+            if link.startswith("/") and profile_url:
+                link = "https://www.itemsatis.com" + link
+            found[advert_id] = {
+                "advert_id": advert_id,
+                "name": title[:220],
+                "url": link,
+                "source": "profile_scrape",
+            }
+
+    # Bazı sayfalarda ilan ID data-id şeklinde bulunabilir; cache ismiyle tamamlanır.
+    for advert_id in re.findall(r"(?:advert|ilan|product|data-id|data-advert-id)[\w\-]*=[\"']?(\d{5,})", page_html, flags=re.I):
+        if advert_id not in found:
+            found[advert_id] = {
+                "advert_id": advert_id,
+                "name": PRODUCT_NAME_CACHE.get(advert_id, "") or f"Itemsatış İlanı {advert_id}",
+                "url": "",
+                "source": "profile_scrape_id_only",
+            }
+
+    return sorted(found.values(), key=lambda x: str(x.get("name", "")).lower())
+
+
+def _advert_link_status(advert_id: str) -> dict:
+    advert_id = str(advert_id or "").strip()
+    service = get_dynamic_services().get(advert_id) or SMM_SERVICE_MAP.get(advert_id)
+    package = get_package_configs(include_inactive=True).get(advert_id)
+    if service and package:
+        label = "Servis + Paket bağlı"
+        status = "both"
+    elif service:
+        label = "Servise bağlı"
+        status = "service"
+    elif package:
+        label = "Pakete bağlı"
+        status = "package"
+    else:
+        label = "Eşleşmemiş"
+        status = "missing"
+    return {"status": status, "label": label}
+
+
+def collect_itemsatis_adverts_from_local_state() -> list[dict]:
+    """Itemsatış API yoksa Redis/cache/history kayıtlarından ilan listesi oluşturur."""
+    rows = {}
+
+    def add(advert_id, name="", source="local", url=""):
+        advert_id_s = str(advert_id or "").strip()
+        if not advert_id_s or advert_id_s.startswith("manual-"):
+            return
+        name_s = str(name or "").strip() or PRODUCT_NAME_CACHE.get(advert_id_s, "") or f"Itemsatış İlanı {advert_id_s}"
+        existing = rows.get(advert_id_s, {})
+        if advert_id_s not in rows or (not existing.get("name") or existing.get("name", "").startswith("Itemsatış İlanı")):
+            rows[advert_id_s] = {"advert_id": advert_id_s, "name": name_s[:220], "url": url, "source": source}
+
+    # Önce scraper cache.
+    cache = redis_get_json(ITEMSATIS_ADVERT_CACHE_KEY, {})
+    if isinstance(cache, dict):
+        for item in cache.get("items", []) or []:
+            if isinstance(item, dict):
+                add(item.get("advert_id"), item.get("name"), item.get("source", "cache"), item.get("url", ""))
+
+    for advert_id, name in (PRODUCT_NAME_CACHE or {}).items():
+        add(advert_id, name, "product_name_cache")
+    for advert_id, service in get_all_services(include_inactive=True).items():
+        add(advert_id, (service or {}).get("name") or PRODUCT_NAME_CACHE.get(str(advert_id), ""), "service_mapping")
+    for advert_id, package in get_package_configs(include_inactive=True).items():
+        add(advert_id, (package or {}).get("name") or PRODUCT_NAME_CACHE.get(str(advert_id), ""), "package_mapping")
+    for item in (ORDER_HISTORY or [])[-500:]:
+        if isinstance(item, dict):
+            add(item.get("advert_id"), item.get("product_name"), "order_history")
+    for item in (PENDING_ORDERS or [])[-300:]:
+        if isinstance(item, dict):
+            add(item.get("advert_id"), item.get("product_name"), "pending_orders")
+    for item in (FAILED_ORDERS or [])[-100:]:
+        if isinstance(item, dict):
+            add(item.get("advert_id"), item.get("product_name"), "failed_orders")
+
+    enriched = []
+    for row in rows.values():
+        row.update(_advert_link_status(row.get("advert_id")))
+        enriched.append(row)
+    return sorted(enriched, key=lambda x: (x.get("status") != "missing", str(x.get("name", "")).lower()))
+
+
+def fetch_itemsatis_public_adverts(force: bool = False) -> dict:
+    """ITEMSATIS_PROFILE_URL üzerinden public ilanları çeker ve Redis'e cache'ler.
+
+    Login/CAPTCHA aşmaz; sadece public profil HTML'ini okur. Çalışmazsa local fallback döner.
+    """
+    cache = redis_get_json(ITEMSATIS_ADVERT_CACHE_KEY, {})
+    now_ts = int(time.time())
+    if not force and isinstance(cache, dict) and cache.get("items") and (now_ts - int(cache.get("updated_at", 0) or 0)) < ITEMSATIS_ADVERT_CACHE_MAX_AGE_SEC:
+        items = collect_itemsatis_adverts_from_local_state()
+        return {"ok": True, "cached": True, "source": cache.get("source", "cache"), "items": items, "error": ""}
+
+    if not ITEMSATIS_PROFILE_URL:
+        return {"ok": False, "cached": bool(cache.get("items") if isinstance(cache, dict) else False), "source": "local_fallback", "items": collect_itemsatis_adverts_from_local_state(), "error": "ITEMSATIS_PROFILE_URL env değişkeni boş"}
+
+    try:
+        response = requests.get(ITEMSATIS_PROFILE_URL, headers=HEADERS, timeout=20)
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        parsed = parse_itemsatis_adverts_from_html(response.text, ITEMSATIS_PROFILE_URL)
+        payload = {
+            "items": parsed,
+            "updated_at": now_ts,
+            "updated_at_text": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+            "profile_url": ITEMSATIS_PROFILE_URL,
+            "source": "profile_scrape",
+        }
+        redis_set_json(ITEMSATIS_ADVERT_CACHE_KEY, payload)
+        items = collect_itemsatis_adverts_from_local_state()
+        log("info", "itemsatis_adverts_refreshed", found=len(parsed))
+        return {"ok": True, "cached": False, "source": "profile_scrape", "items": items, "error": ""}
+    except Exception as e:
+        log("warning", "itemsatis_adverts_fetch_failed", error=str(e))
+        return {"ok": False, "cached": bool(cache.get("items") if isinstance(cache, dict) else False), "source": "local_fallback", "items": collect_itemsatis_adverts_from_local_state(), "error": str(e)}
+
+
+def build_service_cost_quote(panel_key: str, service_id: str, quantity: int = 1000) -> dict:
+    """Panel servis ID + adet için tahmini maliyet hesaplar."""
+    panel_key = normalize_panel_key(panel_key)
+    service_id = str(service_id or "").strip()
+    try:
+        qty = max(1, int(quantity or 1))
+    except Exception:
+        qty = 1
+    panel = get_panel_config(panel_key)
+    service = {
+        "panel_key": panel_key,
+        "panel": panel.get("name", panel_key),
+        "api_url": panel.get("api_url", ""),
+        "api_key": panel.get("api_key", ""),
+        "service_id": service_id,
+    }
+    rate_data = fetch_panel_service_rate(service)
+    if not rate_data.get("ok"):
+        return {"ok": False, "error": rate_data.get("error", "rate_fetch_failed")}
+    rate = rate_data.get("rate", "")
+    cost_tl = estimate_service_cost_tl(panel_key, rate, qty)
+    return {
+        "ok": True,
+        "panel": panel.get("name", panel_key),
+        "panel_key": panel_key,
+        "service_id": service_id,
+        "service_name": rate_data.get("service_name", ""),
+        "quantity": qty,
+        "rate_raw": rate,
+        "rate_tl": format_panel_rate_tl(panel_key, rate),
+        "cost_tl": cost_tl,
+        "cost_tl_text": format_tl_amount(cost_tl) if cost_tl is not None else "Bilinmiyor",
+        "cached": bool(rate_data.get("cached")),
+    }
+
 def search_panel_services(panel_key: str, query: str = "", limit: int = 50):
     """Panel services listesinden servis arar; API key döndürmez."""
     panel_key = normalize_panel_key(panel_key)
@@ -2865,6 +3031,7 @@ def search_panel_services(panel_key: str, query: str = "", limit: int = 50):
             continue
         if sid and name:
             cache_panel_service_name(panel_key, sid, name)
+        rate_tl_value = panel_rate_to_tl(panel_key, rate)
         items.append({
             "panel_key": panel_key,
             "panel_name": panel.get("name", panel_key),
@@ -2872,6 +3039,8 @@ def search_panel_services(panel_key: str, query: str = "", limit: int = 50):
             "name": name,
             "category": category,
             "rate_tl": format_panel_rate_tl(panel_key, rate),
+            "rate_tl_value": rate_tl_value,
+            "cost_1000_tl": format_tl_amount(rate_tl_value) if rate_tl_value is not None else "Bilinmiyor",
             "rate_raw": rate,
             "min": item.get("min", ""),
             "max": item.get("max", ""),
@@ -3190,7 +3359,7 @@ async def startup_event():
     task_specs = {
         "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
         "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
-        "background_check_balances": (int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300")), check_all_panel_balances, 20),
+        "background_check_balances": (CHECK_BALANCE_INTERVAL_SECONDS, check_all_panel_balances, 20),
     }
 
     for name, (interval, func, delay) in task_specs.items():
@@ -3576,6 +3745,8 @@ html, body { max-width: 100%; overflow-x: hidden; }
   <a href="/admin/manual-order"><button type="button">Manuel SMM Sipariş</button></a>
   <a href="/admin/packages"><button type="button">Paketler</button></a>
   <a href="/admin/service-search"><button type="button">Servis Ara</button></a>
+  <a href="/admin/itemsatis-adverts"><button type="button">Itemsatış İlanları</button></a>
+  <a href="/admin/queue-dead"><button type="button">Queue Dead</button></a>
   <a href="/admin/favorites"><button type="button">Favoriler</button></a>
   <a href="/admin/package-test"><button type="button">Paket Test</button></a>
   <form method="post" action="/admin/update-service-names" style="display:inline;">
@@ -3824,9 +3995,6 @@ def admin_reset_dashboard(user: str = Depends(get_current_admin)):
     reset_sales_stats("current_month")
     log("warning", "admin_month_dashboard_reset", user=user)
     return RedirectResponse("/admin", status_code=303)
-
-
-
 
 
 ADMIN_PACKAGES_HTML = """
@@ -4706,21 +4874,21 @@ html, body { max-width: 100%; overflow-x: hidden; }
     <option value="{{ key|e }}" data-panel="{{ fav.panel|e }}" data-service="{{ fav.service_id|e }}" data-quantity="{{ fav.quantity|e }}" data-platform="{{ fav.platform|e }}" data-name="{{ fav.name|e }}">{{ fav.name|e }} | {{ fav.panel|e }} #{{ fav.service_id|e }}</option>
   {% endfor %}
 </select>
-<script>function fillFavorite(){const s=document.getElementById('favoriteSelect');const o=s.options[s.selectedIndex];if(!o||!o.dataset.panel)return;document.querySelector('[name=panel]').value=o.dataset.panel;document.querySelector('[name=service_id]').value=o.dataset.service;document.querySelector('[name=quantity]').value=o.dataset.quantity;document.querySelector('[name=platform]').value=o.dataset.platform;document.querySelector('[name=product_name]').value=o.dataset.name;}</script>
+<script>function fillFavorite(){const s=document.getElementById('favoriteSelect');const o=s.options[s.selectedIndex];if(!o||!o.dataset.panel)return;document.querySelector('[name=panel]').value=o.dataset.panel;document.querySelector('[name=service_id]').value=o.dataset.service;document.querySelector('[name=quantity]').value=o.dataset.quantity;document.querySelector('[name=platform]').value=o.dataset.platform;document.querySelector('[name=product_name]').value=o.dataset.name;setTimeout(updateManualCost,80);}</script>
 {% endif %}
 <form class="grid" method="post" action="/admin/manual-order">
   <label>Panel
-    <select name="panel" required>
+    <select id="manualPanel" name="panel" required>
       {% for key, panel in panels.items() %}
         <option value="{{ key|e }}">{{ panel.name|e }} ({{ key|e }})</option>
       {% endfor %}
     </select>
   </label>
   <label>Panel Servis ID
-    <input name="service_id" placeholder="Örn: 93" pattern="^\\d+$" title="Sadece rakam giriniz" required maxlength="20">
+    <input id="manualServiceId" name="service_id" placeholder="Örn: 93" pattern="^\\d+$" title="Sadece rakam giriniz" required maxlength="20">
   </label>
   <label>Adet
-    <input name="quantity" type="number" min="1" max="1000000" placeholder="Örn: 1000" required>
+    <input id="manualQuantity" name="quantity" type="number" min="1" max="1000000" placeholder="Örn: 1000" required>
   </label>
   <label>Platform
     <select name="platform" required>
@@ -4740,9 +4908,29 @@ html, body { max-width: 100%; overflow-x: hidden; }
   <label class="full">Servis adı / not (opsiyonel)
     <input name="product_name" placeholder="Boş bırakırsan paneldeki servis adı çekilir" maxlength="180">
   </label>
+  <div class="notice full" id="manualCostBox">Panel maliyeti: Panel + servis ID + adet girince otomatik hesaplanır.</div>
   <button class="full" type="submit" onclick="return confirm('Bu sipariş seçilen dış panele gönderilecek. Devam edilsin mi?')">Siparişi Panele Gönder</button>
 </form>
 </div>
+
+<script>
+async function updateManualCost(){
+  const panel=document.getElementById('manualPanel')?.value||'';
+  const service=document.getElementById('manualServiceId')?.value||'';
+  const quantity=document.getElementById('manualQuantity')?.value||'';
+  const box=document.getElementById('manualCostBox');
+  if(!box) return;
+  if(!panel||!service||!quantity){box.textContent='Panel maliyeti: Panel + servis ID + adet girince otomatik hesaplanır.';return;}
+  box.textContent='Panel maliyeti hesaplanıyor...';
+  try{
+    const r=await fetch(`/api/service-cost?panel=${encodeURIComponent(panel)}&service_id=${encodeURIComponent(service)}&quantity=${encodeURIComponent(quantity)}`);
+    const d=await r.json();
+    if(!d.ok){box.textContent='Panel maliyeti hesaplanamadı: '+(d.error||'bilinmeyen hata');return;}
+    box.innerHTML=`Panel fiyatı: <b>${d.rate_tl}</b> / 1000 · Adet: <b>${d.quantity}</b> · Tahmini maliyet: <b>${d.cost_tl_text}</b>`;
+  }catch(e){box.textContent='Panel maliyeti hesaplanamadı.';}
+}
+['manualPanel','manualServiceId','manualQuantity'].forEach(id=>{document.addEventListener('input',e=>{if(e.target&&e.target.id===id) updateManualCost();});document.addEventListener('change',e=>{if(e.target&&e.target.id===id) updateManualCost();});});
+</script>
 
 <script>
 (function(){
@@ -6563,8 +6751,6 @@ def api_logs(user: str = Depends(get_current_admin)):
     return {"logs": LOG_HISTORY}
 
 
-
-
 @app.get("/api/history")
 def api_history(user: str = Depends(get_current_admin)):
     return {"orders": ORDER_HISTORY[-500:]}
@@ -6755,6 +6941,20 @@ def api_queue_status(user: str = Depends(get_current_admin)):
     return build_queue_status()
 
 
+
+def build_redis_health() -> dict:
+    """Upstash Redis REST bağlantısını güvenli şekilde kontrol eder."""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return {"ok": False, "configured": False, "result": "missing_env"}
+    try:
+        started = time.perf_counter()
+        result = redis_request(["PING"])
+        elapsed = round(time.perf_counter() - started, 3)
+        ok = isinstance(result, dict) and str(result.get("result", "")).upper() == "PONG"
+        return {"ok": ok, "configured": True, "duration_sec": elapsed, "result": result.get("result") if isinstance(result, dict) else result}
+    except Exception as e:
+        return {"ok": False, "configured": True, "error": str(e)[:300]}
+
 def build_system_check() -> dict:
     """Genel bot check-up: deploy kıran ve operasyonel riskleri tek yerde özetler."""
     missing_env = validate_environment()
@@ -6803,7 +7003,13 @@ def build_system_check() -> dict:
             "last_warn": BALANCE_WARN_LAST,
         },
         "background_tasks": background,
+        "redis": build_redis_health(),
         "queue_status": build_queue_status(),
+        "itemsatis_adverts": {
+            "profile_url_configured": bool(ITEMSATIS_PROFILE_URL),
+            "cached_count": len((redis_get_json(ITEMSATIS_ADVERT_CACHE_KEY, {}) or {}).get("items", []) or []),
+            "local_count": len(collect_itemsatis_adverts_from_local_state()),
+        },
         "telegram": {
             "main_configured": bool(BOT_TOKEN and CHAT_ID),
             "alerts_configured": bool(BOT_TOKEN and CHAT_ID_ALERTS),
@@ -6874,6 +7080,7 @@ def simple_admin_page(title: str, body: str) -> HTMLResponse:
     nav = """
     <div class="toolbar">
       <a href="/admin">Admin</a><a href="/">Dashboard</a><a href="/admin/service-search">Servis Ara</a>
+      <a href="/admin/itemsatis-adverts">Itemsatış İlanları</a><a href="/admin/queue-dead">Queue Dead</a>
       <a href="/admin/favorites">Favoriler</a><a href="/admin/package-test">Paket Test</a>
       <a href="/admin/balance-history">Bakiye Geçmişi</a><a href="/admin/link-audit">Link Geçmişi</a>
       <a href="/admin/failed-actions">Hata Merkezi</a><a href="/admin/profit-calculator">Kâr Hesapla</a>
@@ -6886,21 +7093,112 @@ def simple_admin_page(title: str, body: str) -> HTMLResponse:
 @app.get("/admin/service-search", response_class=HTMLResponse)
 def admin_service_search(panel: str = "medyabayim", q: str = "", user: str = Depends(get_current_admin)):
     result = {"items": []}
+    panel_key = normalize_panel_key(panel)
     if q:
-        result = search_panel_services(panel, q, 80)
-    rows = "".join([
-        f"<tr><td data-label='Panel'>{item['panel_name']}</td><td data-label='ID'>{item['service_id']}</td><td data-label='Servis'>{item['name']}</td><td data-label='Kategori'>{item['category']}</td><td data-label='Fiyat TL'>{item['rate_tl']}</td><td data-label='Min/Max'>{item.get('min','')} / {item.get('max','')}</td><td data-label='İşlem'><form method='post' action='/admin/favorites/add'><input type='hidden' name='panel' value='{item['panel_key']}'><input type='hidden' name='service_id' value='{item['service_id']}'><input type='hidden' name='name' value=\"{str(item['name']).replace(chr(34),'&quot;')}\"><input type='number' name='quantity' placeholder='Adet' value='1000'><select name='platform'><option>tiktok</option><option>instagram</option><option>youtube</option><option>x</option><option>twitch</option><option>kick</option><option>other</option></select><button class='green'>Favoriye Ekle</button></form></td></tr>"
-        for item in result.get("items", [])
+        result = search_panel_services(panel_key, q, 80)
+
+    row_parts = []
+    for item in result.get("items", []):
+        safe_name = html.escape(str(item.get("name", "")))
+        safe_category = html.escape(str(item.get("category", "")))
+        safe_panel_name = html.escape(str(item.get("panel_name", "")))
+        safe_service_id = html.escape(str(item.get("service_id", "")))
+        safe_panel_key = html.escape(str(item.get("panel_key", "")))
+        safe_rate_tl = html.escape(str(item.get("rate_tl", "")))
+        safe_rate_value = "" if item.get("rate_tl_value") is None else str(item.get("rate_tl_value"))
+        row_parts.append(
+            f"<tr data-rate-tl='{safe_rate_value}'>"
+            f"<td data-label='Panel'>{safe_panel_name}</td>"
+            f"<td data-label='ID'><code>{safe_service_id}</code></td>"
+            f"<td data-label='Servis'>{safe_name}</td>"
+            f"<td data-label='Kategori'>{safe_category}</td>"
+            f"<td data-label='Fiyat TL'>{safe_rate_tl} / 1000</td>"
+            f"<td data-label='Maliyet'><input class='costQty' type='number' min='1' value='50' style='min-height:38px' oninput='calcServiceSearchCosts()'><div class='muted costOut'>Adet girince hesaplanır</div></td>"
+            f"<td data-label='Min/Max'>{html.escape(str(item.get('min','')))} / {html.escape(str(item.get('max','')))}</td>"
+            f"<td data-label='İşlem'><form method='post' action='/admin/favorites/add'>"
+            f"<input type='hidden' name='panel' value='{safe_panel_key}'>"
+            f"<input type='hidden' name='service_id' value='{safe_service_id}'>"
+            f"<input type='hidden' name='name' value=\"{safe_name}\">"
+            f"<input type='number' name='quantity' placeholder='Adet' value='1000'>"
+            f"<select name='platform'><option>tiktok</option><option>instagram</option><option>youtube</option><option>x</option><option>twitch</option><option>kick</option><option>other</option></select>"
+            f"<button class='green'>Favoriye Ekle</button></form></td></tr>"
+        )
+    rows = "".join(row_parts)
+    error = "" if result.get("ok", True) else f"<div class='card'>Hata: {html.escape(str(result.get('error')))}</div>"
+    options = "".join([
+        f'<option value="{html.escape(k)}" {"selected" if k==panel_key else ""}>{html.escape(v.get("name",k))} ({html.escape(k)})</option>'
+        for k, v in PANEL_MAP.items()
     ])
-    error = "" if result.get("ok", True) else f"<div class='card'>Hata: {result.get('error')}</div>"
     body = f"""
-    <div class='card'><div class='muted'>Panel servislerini isim, ID veya kategoriyle ara. Sonuçlarda fiyatlar TL olarak gösterilir.</div>
-    <form class='grid' method='get'><select name='panel'>{''.join([f'<option value="{k}" {"selected" if k==normalize_panel_key(panel) else ""}>{v.get("name",k)} ({k})</option>' for k,v in PANEL_MAP.items()])}</select><input name='q' value='{q}' placeholder='Örn: tiktok views, takipçi, 123'><button>Ara</button></form></div>
+    <div class='card'><div class='muted'>Panel servislerini isim, ID veya kategoriyle ara. Fiyat ve adet bazlı tahmini maliyet TL olarak gösterilir.</div>
+    <form class='grid' method='get'><select name='panel'>{options}</select><input name='q' value='{html.escape(str(q))}' placeholder='Örn: tiktok views, takipçi, 123'><button>Ara</button></form></div>
     {error}
-    <div class='card'><table class='table'><thead><tr><th>Panel</th><th>ID</th><th>Servis</th><th>Kategori</th><th>Fiyat TL</th><th>Min/Max</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Arama yap veya sonuç yok.</td></tr>'}</tbody></table></div>
+    <div class='card'><table class='table'><thead><tr><th>Panel</th><th>ID</th><th>Servis</th><th>Kategori</th><th>Fiyat TL</th><th>Adet Maliyeti</th><th>Min/Max</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Arama yap veya sonuç yok.</td></tr>'}</tbody></table></div>
+    <script>
+    function calcServiceSearchCosts(){{
+      document.querySelectorAll('tr[data-rate-tl]').forEach(function(row){{
+        var rate=parseFloat(row.getAttribute('data-rate-tl')||'');
+        var qty=parseFloat((row.querySelector('.costQty')||{{}}).value||'0');
+        var out=row.querySelector('.costOut');
+        if(!out) return;
+        if(!rate||!qty){{out.textContent='Hesaplanamadı';return;}}
+        out.textContent='Tahmini maliyet: '+((rate/1000)*qty).toFixed(4)+' TL';
+      }});
+    }}
+    calcServiceSearchCosts();
+    </script>
     """
     return simple_admin_page("Panel Servis Arama", body)
 
+
+@app.get("/api/service-cost")
+def api_service_cost(panel: str, service_id: str, quantity: int = 1000, user: str = Depends(get_current_admin)):
+    return build_service_cost_quote(panel, service_id, quantity)
+
+
+@app.get("/admin/itemsatis-adverts", response_class=HTMLResponse)
+def admin_itemsatis_adverts(refresh: int = 0, user: str = Depends(get_current_admin)):
+    result = fetch_itemsatis_public_adverts(force=bool(refresh))
+    rows = []
+    for item in result.get("items", []):
+        advert_id = str(item.get("advert_id", ""))
+        name = html.escape(str(item.get("name", "")))
+        source = html.escape(str(item.get("source", "")))
+        status = item.get("status", "missing")
+        label = html.escape(str(item.get("label", "Eşleşmemiş")))
+        pill_class = "green" if status in {"service", "package", "both"} else ""
+        url = str(item.get("url", ""))
+        url_html = f"<a href='{html.escape(url)}' target='_blank'>Aç</a>" if url else "-"
+        rows.append(
+            f"<tr>"
+            f"<td data-label='İlan ID'><code>{html.escape(advert_id)}</code><button type='button' onclick=\"navigator.clipboard&&navigator.clipboard.writeText('{html.escape(advert_id)}')\">Kopyala</button></td>"
+            f"<td data-label='İlan Adı'>{name}</td>"
+            f"<td data-label='Durum'><span class='pill {pill_class}'>{label}</span></td>"
+            f"<td data-label='Kaynak'>{source}</td>"
+            f"<td data-label='Link'>{url_html}</td>"
+            f"</tr>"
+        )
+    env_note = "" if ITEMSATIS_PROFILE_URL else "<div class='card'>ITEMSATIS_PROFILE_URL env değişkeni boş. Şimdilik sadece cache/history/admin panel kayıtlarından liste gösteriliyor.</div>"
+    err = "" if result.get("ok") else f"<div class='card'>Profil çekimi uyarısı: {html.escape(str(result.get('error','')))}<br><span class='muted'>Liste local fallback ile oluşturuldu.</span></div>"
+    body = f"""
+    <div class='card'>
+      <div class='muted'>Itemsatış API key olmadığı için public profil linkinden ilanları yakalamaya çalışır. Çekemezse Redis/cache, admin servisleri, paketler ve sipariş geçmişinden liste oluşturur.</div>
+      <div class='toolbar'>
+        <a class='btn green' href='/admin/itemsatis-adverts?refresh=1'>İlanları Yenile</a>
+        <a class='btn' href='/admin'>Servis Bağlama Sayfasına Git</a>
+      </div>
+      <div class='muted'>Profil URL: {html.escape(ITEMSATIS_PROFILE_URL or 'Tanımlı değil')}</div>
+    </div>
+    {env_note}{err}
+    <div class='card'><table class='table'><thead><tr><th>İlan ID</th><th>İlan Adı</th><th>Durum</th><th>Kaynak</th><th>Link</th></tr></thead><tbody>{''.join(rows) or '<tr><td>Henüz ilan bulunamadı.</td></tr>'}</tbody></table></div>
+    """
+    return simple_admin_page("Itemsatış İlanları", body)
+
+
+@app.post("/admin/itemsatis-adverts/refresh")
+def admin_itemsatis_adverts_refresh(user: str = Depends(get_current_admin)):
+    fetch_itemsatis_public_adverts(force=True)
+    return RedirectResponse("/admin/itemsatis-adverts", status_code=303)
 
 @app.get("/admin/favorites", response_class=HTMLResponse)
 def admin_favorites(user: str = Depends(get_current_admin)):
