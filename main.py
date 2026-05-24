@@ -359,11 +359,13 @@ def log(level: str, event: str, **kwargs):
 
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-def _send_telegram_to(text: str, chat_id: str, channel: str = "default"):
-    """Telegram mesajı gönderir. parse_mode kullanmaz; < > karakterleri mesajı bozmaz."""
+def _send_telegram_to(text: str, chat_id: str, channel: str = "default") -> bool:
+    """Telegram mesajı gönderir. parse_mode kullanmaz; < > karakterleri mesajı bozmaz.
+    Başarılıysa True döner; alert fallback için kullanılır.
+    """
     if not BOT_TOKEN or not chat_id:
         log("warning", "telegram_skip", reason="BOT_TOKEN veya chat_id eksik", channel=channel)
-        return
+        return False
 
     try:
         r = requests.post(
@@ -376,8 +378,10 @@ def _send_telegram_to(text: str, chat_id: str, channel: str = "default"):
             timeout=30,
         )
         log("info", "telegram_sent", status=r.status_code, channel=channel)
+        return 200 <= int(r.status_code) < 300
     except Exception as e:
         log("error", "telegram_error", error=str(e), channel=channel)
+        return False
 
 
 def send_telegram(text: str):
@@ -393,7 +397,10 @@ def send_telegram_sale(text: str):
 
 
 def send_telegram_alert(text: str):
-    _send_telegram_to(text, CHAT_ID_ALERTS, "alerts")
+    # CHAT_ID_ALERTS yanlış/boş ise ana CHAT_ID'ye düşer; düşük bakiye uyarıları kaybolmaz.
+    ok = _send_telegram_to(text, CHAT_ID_ALERTS, "alerts")
+    if not ok and CHAT_ID_ALERTS != CHAT_ID:
+        _send_telegram_to(text, CHAT_ID, "main_alert_fallback")
 
 
 # ─── YENİ: MÜŞTERİ BİLDİRİM SİSTEMİ ─────────────────────────────────────────
@@ -2669,7 +2676,7 @@ def get_panel_services(api_url, api_key, panel_name=""):
     return _panel_api_request(api_url, api_key, "services", panel_name=panel_name)
 
 
-def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""):
+def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = "", force_alert: bool = False):
     """Panel bakiyesi eşik altındaysa Telegram uyarısı gönderir.
 
     Düzeltmeler:
@@ -2696,7 +2703,7 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
             return False
 
         last_warn = int(BALANCE_WARN_LAST.get(key, 0) or 0)
-        if last_warn and (now_ts - last_warn) < repeat_seconds:
+        if (not force_alert) and last_warn and (now_ts - last_warn) < repeat_seconds:
             log(
                 "info",
                 "low_balance_warning_suppressed",
@@ -2722,8 +2729,10 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
         return False
 
 
-def check_all_panel_balances():
-    """Tüm panelleri kontrol eder; düşük bakiye uyarısını periyodik çalıştırır."""
+def check_all_panel_balances(force_alert: bool = False):
+    """Tüm panelleri kontrol eder; düşük bakiye uyarısını periyodik çalıştırır.
+    force_alert=True manuel check-up için tekrar aralığını bypass eder.
+    """
     results = {}
     changed = False
     for key in PANEL_MAP.keys():
@@ -2742,6 +2751,7 @@ def check_all_panel_balances():
             balance_data.get("currency", ""),
             panel.get("name", key),
             panel_key=key,
+            force_alert=force_alert,
         )
         changed = True
         results[key] = {"ok": True, "balance": format_panel_balance_tl(balance_data), "alerted": alerted}
@@ -2774,7 +2784,7 @@ async def startup_event():
     task_specs = {
         "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
         "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
-        "background_check_balances": (int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300")), check_all_panel_balances, 120),
+        "background_check_balances": (int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300")), check_all_panel_balances, 20),
     }
 
     for name, (interval, func, delay) in task_specs.items():
@@ -6162,6 +6172,115 @@ def api_favorites(user: str = Depends(get_current_admin)):
     return {"items": FAVORITE_SERVICES}
 
 
+
+@app.get("/api/panel-stats")
+def api_panel_stats(user: str = Depends(get_current_admin)):
+    """Panel başarı/başarısız/partial istatistikleri."""
+    rows = {}
+    for panel_key, item in (PANEL_STATS or {}).items():
+        try:
+            success = int(item.get("success", 0) or 0)
+            failed = int(item.get("failed", 0) or 0)
+            partial = int(item.get("partial", 0) or 0)
+            total = success + failed + partial
+            completed_count = int(item.get("completed_count", 0) or 0)
+            total_minutes = int(item.get("completed_total_minutes", 0) or 0)
+            avg_minutes = round(total_minutes / completed_count, 1) if completed_count else 0
+            success_rate = round((success / total) * 100, 2) if total else 0
+        except Exception:
+            success = failed = partial = total = completed_count = total_minutes = avg_minutes = success_rate = 0
+        rows[panel_key] = {
+            "success": success,
+            "failed": failed,
+            "partial": partial,
+            "total": total,
+            "success_rate": success_rate,
+            "avg_completion_minutes": avg_minutes,
+            "last_update": item.get("last_update", "") if isinstance(item, dict) else "",
+        }
+    return {"items": rows}
+
+
+@app.get("/api/buyer-stats")
+def api_buyer_stats(user: str = Depends(get_current_admin)):
+    """Müşteri bazlı sipariş istatistikleri."""
+    return {"items": BUYER_STATS or {}}
+
+
+@app.get("/api/order-notes")
+def api_order_notes(user: str = Depends(get_current_admin)):
+    """Sipariş notları."""
+    return {"items": ORDER_NOTES or {}}
+
+
+def build_system_check() -> dict:
+    """Genel bot check-up: deploy kıran ve operasyonel riskleri tek yerde özetler."""
+    missing_env = validate_environment()
+    configured_panels = []
+    missing_panels = []
+    for key in PANEL_MAP.keys():
+        panel = get_panel_config(key)
+        row = {"key": key, "name": panel.get("name", key), "configured": is_panel_configured(key)}
+        if row["configured"]:
+            configured_panels.append(row)
+        else:
+            missing_panels.append(row)
+
+    background = {}
+    for name, task in (_BACKGROUND_TASKS or {}).items():
+        background[name] = {
+            "running": bool(task and not task.done()),
+            "done": bool(task.done()) if task else True,
+        }
+
+    duplicate_routes = []
+    seen_routes = set()
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        methods = tuple(sorted(getattr(route, "methods", []) or []))
+        key = (path, methods)
+        if key in seen_routes:
+            duplicate_routes.append({"path": path, "methods": list(methods)})
+        seen_routes.add(key)
+
+    return {
+        "ok": not bool(duplicate_routes),
+        "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "routes_count": len(app.routes),
+        "duplicate_routes": duplicate_routes,
+        "missing_env": missing_env,
+        "configured_panels": configured_panels,
+        "missing_panels": missing_panels,
+        "pending_count": len(PENDING_ORDERS),
+        "failed_count": len(FAILED_ORDERS),
+        "packages_count": len(PACKAGE_CONFIGS or {}),
+        "dynamic_services_count": len(DYNAMIC_SERVICES or {}),
+        "balance_alerts": {
+            "threshold_tl": BALANCE_WARN_THRESHOLD_TL,
+            "repeat_minutes": BALANCE_WARN_REPEAT_MINUTES,
+            "last_warn": BALANCE_WARN_LAST,
+        },
+        "background_tasks": background,
+        "telegram": {
+            "main_configured": bool(BOT_TOKEN and CHAT_ID),
+            "alerts_configured": bool(BOT_TOKEN and CHAT_ID_ALERTS),
+            "sales_configured": bool(BOT_TOKEN and CHAT_ID_SALES),
+            "errors_configured": bool(BOT_TOKEN and CHAT_ID_ERRORS),
+        },
+        "state": {
+            "processed_orders": len(PROCESSED_ORDERS),
+            "processed_links": len(PROCESSED_LINKS),
+            "log_history": len(LOG_HISTORY),
+            "link_audit": len(LINK_AUDIT_HISTORY),
+        },
+    }
+
+
+@app.get("/api/system-check")
+def api_system_check(user: str = Depends(get_current_admin)):
+    return build_system_check()
+
+
 @app.get("/api/profit")
 def api_profit(sale: float = 0, cost: float = 0, user: str = Depends(get_current_admin)):
     return calculate_profit(sale, cost)
@@ -6190,7 +6309,14 @@ def api_export(user: str = Depends(get_current_admin)):
 @app.get("/check-panel-health")
 @app.head("/check-panel-health")
 def check_panel_health():
-    return check_all_panel_balances()
+    return check_all_panel_balances(force_alert=False)
+
+
+@app.get("/check-balances")
+@app.head("/check-balances")
+def check_balances_now(user: str = Depends(get_current_admin)):
+    """Admin manuel bakiye check-up. Düşük bakiyelerde tekrar uyarı aralığını bypass eder."""
+    return check_all_panel_balances(force_alert=True)
 
 
 
@@ -7068,6 +7194,7 @@ async def telegram_webhook(request: Request):
             "/balance - Tüm panel bakiyeleri\n"
             "/balance paneladi - Seçili panel bakiyesi\n"
             "/balance-all - Tüm panel bakiyeleri\n"
+            "/check-balances - Bakiye alarm check-up\n"
             "/medyabalance - MedyaBayim bakiyesi\n"
             "/status - Bot durumu\n"
             "/health - Sistem durumu\n"
@@ -7116,6 +7243,18 @@ async def telegram_webhook(request: Request):
 
     if command == "/medyabalance":
         handle_panel_balance_command("/balance medyabayim")
+        return {"ok": True}
+
+    if command in ["/check-balances", "/balance-check"]:
+        result = check_all_panel_balances(force_alert=True)
+        lines = ["Bakiye check-up tamamlandı:\n"]
+        for key, item in (result.get("panels") or {}).items():
+            if item.get("ok"):
+                alert_text = " | Uyarı gönderildi" if item.get("alerted") else ""
+                lines.append(f"{key}: {item.get('balance')}{alert_text}")
+            else:
+                lines.append(f"{key}: Hata - {item.get('error')}")
+        send_telegram("\n".join(lines))
         return {"ok": True}
 
     if command == "/health":
