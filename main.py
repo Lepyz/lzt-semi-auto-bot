@@ -427,6 +427,26 @@ def redis_set_json(key, value):
     redis_request(["SET", key, json.dumps(value, ensure_ascii=False)])
 
 
+def redis_mset_json(data_dict: dict):
+    """Birden fazla state alanını tek Redis MSET isteğiyle yazar.
+    Redis yoksa veya hata olursa botu düşürmez.
+    """
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+
+    try:
+        command = ["MSET"]
+        for key, value in data_dict.items():
+            command.extend([key, json.dumps(value, ensure_ascii=False)])
+        return redis_request(command)
+    except Exception as e:
+        try:
+            logger.error("redis_mset_error", error=str(e))
+        except Exception:
+            print("REDIS MSET ERROR:", str(e), flush=True)
+        return None
+
+
 
 def sanitize_pending_order(item: dict) -> dict:
     """API cevaplarında ve Redis kayıtlarında panel API key sızmasını engeller."""
@@ -498,27 +518,38 @@ def load_state():
 
 
 def save_state():
+    """State verilerini tek Redis MSET isteğiyle kaydeder.
+    Eski tek tek SET sistemine göre daha hızlıdır ve yarım kayıt riskini azaltır.
+    """
     with STATE_LOCK:
         sanitize_pending_orders_for_storage()
-        redis_set_json("recorded_sales", list(RECORDED_SALES))
-        redis_set_json("processed_orders", list(PROCESSED_ORDERS))
-        redis_set_json("processed_links", list(PROCESSED_LINKS))
-        redis_set_json("failed_orders", FAILED_ORDERS)
-        redis_set_json("pending_orders", PENDING_ORDERS)
-        redis_set_json("daily_stats", DAILY_STATS)
-        redis_set_json("last_daily_report_date", LAST_DAILY_REPORT_DATE)
-        redis_set_json("service_price_cache", SERVICE_PRICE_CACHE)
-        redis_set_json("weekly_stats", WEEKLY_STATS)
-        redis_set_json("monthly_stats", MONTHLY_STATS)
-        redis_set_json("last_weekly_report_date", LAST_WEEKLY_REPORT_DATE)
-        redis_set_json("last_monthly_report_date", LAST_MONTHLY_REPORT_DATE)
-        redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
-        redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
-        redis_set_json("dynamic_services", DYNAMIC_SERVICES)
-        redis_set_json("package_configs", PACKAGE_CONFIGS)
-        redis_set_json("sales_history", SALES_HISTORY)
-        redis_set_json("order_history", ORDER_HISTORY[-500:])
-        redis_set_json("blacklist", list(BLACKLIST))
+
+        data_to_save = {
+            "recorded_sales": list(RECORDED_SALES),
+            "processed_orders": list(PROCESSED_ORDERS),
+            "processed_links": list(PROCESSED_LINKS),
+            "failed_orders": FAILED_ORDERS,
+            "pending_orders": PENDING_ORDERS,
+            "daily_stats": DAILY_STATS,
+            "last_daily_report_date": LAST_DAILY_REPORT_DATE,
+            "service_price_cache": SERVICE_PRICE_CACHE,
+            "weekly_stats": WEEKLY_STATS,
+            "monthly_stats": MONTHLY_STATS,
+            "last_weekly_report_date": LAST_WEEKLY_REPORT_DATE,
+            "last_monthly_report_date": LAST_MONTHLY_REPORT_DATE,
+            "product_name_cache": PRODUCT_NAME_CACHE,
+            "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
+            "dynamic_services": DYNAMIC_SERVICES,
+            "package_configs": PACKAGE_CONFIGS,
+            "sales_history": SALES_HISTORY,
+            "order_history": ORDER_HISTORY[-500:],
+            "blacklist": list(BLACKLIST),
+        }
+
+        result = redis_mset_json(data_to_save)
+        if result is None:
+            log("warning", "redis_mset_skipped_or_failed")
+
         flush_logs(force=True)
 
 
@@ -2159,29 +2190,57 @@ def check_low_balance(balance, currency, panel_name="Panel"):
 
 
 
-async def background_scheduler():
-    """Render açık kaldığı sürece sipariş ve servis kontrollerini otomatik çalıştırır."""
-    await asyncio.sleep(30)
+BACKGROUND_TASKS_STARTED = False
+
+
+async def periodic_runner(name: str, interval_seconds: int, func, initial_delay: int = 30):
+    """FastAPI içinde hafif periyodik görev çalıştırıcı.
+    APScheduler gibi ekstra paket gerektirmez. Senkron fonksiyonları thread içinde çalıştırır, event loop'u kilitlemez.
+    """
+    await asyncio.sleep(initial_delay)
+
     while True:
         try:
-            log("info", "background_check_orders_start")
-            check_orders()
+            log("info", f"{name}_start")
+            await asyncio.to_thread(func)
+            log("info", f"{name}_done")
         except Exception as e:
-            log("error", "background_check_orders_error", error=str(e))
+            log("error", f"{name}_error", error=str(e))
 
-        try:
-            log("info", "background_check_services_start")
-            check_services()
-        except Exception as e:
-            log("error", "background_check_services_error", error=str(e))
-
-        await asyncio.sleep(300)
+        await asyncio.sleep(max(30, int(interval_seconds or 300)))
 
 
 @app.on_event("startup")
 async def startup_event():
+    global BACKGROUND_TASKS_STARTED
+
     validate_environment()
-    asyncio.create_task(background_scheduler())
+
+    if BACKGROUND_TASKS_STARTED:
+        log("warning", "background_tasks_already_started")
+        return
+
+    BACKGROUND_TASKS_STARTED = True
+
+    asyncio.create_task(
+        periodic_runner(
+            "background_check_orders",
+            int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")),
+            check_orders,
+            45,
+        )
+    )
+
+    asyncio.create_task(
+        periodic_runner(
+            "background_check_services",
+            int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")),
+            check_services,
+            90,
+        )
+    )
+
+    log("info", "background_tasks_started")
 
 
 load_state()
