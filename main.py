@@ -246,6 +246,23 @@ ORDER_NOTES = {}
 COMPLAINT_LOG = []
 LINK_FAIL_COUNT = {}
 
+# ─── PROFESYONEL PANEL DAYANIKLILIĞI: CIRCUIT BREAKER + REDIS QUEUE ──────────
+CIRCUIT_THRESHOLD = int(os.getenv("CIRCUIT_THRESHOLD", "3"))
+CIRCUIT_RECOVERY_SEC = int(os.getenv("CIRCUIT_RECOVERY_SEC", "600"))
+
+ITEMSATIS_WEBHOOK_QUEUE_KEY = os.getenv("ITEMSATIS_WEBHOOK_QUEUE_KEY", "queue:itemsatis:webhooks")
+ITEMSATIS_WEBHOOK_PROCESSING_KEY = os.getenv("ITEMSATIS_WEBHOOK_PROCESSING_KEY", "queue:itemsatis:processing")
+ITEMSATIS_WEBHOOK_DEAD_KEY = os.getenv("ITEMSATIS_WEBHOOK_DEAD_KEY", "queue:itemsatis:dead")
+
+QUEUE_ITEM_MAX_ATTEMPTS = int(os.getenv("QUEUE_ITEM_MAX_ATTEMPTS", "5"))
+QUEUE_WORKER_SLEEP_SEC = float(os.getenv("QUEUE_WORKER_SLEEP_SEC", "2"))
+QUEUE_RETRY_DELAY_SEC = int(os.getenv("QUEUE_RETRY_DELAY_SEC", "120"))
+QUEUE_CIRCUIT_RETRY_DELAY_SEC = int(os.getenv("QUEUE_CIRCUIT_RETRY_DELAY_SEC", "600"))
+QUEUE_STUCK_RECOVERY_SEC = int(os.getenv("QUEUE_STUCK_RECOVERY_SEC", "600"))
+
+QUEUE_CONTEXT = threading.local()
+
+
 
 
 
@@ -542,6 +559,260 @@ def redis_mset_json(data_dict: dict):
         except Exception:
             print("REDIS MSET ERROR:", str(e), flush=True)
         return None
+
+
+
+# ─── PROFESYONEL PANEL DAYANIKLILIĞI: REDIS RAW HELPERS ──────────────────────
+def redis_command_result(command, default=None):
+    """redis_request(command) cevabındaki result alanını güvenli döndürür."""
+    try:
+        result = redis_request(command)
+        if not isinstance(result, dict):
+            return default
+        return result.get("result", default)
+    except Exception as e:
+        log("error", "redis_command_result_error", command=str(command)[:120], error=str(e))
+        return default
+
+
+def redis_get_raw(key: str, default=None):
+    return redis_command_result(["GET", key], default)
+
+
+def redis_set_raw(key: str, value, ex: int | None = None, nx: bool = False):
+    command = ["SET", key, str(value)]
+    if ex:
+        command.extend(["EX", int(ex)])
+    if nx:
+        command.append("NX")
+    return redis_request(command)
+
+
+def redis_delete_key(key: str):
+    return redis_request(["DEL", key])
+
+
+def redis_lpush_json(key: str, value: dict):
+    return redis_request(["LPUSH", key, json.dumps(value, ensure_ascii=False, default=str)])
+
+
+def redis_lrem_value(key: str, raw_value: str):
+    return redis_request(["LREM", key, 1, raw_value])
+
+
+def redis_lrange_raw(key: str, start: int = 0, end: int = -1):
+    result = redis_command_result(["LRANGE", key, start, end], [])
+    return result if isinstance(result, list) else []
+
+
+def redis_rpoplpush_raw(src_key: str, dst_key: str):
+    return redis_command_result(["RPOPLPUSH", src_key, dst_key], None)
+
+
+class CircuitOpenForOrder(Exception):
+    """Webhook worker içinde panel geçici kapalıysa siparişi failed'a düşürmeden requeue eder."""
+    def __init__(self, panel_name: str, message: str = "", retry_after: int | None = None):
+        self.panel_name = str(panel_name or "unknown")
+        self.retry_after = int(retry_after or QUEUE_CIRCUIT_RETRY_DELAY_SEC)
+        super().__init__(message or f"Panel circuit open: {self.panel_name}")
+
+
+def _queue_context_active() -> bool:
+    return bool(getattr(QUEUE_CONTEXT, "active", False))
+
+
+def circuit_failures_key(panel_name: str) -> str:
+    return f"circuit:{normalize_panel_key(panel_name or 'unknown')}:failures"
+
+
+def circuit_open_until_key(panel_name: str) -> str:
+    return f"circuit:{normalize_panel_key(panel_name or 'unknown')}:opened_until"
+
+
+def is_panel_circuit_open(panel_name: str) -> bool:
+    """Panel circuit breaker açık mı? True ise panele istek atılmaz."""
+    panel_name = normalize_panel_key(panel_name or "unknown")
+    try:
+        opened_until_raw = redis_get_raw(circuit_open_until_key(panel_name), "")
+        if not opened_until_raw:
+            return False
+        opened_until = int(opened_until_raw)
+        now_ts = int(time.time())
+        if opened_until > now_ts:
+            return True
+        redis_delete_key(circuit_open_until_key(panel_name))
+        redis_delete_key(circuit_failures_key(panel_name))
+        log("info", "circuit_auto_recovered", panel=panel_name)
+        return False
+    except Exception as e:
+        log("error", "circuit_check_error", panel=panel_name, error=str(e))
+        return False
+
+
+def get_panel_circuit_retry_after(panel_name: str) -> int:
+    try:
+        opened_until = int(redis_get_raw(circuit_open_until_key(panel_name), "0") or 0)
+        return max(QUEUE_RETRY_DELAY_SEC, opened_until - int(time.time()))
+    except Exception:
+        return QUEUE_CIRCUIT_RETRY_DELAY_SEC
+
+
+def record_panel_failure(panel_name: str, reason: str = ""):
+    """Panel bağlantı/timeout/5xx hatalarında hata sayacını artırır."""
+    panel_name = normalize_panel_key(panel_name or "unknown")
+    try:
+        key = circuit_failures_key(panel_name)
+        failures = int(redis_get_raw(key, "0") or 0) + 1
+        redis_set_raw(key, failures, ex=max(CIRCUIT_RECOVERY_SEC * 2, 1200))
+        log("warning", "panel_failure_recorded", panel=panel_name, failures=failures, reason=str(reason)[:240])
+        if failures >= CIRCUIT_THRESHOLD:
+            opened_until = int(time.time()) + CIRCUIT_RECOVERY_SEC
+            already_open = is_panel_circuit_open(panel_name)
+            redis_set_raw(circuit_open_until_key(panel_name), opened_until, ex=CIRCUIT_RECOVERY_SEC + 120)
+            if not already_open:
+                send_telegram_error(
+                    f"🚨 Panel geçici kapatıldı\n\n"
+                    f"Panel: {panel_name}\n"
+                    f"Hata sayısı: {failures}\n"
+                    f"Süre: {CIRCUIT_RECOVERY_SEC // 60} dakika\n\n"
+                    f"Bu panele yeni sipariş gönderilmeyecek. Webhook siparişleri failed yerine kuyruğa alınacak."
+                )
+    except Exception as e:
+        log("error", "record_panel_failure_error", panel=panel_name, error=str(e))
+
+
+def record_panel_success(panel_name: str):
+    """Panel başarılı cevap verirse circuit sayaçlarını sıfırlar."""
+    panel_name = normalize_panel_key(panel_name or "unknown")
+    try:
+        had_failures = redis_get_raw(circuit_failures_key(panel_name), "")
+        had_open = redis_get_raw(circuit_open_until_key(panel_name), "")
+        redis_delete_key(circuit_failures_key(panel_name))
+        redis_delete_key(circuit_open_until_key(panel_name))
+        if had_failures or had_open:
+            log("success", "circuit_reset", panel=panel_name)
+    except Exception as e:
+        log("error", "record_panel_success_error", panel=panel_name, error=str(e))
+
+
+def enqueue_itemsatis_webhook(data: dict, *, attempts: int = 0, queue_id: str = "", not_before: int = 0, last_error: str = "") -> str:
+    """Itemsatış payload'unu Redis kuyruğuna yazar. Render restart olsa bile sipariş kaybolmaz."""
+    if not isinstance(data, dict):
+        data = {"raw_payload": str(data)}
+    if not queue_id:
+        raw = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+        queue_id = hashlib.sha1(f"{time.time()}:{raw}".encode("utf-8", errors="ignore")).hexdigest()[:20]
+    item = {
+        "id": queue_id,
+        "created_at": int(time.time()),
+        "attempts": int(attempts or 0),
+        "not_before": int(not_before or 0),
+        "last_error": str(last_error or "")[:500],
+        "payload": data,
+    }
+    redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+    log("info", "itemsatis_webhook_queued", queue_id=queue_id, attempts=attempts, not_before=not_before)
+    return queue_id
+
+
+def move_queue_item_to_dead(item: dict, reason: str):
+    item = item if isinstance(item, dict) else {"payload": item}
+    item["dead_at"] = int(time.time())
+    item["dead_reason"] = str(reason)[:500]
+    redis_lpush_json(ITEMSATIS_WEBHOOK_DEAD_KEY, item)
+    log("error", "itemsatis_queue_dead", queue_id=item.get("id"), reason=reason)
+
+
+def recover_stuck_itemsatis_processing():
+    """Worker crash/restart sırasında processing listesinde kalan eski işleri ana kuyruğa geri taşır."""
+    try:
+        raw_items = redis_lrange_raw(ITEMSATIS_WEBHOOK_PROCESSING_KEY, 0, -1)
+        now_ts = int(time.time())
+        recovered = 0
+        for raw in raw_items:
+            try:
+                item = json.loads(raw)
+            except Exception:
+                continue
+            started_at = int(item.get("processing_started_at", item.get("created_at", 0)) or 0)
+            if started_at and now_ts - started_at < QUEUE_STUCK_RECOVERY_SEC:
+                continue
+            item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+            item["not_before"] = now_ts + QUEUE_RETRY_DELAY_SEC
+            item["last_error"] = "Recovered from stuck processing queue"
+            redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+            if item["attempts"] >= QUEUE_ITEM_MAX_ATTEMPTS:
+                move_queue_item_to_dead(item, "Max attempts after stuck recovery")
+            else:
+                redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+            recovered += 1
+        if recovered:
+            log("warning", "itemsatis_stuck_jobs_recovered", count=recovered)
+    except Exception as e:
+        log("error", "recover_stuck_processing_error", error=str(e))
+
+
+async def itemsatis_queue_worker():
+    """Redis tabanlı mini webhook worker. Ekstra paket istemez; siparişleri sırayla işler."""
+    log("info", "itemsatis_queue_worker_started")
+    recover_stuck_itemsatis_processing()
+    while True:
+        try:
+            raw = redis_rpoplpush_raw(ITEMSATIS_WEBHOOK_QUEUE_KEY, ITEMSATIS_WEBHOOK_PROCESSING_KEY)
+            if not raw:
+                await asyncio.sleep(QUEUE_WORKER_SLEEP_SEC)
+                continue
+            try:
+                item = json.loads(raw)
+            except Exception as e:
+                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                move_queue_item_to_dead({"raw": str(raw)[:1000]}, f"Queue JSON parse error: {e}")
+                continue
+            now_ts = int(time.time())
+            not_before = int(item.get("not_before", 0) or 0)
+            if not_before > now_ts:
+                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+                await asyncio.sleep(min(QUEUE_WORKER_SLEEP_SEC + 3, max(1, not_before - now_ts)))
+                continue
+            item["processing_started_at"] = now_ts
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else item
+            try:
+                result = await asyncio.to_thread(process_itemsatis_webhook_payload, payload)
+                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                log("info", "itemsatis_queue_processed", queue_id=item.get("id"), result=str(result)[:300])
+            except CircuitOpenForOrder as e:
+                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                attempts = int(item.get("attempts", 0) or 0) + 1
+                item["attempts"] = attempts
+                item["not_before"] = int(time.time()) + int(e.retry_after)
+                item["last_error"] = str(e)
+                if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
+                    move_queue_item_to_dead(item, f"Circuit open max attempts: {e}")
+                else:
+                    redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+                    log("warning", "itemsatis_requeued_circuit_open", queue_id=item.get("id"), panel=e.panel_name, attempts=attempts)
+            except Exception as e:
+                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                attempts = int(item.get("attempts", 0) or 0) + 1
+                item["attempts"] = attempts
+                item["not_before"] = int(time.time()) + QUEUE_RETRY_DELAY_SEC
+                item["last_error"] = str(e)
+                if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
+                    move_queue_item_to_dead(item, f"Max attempts: {e}")
+                    send_telegram_error(
+                        f"Itemsatış queue dead\'e düştü.\n\n"
+                        f"Queue ID: {item.get('id')}\n"
+                        f"Deneme: {attempts}\n"
+                        f"Hata: {str(e)[:500]}"
+                    )
+                else:
+                    redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+                    log("warning", "itemsatis_requeued_error", queue_id=item.get("id"), attempts=attempts, error=str(e))
+        except Exception as e:
+            log("error", "itemsatis_queue_worker_error", error=str(e))
+            send_telegram_error(f"Itemsatış queue worker kritik hata:\n{str(e)[:700]}")
+            await asyncio.sleep(max(5, QUEUE_WORKER_SLEEP_SEC))
 
 
 
@@ -2565,86 +2836,87 @@ def handle_panel_balance_command(text: str):
 
 
 def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="", timeout=30):
-    """Panel API çağrılarını tek yerden yapar.
-    balance/status/services gibi güvenli okuma çağrılarında kısa retry uygular.
-    add action otomatik retry yapmaz; çift sipariş riskini önler.
+    """Circuit Breaker + güvenli retry korumalı panel API çağrısı.
+
+    Kritik kural:
+    - add action otomatik retry yapmaz. Timeout/connection belirsizliğinde çift siparişi önler.
+    - balance/status/services gibi okuma işlemlerinde kısa güvenli retry devam eder.
+    - Webhook worker içinde circuit açık/bağlantı sorunu olursa sipariş failed'a düşmeden Redis queue'ya geri alınır.
     """
     if not api_url or not api_key:
         return {"error": "API URL veya API KEY eksik"}
-
+    panel_id = normalize_panel_key(panel_name or api_url or "unknown")
+    if is_panel_circuit_open(panel_id):
+        msg = f"Circuit Breaker aktif. {panel_id} geçici kapalı."
+        log("warning", "circuit_open_skip_request", panel=panel_id, action=action)
+        if _queue_context_active() and action in {"balance", "services"}:
+            raise CircuitOpenForOrder(panel_id, msg, retry_after=get_panel_circuit_retry_after(panel_id))
+        return {"error": msg, "circuit_open": True, "retryable": True}
     payload = {"key": api_key, "action": action}
     if extra_data:
         payload.update(extra_data)
-
     max_attempts = 1 if action == "add" else max(1, PANEL_SAFE_RETRY_COUNT)
     last_error = None
-
     for attempt in range(1, max_attempts + 1):
         started = time.perf_counter()
         try:
             r = requests.post(api_url, data=payload, headers=HEADERS, timeout=timeout)
             elapsed = time.perf_counter() - started
             level = "warning" if elapsed >= SLOW_API_THRESHOLD_SECONDS else "info"
-            log(
-                level,
-                "panel_api_performance",
-                panel=panel_name or api_url,
-                action=action,
-                duration=f"{elapsed:.2f}s",
-                status_code=r.status_code,
-                attempt=attempt,
-            )
-
-            # 5xx panel hatalarında güvenli okuma işlemlerini tekrar deneyebiliriz.
-            if action != "add" and r.status_code >= 500 and attempt < max_attempts:
+            log(level, "panel_api_performance", panel=panel_id, action=action, duration=f"{elapsed:.2f}s", status_code=r.status_code, attempt=attempt)
+            if r.status_code >= 500:
                 last_error = f"HTTP {r.status_code}"
-                time.sleep(PANEL_RETRY_SLEEP_SECONDS)
-                continue
-
+                record_panel_failure(panel_id, last_error)
+                if action != "add" and attempt < max_attempts:
+                    time.sleep(PANEL_RETRY_SLEEP_SECONDS)
+                    continue
+                if _queue_context_active() and action in {"balance", "services"}:
+                    raise CircuitOpenForOrder(panel_id, last_error, retry_after=QUEUE_RETRY_DELAY_SEC)
             try:
                 result = r.json()
             except Exception:
                 result = {"error": f"Panel {action} JSON cevap vermedi", "raw": r.text[:300]}
-
             if isinstance(result, dict):
                 result.setdefault("_duration", elapsed)
                 result.setdefault("_attempt", attempt)
+            if isinstance(result, dict) and "error" not in result:
+                record_panel_success(panel_id)
             return result
-
-        except requests.exceptions.Timeout as e:
+        except CircuitOpenForOrder:
+            raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             elapsed = time.perf_counter() - started
-            last_error = f"timeout: {e}"
-            log(
-                "warning",
-                "panel_api_timeout",
-                panel=panel_name or api_url,
-                action=action,
-                duration=f"{elapsed:.2f}s",
-                attempt=attempt,
-            )
+            last_error = f"{type(e).__name__}: {e}"
+            record_panel_failure(panel_id, last_error)
+            log("warning", "panel_api_connection_problem", panel=panel_id, action=action, duration=f"{elapsed:.2f}s", attempt=attempt, error=str(e))
             if action != "add" and attempt < max_attempts:
                 time.sleep(PANEL_RETRY_SLEEP_SECONDS)
                 continue
-            return {"error": last_error, "duration": elapsed, "attempt": attempt}
-
+            if _queue_context_active() and action in {"balance", "services"}:
+                raise CircuitOpenForOrder(panel_id, last_error, retry_after=get_panel_circuit_retry_after(panel_id))
+            return {"error": last_error, "duration": elapsed, "attempt": attempt, "retryable": action != "add", "manual_check_required": action == "add"}
+        except requests.exceptions.RequestException as e:
+            elapsed = time.perf_counter() - started
+            last_error = f"RequestException: {e}"
+            record_panel_failure(panel_id, last_error)
+            log("error", "panel_api_request_exception", panel=panel_id, action=action, duration=f"{elapsed:.2f}s", attempt=attempt, error=str(e))
+            if action != "add" and attempt < max_attempts:
+                time.sleep(PANEL_RETRY_SLEEP_SECONDS)
+                continue
+            if _queue_context_active() and action in {"balance", "services"}:
+                raise CircuitOpenForOrder(panel_id, last_error, retry_after=get_panel_circuit_retry_after(panel_id))
+            return {"error": last_error, "duration": elapsed, "attempt": attempt, "retryable": action != "add", "manual_check_required": action == "add"}
         except Exception as e:
             elapsed = time.perf_counter() - started
             last_error = str(e)
-            log(
-                "error",
-                "panel_api_error",
-                panel=panel_name or api_url,
-                action=action,
-                duration=f"{elapsed:.2f}s",
-                attempt=attempt,
-                error=str(e),
-            )
+            log("error", "panel_api_error", panel=panel_id, action=action, duration=f"{elapsed:.2f}s", attempt=attempt, error=str(e))
             if action != "add" and attempt < max_attempts:
                 time.sleep(PANEL_RETRY_SLEEP_SECONDS)
                 continue
             return {"error": str(e), "duration": elapsed, "attempt": attempt}
-
     return {"error": last_error or "Panel API isteği başarısız"}
+
+
 
 def panel_balance(api_url, api_key, panel_name=""):
     return _panel_api_request(api_url, api_key, "balance", panel_name=panel_name)
@@ -2793,6 +3065,10 @@ async def startup_event():
             log("info", "background_task_already_running", task=name)
             continue
         _BACKGROUND_TASKS[name] = asyncio.create_task(periodic_runner(name, interval, func, delay))
+
+
+    asyncio.create_task(itemsatis_queue_worker())
+    log("info", "background_itemsatis_queue_worker_started")
 
     log("info", "background_tasks_started", tasks=list(_BACKGROUND_TASKS.keys()))
 
@@ -6909,268 +7185,291 @@ def check_services():
     return {"ok": True, "changed_count": changed_count, "missing_count": missing_count}
 
 
+def process_itemsatis_webhook_payload(data: dict):
+    """Eski Itemsatış webhook işleme mantığı. Worker tarafından thread içinde çağrılır."""
+    QUEUE_CONTEXT.active = True
+    try:
+        log("info", "webhook_received", raw=str(data)[:200])
+
+        event = get_event(data)
+        order_id = get_order_id(data)
+        advert_id = get_advert_id(data)
+        product_name = get_product_name(data)
+        buyer = get_buyer(data)
+        price = get_order_price(data)
+
+        ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
+        if event in ignored_events:
+            log("info", "webhook_ignored", event=event)
+            return {"ignored": True, "event": event}
+
+        report_product_name = get_itemsatis_report_name(advert_id, product_name)
+
+        sale_recorded = record_itemsatis_sale(data=data, order_id=order_id, advert_id=advert_id, buyer=buyer,
+                              product_name=report_product_name, price=price)
+        if sale_recorded:
+            record_buyer_stats(buyer, price)
+            save_state()
+
+        log("info", "sale_received", order_id=order_id, product=report_product_name, buyer=buyer, price=price)
+
+        send_telegram(
+            f"Itemsatış webhook geldi.\n\nEvent: {event or 'Yok'}\nAdvert ID: {advert_id or 'Yok'}\n"
+            f"Ürün: {report_product_name}\nSipariş ID: {order_id}\nMüşteri: {buyer}\nTutar: {price:.2f} TL"
+        )
+
+        if advert_id == CS2_ADVERT_ID:
+            order_key = make_order_key(order_id, advert_id, buyer)
+            if order_key in PROCESSED_ORDERS:
+                return {"ignored": True, "reason": "duplicate_cs2_order"}
+            PROCESSED_ORDERS.add(order_key)
+            save_state()
+            send_telegram(f"Yeni CS2 5 yıllık hesap siparişi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\n\n{get_lzt_links()}")
+            return {"ok": True, "type": "cs2", "order_id": order_id}
+
+        all_packages = get_package_configs()
+        if advert_id in all_packages:
+            package = all_packages[advert_id]
+            package_name = get_package_display_name(advert_id, package, product_name)
+            package_platform = normalize_text(package.get("platform", "tiktok")) or "tiktok"
+            customer_link, detected_link_platform = find_package_order_link(data, package)
+
+            if not customer_link:
+                record_link_audit(order_id, advert_id, package_name, package_platform, "", "blocked", "Paket linki bulunamadı")
+                add_failed_order(order_id, advert_id, package_name, "Paket sipariş linki bulunamadı")
+                notify_customer_order_failed(order_id, package_name)
+                send_telegram(
+                    f"Paket sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nPaket: {package_name}\nPlatform: {package_platform}\nMüşteri: {buyer}\n\n"
+                    f"Bot hiçbir panel siparişi açmadı. Itemsatış müşteri bilgi alanında gerçek sosyal medya linki olduğundan emin ol."
+                )
+                return {"ok": False, "error": "package_link_not_found"}
+
+            log("info", "package_customer_link_detected", advert_id=advert_id, platform=detected_link_platform, link=customer_link)
+            record_link_audit(order_id, advert_id, package_name, detected_link_platform or package_platform, customer_link, "ok", "Paket linki yakalandı")
+
+
+            if is_blacklisted(customer_link) or is_blacklisted(buyer):
+                add_failed_order(order_id, advert_id, package_name, "Blacklist engeli", customer_link, link=customer_link)
+                send_telegram(f"Blacklisted paket sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}")
+                return {"ok": False, "error": "blacklisted"}
+
+            normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
+            duplicate_link_key = f"package:{advert_id}:{normalized_link}"
+            order_key = make_order_key(order_id, advert_id, buyer, customer_link, detected_link_platform or package_platform)
+
+            if order_key in PROCESSED_ORDERS:
+                return {"ignored": True, "reason": "duplicate_package_order"}
+            if duplicate_link_key in PROCESSED_LINKS:
+                return {"ignored": True, "reason": "duplicate_package_link"}
+
+            success_rows = []
+            failed_rows = []
+            components = package.get("components", []) or []
+
+            guard_services = []
+            for guard_component in components:
+                guard_component = normalize_package_component(guard_component)
+                if guard_component.get("active", True):
+                    guard_services.append(get_service_config(guard_component))
+            anti_loss = check_anti_loss_guardrail_for_services(guard_services, price, f"Paket: {package_name}")
+            if not anti_loss.get("ok"):
+                add_failed_order(order_id, advert_id, package_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel="package", retryable=False)
+                send_telegram(format_anti_loss_message("Dikkat: Zararına paket satış engellendi.", package_name, order_id, anti_loss))
+                return {"ok": False, "error": "anti_loss_guardrail", "type": "package_order", "guard": anti_loss}
+
+            for component in components:
+                component = normalize_package_component(component)
+                if not component.get("active", True):
+                    continue
+                component_name = component.get("name") or "Paket Bileşeni"
+                service = get_service_config(component)
+                component_label = f"{package_name} - {component_name}"
+
+                if not service.get("api_url") or not service.get("api_key"):
+                    failed_rows.append((component_name, service.get("panel", "Panel"), "Panel bilgileri eksik"))
+                    add_failed_order(order_id, advert_id, component_label, "Panel bilgileri eksik", service.get("panel_key", ""), link=customer_link, panel=service.get("panel", ""))
+                    continue
+
+                component_link = normalize_panel_link(customer_link, service.get("platform", detected_link_platform or package_platform))
+                smm_result = create_panel_order(
+                    service["api_url"],
+                    service["api_key"],
+                    service["service_id"],
+                    component_link,
+                    service["quantity"],
+                    service.get("panel", ""),
+                )
+
+                if "error" in smm_result:
+                    error_text = str(smm_result.get("error") or smm_result)
+                    failed_rows.append((component_name, service.get("panel", "Panel"), error_text))
+                    add_failed_order(order_id, advert_id, component_label, "Paket panel sipariş hatası", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""))
+                    continue
+
+                smm_order_id = smm_result.get("order", "Bilinmiyor")
+                add_pending_order(
+                    order_id,
+                    advert_id,
+                    component_label,
+                    service["panel"],
+                    service["api_url"],
+                    service["api_key"],
+                    smm_order_id,
+                    component_link,
+                    service_id=service.get("service_id", ""),
+                    quantity=service.get("quantity", ""),
+                    platform=service.get("platform", ""),
+                    panel_key=service.get("panel_key", ""),
+                    price=0,
+                )
+                success_rows.append((component_name, service.get("panel", "Panel"), smm_order_id))
+
+            if success_rows:
+                PROCESSED_LINKS.add(duplicate_link_key)
+                PROCESSED_ORDERS.add(order_key)
+                save_state()
+                notify_customer_order_started(order_id, package_name, customer_link)
+
+            success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id}" for name, panel, smm_id in success_rows]) or "Yok"
+            failed_text = "\n".join([f"❌ {name} | {panel} | {err}" for name, panel, err in failed_rows]) or "Yok"
+            send_telegram(
+                f"Paket sipariş işlendi.\n\nPaket: {package_name}\nItemsatış ID: {order_id}\nLink: {customer_link}\n\nBaşarılı:\n{success_text}\n\nHatalı:\n{failed_text}"
+            )
+
+            if not success_rows:
+                return {"ok": False, "type": "package_order", "error": "all_package_components_failed", "failed_count": len(failed_rows)}
+            return {"ok": True, "type": "package_order", "success_count": len(success_rows), "failed_count": len(failed_rows)}
+
+        all_services = get_all_services()
+        if advert_id in all_services:
+            service = get_service_config(all_services[advert_id])
+            service_name = get_itemsatis_report_name(advert_id, product_name)
+            platform = normalize_text(service.get("platform", "instagram"))
+            customer_link = find_order_link(data, platform)
+
+            if not customer_link:
+                record_link_audit(order_id, advert_id, service_name, platform, "", "blocked", "Sipariş linki bulunamadı")
+                add_failed_order(order_id, advert_id, service_name, "Sipariş linki bulunamadı")
+                notify_customer_order_failed(order_id, service_name)
+                send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
+                return {"ok": False, "error": "order_link_not_found"}
+
+            record_link_audit(order_id, advert_id, service_name, platform, customer_link, "ok", "Servis linki yakalandı")
+
+            if is_blacklisted(customer_link) or is_blacklisted(buyer):
+                add_failed_order(order_id, advert_id, service_name, "Blacklist engeli", customer_link, link=customer_link, panel=service.get("panel", ""))
+                send_telegram(
+                    f"Blacklisted sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}"
+                )
+                return {"ok": False, "error": "blacklisted"}
+
+            normalized_link = normalize_link_for_check(customer_link, platform)
+            duplicate_link_key = f"{advert_id}:{normalized_link}"
+            order_key = make_order_key(order_id, advert_id, buyer, customer_link, platform)
+
+            if order_key in PROCESSED_ORDERS:
+                return {"ignored": True, "reason": "duplicate_order"}
+
+            if duplicate_link_key in PROCESSED_LINKS:
+                return {"ignored": True, "reason": "duplicate_link"}
+
+            if not service.get("api_url") or not service.get("api_key"):
+                add_failed_order(order_id, advert_id, service_name, "Panel bilgileri eksik", service.get("panel_key", ""))
+                send_telegram(f"Panel bilgileri eksik.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPanel: {service['panel']}\n\nRender Environment ayarlarını kontrol et.")
+                return {"ok": False, "error": "panel_config_missing"}
+
+            anti_loss = check_anti_loss_guardrail_for_services([service], price, f"Itemsatış ilanı {advert_id}")
+            if not anti_loss.get("ok"):
+                add_failed_order(order_id, advert_id, service_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel=service.get("panel", ""), retryable=False)
+                send_telegram(format_anti_loss_message("Dikkat: Zararına satış engellendi.", service_name, order_id, anti_loss))
+                return {"ok": False, "error": "anti_loss_guardrail", "guard": anti_loss}
+
+            balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
+
+            if "error" in balance_data:
+                add_failed_order(order_id, advert_id, service_name, "Panel bakiyesi alınamadı", balance_data.get("error"))
+                notify_customer_order_failed(order_id, service_name)
+                send_telegram(f"Panel bakiyesi alınamadı.\n\nSipariş ID: {order_id}\nHata: {balance_data.get('error')}")
+                return {"ok": False, "error": "balance_failed"}
+
+            balance = balance_data.get("balance", "Bilinmiyor")
+            currency = balance_data.get("currency", "")
+            check_low_balance(balance, currency, service["panel"])
+
+            smm_result = create_panel_order(service["api_url"], service["api_key"],
+                                            service["service_id"], customer_link, service["quantity"], service.get("panel", ""))
+
+            if "error" in smm_result:
+                add_failed_order(order_id, advert_id, service_name, "Panel sipariş hatası", smm_result.get("error"))
+                notify_customer_order_failed(order_id, service_name)
+                send_telegram(f"Panel siparişi başarısız.\n\nSipariş ID: {order_id}\nHata: {smm_result.get('error')}")
+                return {"ok": False, "error": "panel_order_error"}
+
+            smm_order_id = smm_result.get("order", "Bilinmiyor")
+
+            PROCESSED_LINKS.add(duplicate_link_key)
+            PROCESSED_ORDERS.add(order_key)
+            add_pending_order(
+                order_id,
+                advert_id,
+                service_name,
+                service["panel"],
+                service["api_url"],
+                service["api_key"],
+                smm_order_id,
+                customer_link,
+                service_id=service.get("service_id", ""),
+                quantity=service.get("quantity", ""),
+                platform=service.get("platform", ""),
+                panel_key=service.get("panel_key", ""),
+                price=price,
+            )
+            save_state()
+
+            # YENİ: Müşteriye sipariş başladı bildirimi
+            notify_customer_order_started(order_id, service_name, customer_link)
+
+            send_telegram(
+                f"SMM siparişi panele girildi.\n\nÜrün: {service_name}\nPanel: {service['panel']}\n"
+                f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
+                f"Adet: {service['quantity']}\nBakiye: {format_tl_amount(convert_balance_to_try(balance, currency) or 0)}"
+            )
+
+            return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
+
+        log("info", "webhook_unmatched", advert_id=advert_id, product=product_name)
+        return {"ignored": True, "product": product_name, "advert_id": advert_id}
+
+    finally:
+        QUEUE_CONTEXT.active = False
+
+
 @app.post("/itemsatis-webhook")
 async def itemsatis_webhook(request: Request):
+    """Itemsatış webhook'u hızlıca alır ve Redis kuyruğuna yazar."""
     if not is_webhook_authorized(request):
-        log("warning", "webhook_unauthorized", ip=request.client.host if request.client else "")
+        log("warning", "webhook_unauthorized", ip=get_request_ip(request))
         raise HTTPException(status_code=401, detail="Unauthorized webhook")
-
     try:
         data = await request.json()
     except Exception:
         body = await request.body()
         data = {"raw_body": body.decode("utf-8", errors="ignore")}
-
-    log("info", "webhook_received", raw=str(data)[:200])
-
+    log("info", "webhook_received_queued", raw=str(data)[:200])
     event = get_event(data)
-    order_id = get_order_id(data)
-    advert_id = get_advert_id(data)
-    product_name = get_product_name(data)
-    buyer = get_buyer(data)
-    price = get_order_price(data)
-
     ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
     if event in ignored_events:
-        log("info", "webhook_ignored", event=event)
+        log("info", "webhook_ignored_before_queue", event=event)
         return {"ignored": True, "event": event}
-
-    report_product_name = get_itemsatis_report_name(advert_id, product_name)
-
-    sale_recorded = record_itemsatis_sale(data=data, order_id=order_id, advert_id=advert_id, buyer=buyer,
-                          product_name=report_product_name, price=price)
-    if sale_recorded:
-        record_buyer_stats(buyer, price)
-        save_state()
-
-    log("info", "sale_received", order_id=order_id, product=report_product_name, buyer=buyer, price=price)
-
-    send_telegram(
-        f"Itemsatış webhook geldi.\n\nEvent: {event or 'Yok'}\nAdvert ID: {advert_id or 'Yok'}\n"
-        f"Ürün: {report_product_name}\nSipariş ID: {order_id}\nMüşteri: {buyer}\nTutar: {price:.2f} TL"
-    )
-
-    if advert_id == CS2_ADVERT_ID:
-        order_key = make_order_key(order_id, advert_id, buyer)
-        if order_key in PROCESSED_ORDERS:
-            return {"ignored": True, "reason": "duplicate_cs2_order"}
-        PROCESSED_ORDERS.add(order_key)
-        save_state()
-        send_telegram(f"Yeni CS2 5 yıllık hesap siparişi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\n\n{get_lzt_links()}")
-        return {"ok": True, "type": "cs2", "order_id": order_id}
-
-    all_packages = get_package_configs()
-    if advert_id in all_packages:
-        package = all_packages[advert_id]
-        package_name = get_package_display_name(advert_id, package, product_name)
-        package_platform = normalize_text(package.get("platform", "tiktok")) or "tiktok"
-        customer_link, detected_link_platform = find_package_order_link(data, package)
-
-        if not customer_link:
-            record_link_audit(order_id, advert_id, package_name, package_platform, "", "blocked", "Paket linki bulunamadı")
-            add_failed_order(order_id, advert_id, package_name, "Paket sipariş linki bulunamadı")
-            notify_customer_order_failed(order_id, package_name)
-            send_telegram(
-                f"Paket sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nPaket: {package_name}\nPlatform: {package_platform}\nMüşteri: {buyer}\n\n"
-                f"Bot hiçbir panel siparişi açmadı. Itemsatış müşteri bilgi alanında gerçek sosyal medya linki olduğundan emin ol."
-            )
-            return {"ok": False, "error": "package_link_not_found"}
-
-        log("info", "package_customer_link_detected", advert_id=advert_id, platform=detected_link_platform, link=customer_link)
-        record_link_audit(order_id, advert_id, package_name, detected_link_platform or package_platform, customer_link, "ok", "Paket linki yakalandı")
-
-
-        if is_blacklisted(customer_link) or is_blacklisted(buyer):
-            add_failed_order(order_id, advert_id, package_name, "Blacklist engeli", customer_link, link=customer_link)
-            send_telegram(f"Blacklisted paket sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}")
-            return {"ok": False, "error": "blacklisted"}
-
-        normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
-        duplicate_link_key = f"package:{advert_id}:{normalized_link}"
-        order_key = make_order_key(order_id, advert_id, buyer, customer_link, detected_link_platform or package_platform)
-
-        if order_key in PROCESSED_ORDERS:
-            return {"ignored": True, "reason": "duplicate_package_order"}
-        if duplicate_link_key in PROCESSED_LINKS:
-            return {"ignored": True, "reason": "duplicate_package_link"}
-
-        success_rows = []
-        failed_rows = []
-        components = package.get("components", []) or []
-
-        guard_services = []
-        for guard_component in components:
-            guard_component = normalize_package_component(guard_component)
-            if guard_component.get("active", True):
-                guard_services.append(get_service_config(guard_component))
-        anti_loss = check_anti_loss_guardrail_for_services(guard_services, price, f"Paket: {package_name}")
-        if not anti_loss.get("ok"):
-            add_failed_order(order_id, advert_id, package_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel="package", retryable=False)
-            send_telegram(format_anti_loss_message("Dikkat: Zararına paket satış engellendi.", package_name, order_id, anti_loss))
-            return {"ok": False, "error": "anti_loss_guardrail", "type": "package_order", "guard": anti_loss}
-
-        for component in components:
-            component = normalize_package_component(component)
-            if not component.get("active", True):
-                continue
-            component_name = component.get("name") or "Paket Bileşeni"
-            service = get_service_config(component)
-            component_label = f"{package_name} - {component_name}"
-
-            if not service.get("api_url") or not service.get("api_key"):
-                failed_rows.append((component_name, service.get("panel", "Panel"), "Panel bilgileri eksik"))
-                add_failed_order(order_id, advert_id, component_label, "Panel bilgileri eksik", service.get("panel_key", ""), link=customer_link, panel=service.get("panel", ""))
-                continue
-
-            component_link = normalize_panel_link(customer_link, service.get("platform", detected_link_platform or package_platform))
-            smm_result = create_panel_order(
-                service["api_url"],
-                service["api_key"],
-                service["service_id"],
-                component_link,
-                service["quantity"],
-                service.get("panel", ""),
-            )
-
-            if "error" in smm_result:
-                error_text = str(smm_result.get("error") or smm_result)
-                failed_rows.append((component_name, service.get("panel", "Panel"), error_text))
-                add_failed_order(order_id, advert_id, component_label, "Paket panel sipariş hatası", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""))
-                continue
-
-            smm_order_id = smm_result.get("order", "Bilinmiyor")
-            add_pending_order(
-                order_id,
-                advert_id,
-                component_label,
-                service["panel"],
-                service["api_url"],
-                service["api_key"],
-                smm_order_id,
-                component_link,
-                service_id=service.get("service_id", ""),
-                quantity=service.get("quantity", ""),
-                platform=service.get("platform", ""),
-                panel_key=service.get("panel_key", ""),
-                price=0,
-            )
-            success_rows.append((component_name, service.get("panel", "Panel"), smm_order_id))
-
-        if success_rows:
-            PROCESSED_LINKS.add(duplicate_link_key)
-            PROCESSED_ORDERS.add(order_key)
-            save_state()
-            notify_customer_order_started(order_id, package_name, customer_link)
-
-        success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id}" for name, panel, smm_id in success_rows]) or "Yok"
-        failed_text = "\n".join([f"❌ {name} | {panel} | {err}" for name, panel, err in failed_rows]) or "Yok"
-        send_telegram(
-            f"Paket sipariş işlendi.\n\nPaket: {package_name}\nItemsatış ID: {order_id}\nLink: {customer_link}\n\nBaşarılı:\n{success_text}\n\nHatalı:\n{failed_text}"
-        )
-
-        if not success_rows:
-            return {"ok": False, "type": "package_order", "error": "all_package_components_failed", "failed_count": len(failed_rows)}
-        return {"ok": True, "type": "package_order", "success_count": len(success_rows), "failed_count": len(failed_rows)}
-
-    all_services = get_all_services()
-    if advert_id in all_services:
-        service = get_service_config(all_services[advert_id])
-        service_name = get_itemsatis_report_name(advert_id, product_name)
-        platform = normalize_text(service.get("platform", "instagram"))
-        customer_link = find_order_link(data, platform)
-
-        if not customer_link:
-            record_link_audit(order_id, advert_id, service_name, platform, "", "blocked", "Sipariş linki bulunamadı")
-            add_failed_order(order_id, advert_id, service_name, "Sipariş linki bulunamadı")
-            notify_customer_order_failed(order_id, service_name)
-            send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
-            return {"ok": False, "error": "order_link_not_found"}
-
-        record_link_audit(order_id, advert_id, service_name, platform, customer_link, "ok", "Servis linki yakalandı")
-
-        if is_blacklisted(customer_link) or is_blacklisted(buyer):
-            add_failed_order(order_id, advert_id, service_name, "Blacklist engeli", customer_link, link=customer_link, panel=service.get("panel", ""))
-            send_telegram(
-                f"Blacklisted sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}"
-            )
-            return {"ok": False, "error": "blacklisted"}
-
-        normalized_link = normalize_link_for_check(customer_link, platform)
-        duplicate_link_key = f"{advert_id}:{normalized_link}"
-        order_key = make_order_key(order_id, advert_id, buyer, customer_link, platform)
-
-        if order_key in PROCESSED_ORDERS:
-            return {"ignored": True, "reason": "duplicate_order"}
-
-        if duplicate_link_key in PROCESSED_LINKS:
-            return {"ignored": True, "reason": "duplicate_link"}
-
-        if not service.get("api_url") or not service.get("api_key"):
-            add_failed_order(order_id, advert_id, service_name, "Panel bilgileri eksik", service.get("panel_key", ""))
-            send_telegram(f"Panel bilgileri eksik.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPanel: {service['panel']}\n\nRender Environment ayarlarını kontrol et.")
-            return {"ok": False, "error": "panel_config_missing"}
-
-        anti_loss = check_anti_loss_guardrail_for_services([service], price, f"Itemsatış ilanı {advert_id}")
-        if not anti_loss.get("ok"):
-            add_failed_order(order_id, advert_id, service_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel=service.get("panel", ""), retryable=False)
-            send_telegram(format_anti_loss_message("Dikkat: Zararına satış engellendi.", service_name, order_id, anti_loss))
-            return {"ok": False, "error": "anti_loss_guardrail", "guard": anti_loss}
-
-        balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
-
-        if "error" in balance_data:
-            add_failed_order(order_id, advert_id, service_name, "Panel bakiyesi alınamadı", balance_data.get("error"))
-            notify_customer_order_failed(order_id, service_name)
-            send_telegram(f"Panel bakiyesi alınamadı.\n\nSipariş ID: {order_id}\nHata: {balance_data.get('error')}")
-            return {"ok": False, "error": "balance_failed"}
-
-        balance = balance_data.get("balance", "Bilinmiyor")
-        currency = balance_data.get("currency", "")
-        check_low_balance(balance, currency, service["panel"])
-
-        smm_result = create_panel_order(service["api_url"], service["api_key"],
-                                        service["service_id"], customer_link, service["quantity"], service.get("panel", ""))
-
-        if "error" in smm_result:
-            add_failed_order(order_id, advert_id, service_name, "Panel sipariş hatası", smm_result.get("error"))
-            notify_customer_order_failed(order_id, service_name)
-            send_telegram(f"Panel siparişi başarısız.\n\nSipariş ID: {order_id}\nHata: {smm_result.get('error')}")
-            return {"ok": False, "error": "panel_order_error"}
-
-        smm_order_id = smm_result.get("order", "Bilinmiyor")
-
-        PROCESSED_LINKS.add(duplicate_link_key)
-        PROCESSED_ORDERS.add(order_key)
-        add_pending_order(
-            order_id,
-            advert_id,
-            service_name,
-            service["panel"],
-            service["api_url"],
-            service["api_key"],
-            smm_order_id,
-            customer_link,
-            service_id=service.get("service_id", ""),
-            quantity=service.get("quantity", ""),
-            platform=service.get("platform", ""),
-            panel_key=service.get("panel_key", ""),
-            price=price,
-        )
-        save_state()
-
-        # YENİ: Müşteriye sipariş başladı bildirimi
-        notify_customer_order_started(order_id, service_name, customer_link)
-
-        send_telegram(
-            f"SMM siparişi panele girildi.\n\nÜrün: {service_name}\nPanel: {service['panel']}\n"
-            f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
-            f"Adet: {service['quantity']}\nBakiye: {format_tl_amount(convert_balance_to_try(balance, currency) or 0)}"
-        )
-
-        return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
-
-    log("info", "webhook_unmatched", advert_id=advert_id, product=product_name)
-    return {"ignored": True, "product": product_name, "advert_id": advert_id}
+    order_id = get_order_id(data)
+    if order_id and str(order_id) != "Bilinmiyor":
+        seen_key = f"itemsatis:webhook_seen:{order_id}"
+        seen = redis_set_raw(seen_key, "1", ex=86400, nx=True)
+        if isinstance(seen, dict) and seen.get("result") is None:
+            log("warning", "webhook_duplicate_seen_before_queue", order_id=order_id)
+            return {"ok": True, "status": "already_queued", "order_id": order_id}
+    queue_id = enqueue_itemsatis_webhook(data)
+    return {"ok": True, "status": "queued", "queue_id": queue_id}
 
 
 @app.post("/telegram-webhook")
