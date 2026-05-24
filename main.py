@@ -605,6 +605,13 @@ def redis_lrange_raw(key: str, start: int = 0, end: int = -1):
     return result if isinstance(result, list) else []
 
 
+def redis_llen(key: str) -> int:
+    try:
+        return int(redis_command_result(["LLEN", key], 0) or 0)
+    except Exception:
+        return 0
+
+
 def redis_rpoplpush_raw(src_key: str, dst_key: str):
     return redis_command_result(["RPOPLPUSH", src_key, dst_key], None)
 
@@ -813,6 +820,134 @@ async def itemsatis_queue_worker():
             log("error", "itemsatis_queue_worker_error", error=str(e))
             send_telegram_error(f"Itemsatış queue worker kritik hata:\n{str(e)[:700]}")
             await asyncio.sleep(max(5, QUEUE_WORKER_SLEEP_SEC))
+
+
+
+
+def read_queue_items(key: str, limit: int = 100) -> list:
+    """Redis queue/list içeriğini admin ve API için güvenli şekilde okur."""
+    rows = []
+    raw_items = redis_lrange_raw(key, 0, max(0, int(limit or 100) - 1))
+    for raw in raw_items:
+        try:
+            item = json.loads(raw)
+        except Exception:
+            item = {"id": "", "raw": str(raw)[:1000]}
+        if isinstance(item, dict):
+            item["_raw"] = raw
+            rows.append(item)
+    return rows
+
+
+def build_queue_status() -> dict:
+    """Itemsatış webhook queue derinliği ve circuit durumlarını döndürür."""
+    circuits = []
+    now_ts = int(time.time())
+
+    for panel_key in PANEL_MAP.keys():
+        panel_id = normalize_panel_key(panel_key)
+        opened_until_raw = redis_get_raw(circuit_open_until_key(panel_id), "0") or "0"
+        failures_raw = redis_get_raw(circuit_failures_key(panel_id), "0") or "0"
+
+        try:
+            opened_until = int(opened_until_raw or 0)
+        except Exception:
+            opened_until = 0
+
+        try:
+            failures = int(failures_raw or 0)
+        except Exception:
+            failures = 0
+
+        circuits.append({
+            "panel": panel_id,
+            "open": opened_until > now_ts,
+            "failures": failures,
+            "opened_until": opened_until,
+            "retry_after": max(0, opened_until - now_ts),
+        })
+
+    latest_waiting = read_queue_items(ITEMSATIS_WEBHOOK_QUEUE_KEY, 5)
+    latest_processing = read_queue_items(ITEMSATIS_WEBHOOK_PROCESSING_KEY, 5)
+    latest_dead = read_queue_items(ITEMSATIS_WEBHOOK_DEAD_KEY, 5)
+
+    return {
+        "ok": True,
+        "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "queue": {
+            "waiting": redis_llen(ITEMSATIS_WEBHOOK_QUEUE_KEY),
+            "processing": redis_llen(ITEMSATIS_WEBHOOK_PROCESSING_KEY),
+            "dead": redis_llen(ITEMSATIS_WEBHOOK_DEAD_KEY),
+        },
+        "latest": {
+            "waiting": [
+                {
+                    "id": item.get("id", ""),
+                    "created_at": item.get("created_at", ""),
+                    "attempts": item.get("attempts", 0),
+                    "not_before": item.get("not_before", 0),
+                    "last_error": item.get("last_error", ""),
+                    "order_id": get_order_id(item.get("payload", {}) if isinstance(item.get("payload"), dict) else item),
+                }
+                for item in latest_waiting
+            ],
+            "processing": [
+                {
+                    "id": item.get("id", ""),
+                    "created_at": item.get("created_at", ""),
+                    "attempts": item.get("attempts", 0),
+                    "processing_started_at": item.get("processing_started_at", ""),
+                    "last_error": item.get("last_error", ""),
+                    "order_id": get_order_id(item.get("payload", {}) if isinstance(item.get("payload"), dict) else item),
+                }
+                for item in latest_processing
+            ],
+            "dead": [
+                {
+                    "id": item.get("id", ""),
+                    "created_at": item.get("created_at", ""),
+                    "attempts": item.get("attempts", 0),
+                    "dead_reason": item.get("dead_reason", ""),
+                    "order_id": get_order_id(item.get("payload", {}) if isinstance(item.get("payload"), dict) else item),
+                }
+                for item in latest_dead
+            ],
+        },
+        "circuits": circuits,
+    }
+
+
+def retry_dead_queue_item(queue_id: str = "", retry_all: bool = False) -> int:
+    """Dead queue'dan seçili veya tüm işleri ana kuyruğa geri alır."""
+    queue_id = str(queue_id or "").strip()
+    moved = 0
+    raw_items = redis_lrange_raw(ITEMSATIS_WEBHOOK_DEAD_KEY, 0, -1)
+
+    for raw in raw_items:
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+
+        item_id = str(item.get("id", "")).strip()
+        if not retry_all and queue_id and item_id != queue_id:
+            continue
+        if not retry_all and not queue_id:
+            continue
+
+        redis_lrem_value(ITEMSATIS_WEBHOOK_DEAD_KEY, raw)
+        item["attempts"] = 0
+        item["not_before"] = 0
+        item["last_error"] = f"Admin tarafından dead queue'dan tekrar kuyruğa alındı: {now_tr().strftime('%Y-%m-%d %H:%M:%S')}"
+        item.pop("dead_at", None)
+        item.pop("dead_reason", None)
+        redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+        moved += 1
+
+    if moved:
+        log("warning", "dead_queue_requeued_by_admin", queue_id=queue_id, retry_all=retry_all, moved=moved)
+
+    return moved
 
 
 
@@ -1199,6 +1334,7 @@ def add_daily_stat(product_name: str, price: float = 0):
 
 
 def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price, link="") -> bool:
+    """Itemsatış satışını belleğe işler; kalıcı kayıt caller tarafından tek save_state ile yapılır."""
     global RECORDED_SALES
     sale_key = make_sale_key(data, order_id, advert_id, buyer, product_name, price, link)
     with STATE_LOCK:
@@ -1206,7 +1342,6 @@ def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price,
             return False
         add_daily_stat(product_name, price)
         RECORDED_SALES.add(sale_key)
-        save_state()
     return True
 
 
@@ -2393,7 +2528,7 @@ def parse_numeric_balance(value) -> float | None:
             text = text.replace(".", "").replace(",", ".")
         else:
             text = text.replace(",", ".")
-        text = re.sub(r"[^0-9.-]", "", text)
+        text = re.sub(r"[^0-9.]", "", text)
         if not text:
             return None
         return float(text)
@@ -3067,8 +3202,19 @@ async def startup_event():
         _BACKGROUND_TASKS[name] = asyncio.create_task(periodic_runner(name, interval, func, delay))
 
 
-    asyncio.create_task(itemsatis_queue_worker())
-    log("info", "background_itemsatis_queue_worker_started")
+    existing_queue_worker = _BACKGROUND_TASKS.get("itemsatis_queue_worker")
+    if existing_queue_worker and not existing_queue_worker.done():
+        log("info", "background_task_already_running", task="itemsatis_queue_worker")
+    else:
+        _BACKGROUND_TASKS["itemsatis_queue_worker"] = asyncio.create_task(itemsatis_queue_worker())
+        log("info", "background_itemsatis_queue_worker_started")
+
+    try:
+        startup_check = build_system_check()
+        if startup_check.get("duplicate_routes"):
+            log("error", "duplicate_routes_detected_on_startup", duplicate_routes=startup_check.get("duplicate_routes"))
+    except Exception as e:
+        log("warning", "startup_system_check_failed", error=str(e))
 
     log("info", "background_tasks_started", tasks=list(_BACKGROUND_TASKS.keys()))
 
@@ -6489,6 +6635,130 @@ def api_order_notes(user: str = Depends(get_current_admin)):
     return {"items": ORDER_NOTES or {}}
 
 
+
+QUEUE_DEAD_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boostera Dead Queue</title>
+<style>
+body{margin:0;background:#070814;color:#f1f5f9;font-family:Arial,sans-serif}
+.wrap{width:min(1400px,calc(100% - 32px));margin:20px auto}
+.card{background:#111827;border:1px solid rgba(148,163,184,.18);border-radius:18px;padding:18px;margin-bottom:14px}
+a{color:#c4b5fd;text-decoration:none}
+.btn{border:0;border-radius:10px;padding:9px 12px;font-weight:800;cursor:pointer;background:#8b5cf6;color:white}
+.btn.red{background:#dc2626}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th,td{border-bottom:1px solid rgba(148,163,184,.14);padding:10px;text-align:left;vertical-align:top}
+th{color:#94a3b8;font-size:12px;text-transform:uppercase}
+pre{white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;background:#0b1020;border-radius:12px;padding:10px;color:#cbd5e1}
+.small{color:#94a3b8;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.stat{background:#0b1020;border-radius:14px;padding:14px}
+.stat b{font-size:24px;display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Boostera Dead Queue</h1>
+    <p class="small">Buraya düşen webhooklar otomatik işlenememiştir. Kontrol edip tekrar kuyruğa alabilirsin.</p>
+    <p><a href="/admin">← Admin panele dön</a></p>
+  </div>
+
+  <div class="card grid">
+    <div class="stat"><span class="small">Bekleyen</span><b>{{ status.queue.waiting }}</b></div>
+    <div class="stat"><span class="small">İşlenen</span><b>{{ status.queue.processing }}</b></div>
+    <div class="stat"><span class="small">Dead</span><b>{{ status.queue.dead }}</b></div>
+  </div>
+
+  <div class="card">
+    <form method="post" action="/admin/queue-dead/retry" onsubmit="return confirm('Tüm dead queue tekrar kuyruğa alınsın mı?')">
+      <input type="hidden" name="retry_all" value="1">
+      <button class="btn red" type="submit">Tüm Dead Queue'yu Tekrar Dene</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Dead kayıtlar</h2>
+    {% if rows %}
+    <table>
+      <thead>
+        <tr>
+          <th>Queue ID</th>
+          <th>Order ID</th>
+          <th>Deneme</th>
+          <th>Sebep</th>
+          <th>Payload</th>
+          <th>İşlem</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in rows %}
+        <tr>
+          <td>{{ row.id | e }}</td>
+          <td>{{ row.order_id | e }}</td>
+          <td>{{ row.attempts }}</td>
+          <td>{{ row.dead_reason | e }}</td>
+          <td><pre>{{ row.payload_preview | e }}</pre></td>
+          <td>
+            <form method="post" action="/admin/queue-dead/retry">
+              <input type="hidden" name="queue_id" value="{{ row.id | e }}">
+              <button class="btn" type="submit">Tekrar Kuyruğa Al</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="small">Dead queue boş.</p>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/queue-dead", response_class=HTMLResponse)
+def admin_queue_dead(user: str = Depends(get_current_admin)):
+    raw_rows = read_queue_items(ITEMSATIS_WEBHOOK_DEAD_KEY, 100)
+    rows = []
+    for item in raw_rows:
+        payload = item.get("payload", {}) if isinstance(item, dict) else {}
+        rows.append({
+            "id": item.get("id", ""),
+            "order_id": get_order_id(payload if isinstance(payload, dict) else item),
+            "attempts": item.get("attempts", 0),
+            "dead_reason": item.get("dead_reason", item.get("last_error", "")),
+            "payload_preview": json.dumps(payload or item, ensure_ascii=False, indent=2, default=str)[:3000],
+        })
+    return HTMLResponse(Template(QUEUE_DEAD_HTML).render(rows=rows, status=build_queue_status()))
+
+
+@app.post("/admin/queue-dead/retry")
+def admin_queue_dead_retry(
+    queue_id: str = Form(""),
+    retry_all: str = Form(""),
+    user: str = Depends(get_current_admin),
+):
+    moved = retry_dead_queue_item(queue_id=queue_id, retry_all=bool(retry_all))
+    send_telegram_alert(
+        f"Dead queue yeniden deneme işlemi yapıldı.\n\n"
+        f"Taşınan kayıt: {moved}\n"
+        f"Queue ID: {queue_id or 'Tümü'}"
+    )
+    return RedirectResponse("/admin/queue-dead", status_code=303)
+
+
+@app.get("/api/queue-status")
+def api_queue_status(user: str = Depends(get_current_admin)):
+    return build_queue_status()
+
+
 def build_system_check() -> dict:
     """Genel bot check-up: deploy kıran ve operasyonel riskleri tek yerde özetler."""
     missing_env = validate_environment()
@@ -6537,6 +6807,7 @@ def build_system_check() -> dict:
             "last_warn": BALANCE_WARN_LAST,
         },
         "background_tasks": background,
+        "queue_status": build_queue_status(),
         "telegram": {
             "main_configured": bool(BOT_TOKEN and CHAT_ID),
             "alerts_configured": bool(BOT_TOKEN and CHAT_ID_ALERTS),
@@ -7034,7 +7305,7 @@ def normalize_panel_rate(value) -> str:
             text = text.replace(".", "").replace(",", ".")
         else:
             text = text.replace(",", ".")
-        text = re.sub(r"[^0-9.-]", "", text)
+        text = re.sub(r"[^0-9.]", "", text)
         if not text:
             return ""
         return f"{float(text):.6f}".rstrip("0").rstrip(".")
