@@ -10,6 +10,7 @@ import asyncio
 import secrets
 import threading
 import requests
+from collections import defaultdict
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -53,9 +54,13 @@ if os.path.isdir("static"):
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
+CHAT_ID_ERRORS = os.getenv("CHAT_ID_ERRORS", "") or CHAT_ID
+CHAT_ID_SALES = os.getenv("CHAT_ID_SALES", "") or CHAT_ID
+CHAT_ID_ALERTS = os.getenv("CHAT_ID_ALERTS", "") or CHAT_ID
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
+WEBHOOK_IP_WHITELIST = [ip.strip() for ip in os.getenv("WEBHOOK_IP_WHITELIST", "").split(",") if ip.strip()]
 STATE_LOCK = threading.RLock()
 
 
@@ -199,6 +204,9 @@ LINK_AUDIT_HISTORY = []
 
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
 LOG_HISTORY = []
+_RATE_LIMIT_STORE = defaultdict(list)
+MESSAGE_TEMPLATES = {}
+BALANCE_WARN_LAST = {}
 MAX_LOG_HISTORY = 200
 LOG_FLUSH_INTERVAL_SECONDS = int(os.getenv("LOG_FLUSH_INTERVAL_SECONDS", "30"))
 _LOG_DIRTY = False
@@ -217,6 +225,24 @@ PANEL_RETRY_SLEEP_SECONDS = float(os.getenv("PANEL_RETRY_SLEEP_SECONDS", "1"))
 USD_TO_TRY_RATE = float(os.getenv("USD_TO_TRY_RATE", "46"))
 USD_TO_TRY_CACHE = {"rate": USD_TO_TRY_RATE, "updated_at": 0}
 USD_TO_TRY_REFRESH_SECONDS = int(os.getenv("USD_TO_TRY_REFRESH_SECONDS", "21600"))
+
+# Anti-loss ve toplu retry ayarları
+ANTI_LOSS_ENABLED = os.getenv("ANTI_LOSS_ENABLED", "true").lower() == "true"
+ANTI_LOSS_MIN_PROFIT_TL = float(os.getenv("ANTI_LOSS_MIN_PROFIT_TL", "0"))
+BULK_RETRY_MAX = int(os.getenv("BULK_RETRY_MAX", "30"))
+BULK_RETRY_DELAY_SECONDS = float(os.getenv("BULK_RETRY_DELAY_SECONDS", "2"))
+BALANCE_WARN_REPEAT_MINUTES = int(os.getenv("BALANCE_WARN_REPEAT_MINUTES", "60"))
+VIP_ORDER_THRESHOLD = int(os.getenv("VIP_ORDER_THRESHOLD", "5"))
+BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "true").lower() == "true"
+BLACKLIST_AUTO_FAIL_COUNT = int(os.getenv("BLACKLIST_AUTO_FAIL_COUNT", "2"))
+BULK_RETRY_RUNNING = False
+_BULK_RETRY_LOCK = threading.Lock()
+_BACKGROUND_TASKS = {}
+PANEL_STATS = {}
+BUYER_STATS = {}
+ORDER_NOTES = {}
+COMPLAINT_LOG = []
+LINK_FAIL_COUNT = {}
 
 
 
@@ -241,13 +267,43 @@ def validate_environment():
     return missing
 
 
+def get_request_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def check_rate_limit(ip: str, limit: int = 60, window: int = 60) -> bool:
+    """Basit bellek içi rate-limit. Render tek worker kullanımında yeterlidir."""
+    if not ip:
+        return True
+    now_ts = time.time()
+    cutoff = now_ts - window
+    with STATE_LOCK:
+        recent = [t for t in _RATE_LIMIT_STORE[ip] if t > cutoff]
+        _RATE_LIMIT_STORE[ip] = recent
+        if len(recent) >= limit:
+            return False
+        _RATE_LIMIT_STORE[ip].append(now_ts)
+        return True
+
+
 def is_webhook_authorized(request: Request) -> bool:
-    """Opsiyonel webhook token kontrolü.
-    WEBHOOK_SECRET_TOKEN boşsa eski sistem gibi herkese açık kalır.
-    Token ayarlanırsa Itemsatış webhook URL'sine ?token=... ekleyebilir veya X-Webhook-Token header kullanabilirsin.
-    """
+    """Webhook güvenliği: opsiyonel IP whitelist + opsiyonel token + basit rate limit."""
+    client_ip = get_request_ip(request)
+
+    if WEBHOOK_IP_WHITELIST and client_ip not in WEBHOOK_IP_WHITELIST:
+        log("warning", "webhook_ip_blocked", ip=client_ip)
+        return False
+
+    if not check_rate_limit(client_ip, limit=120, window=60):
+        log("warning", "webhook_rate_limited", ip=client_ip)
+        return False
+
     if not WEBHOOK_SECRET_TOKEN:
         return True
+
     provided = (
         request.headers.get("X-Webhook-Token")
         or request.headers.get("X-Boostera-Token")
@@ -301,24 +357,41 @@ def log(level: str, event: str, **kwargs):
 
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-def send_telegram(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        log("warning", "telegram_skip", reason="BOT_TOKEN veya CHAT_ID eksik")
+def _send_telegram_to(text: str, chat_id: str, channel: str = "default"):
+    """Telegram mesajı gönderir. parse_mode kullanmaz; < > karakterleri mesajı bozmaz."""
+    if not BOT_TOKEN or not chat_id:
+        log("warning", "telegram_skip", reason="BOT_TOKEN veya chat_id eksik", channel=channel)
         return
 
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={
-                "chat_id": CHAT_ID,
+                "chat_id": chat_id,
                 "text": text,
                 "disable_web_page_preview": True,
             },
             timeout=30,
         )
-        log("info", "telegram_sent", status=r.status_code)
+        log("info", "telegram_sent", status=r.status_code, channel=channel)
     except Exception as e:
-        log("error", "telegram_error", error=str(e))
+        log("error", "telegram_error", error=str(e), channel=channel)
+
+
+def send_telegram(text: str):
+    _send_telegram_to(text, CHAT_ID, "main")
+
+
+def send_telegram_error(text: str):
+    _send_telegram_to(text, CHAT_ID_ERRORS, "errors")
+
+
+def send_telegram_sale(text: str):
+    _send_telegram_to(text, CHAT_ID_SALES, "sales")
+
+
+def send_telegram_alert(text: str):
+    _send_telegram_to(text, CHAT_ID_ALERTS, "alerts")
 
 
 # ─── YENİ: MÜŞTERİ BİLDİRİM SİSTEMİ ─────────────────────────────────────────
@@ -362,35 +435,47 @@ def send_itemsatis_message(order_id: str, message: str) -> bool:
         return False
 
 
+DEFAULT_MESSAGE_TEMPLATES = {
+    "started": (
+        "Merhaba! '{product}' siparişiniz alındı ve işleme girdi.\n\n"
+        "Hesabınız: {link}\n\n"
+        "Siparişiniz genellikle 0-24 saat içinde tamamlanmaya başlar. Teşekkürler."
+    ),
+    "completed": (
+        "Merhaba! '{product}' siparişiniz tamamlandı! 🎉\n\n"
+        "Hesabınız: {link}\n\n"
+        "Memnun kaldıysanız değerlendirme bırakırsanız çok seviniriz. Tekrar alışveriş için görüşmek üzere."
+    ),
+    "failed": (
+        "Merhaba! '{product}' siparişinizde teknik bir sorun yaşandı. "
+        "En kısa sürede çözüp siparişinizi işleme alacağız. Rahatsızlık için özür dileriz."
+    ),
+}
+
+
+def render_customer_template(key: str, **kwargs) -> str:
+    template = str(MESSAGE_TEMPLATES.get(key) or DEFAULT_MESSAGE_TEMPLATES.get(key) or "")
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return DEFAULT_MESSAGE_TEMPLATES.get(key, "").format(**kwargs)
+
+
 def notify_customer_order_started(order_id: str, product_name: str, link: str):
     """Sipariş panele girilince müşteriye bildirim gönder."""
-    message = (
-        f"Merhaba! '{product_name}' siparişiniz alındı ve işleme girdi.\n\n"
-        f"Hesabınız: {link}\n\n"
-        f"Siparişiniz genellikle 0-24 saat içinde tamamlanmaya başlar. "
-        f"Herhangi bir sorun olursa bize ulaşabilirsiniz. Teşekkürler."
-    )
+    message = render_customer_template("started", product=product_name, link=link, order_id=order_id)
     return send_itemsatis_message(order_id, message)
 
 
 def notify_customer_order_completed(order_id: str, product_name: str, link: str):
     """Sipariş tamamlanınca müşteriye bildirim gönder."""
-    message = (
-        f"Merhaba! '{product_name}' siparişiniz tamamlandı! 🎉\n\n"
-        f"Hesabınız: {link}\n\n"
-        f"Memnun kaldıysanız değerlendirme bırakırsanız çok seviniriz. "
-        f"Tekrar alışveriş için görüşmek üzere."
-    )
+    message = render_customer_template("completed", product=product_name, link=link, order_id=order_id)
     return send_itemsatis_message(order_id, message)
 
 
 def notify_customer_order_failed(order_id: str, product_name: str):
     """Sipariş başarısız olunca müşteriye bildirim gönder."""
-    message = (
-        f"Merhaba! '{product_name}' siparişinizde teknik bir sorun yaşandı. "
-        f"En kısa sürede çözüp siparişinizi işleme alacağız. "
-        f"Rahatsızlık için özür dileriz."
-    )
+    message = render_customer_template("failed", product=product_name, link="", order_id=order_id)
     return send_itemsatis_message(order_id, message)
 
 
@@ -493,7 +578,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, PANEL_STATS, BUYER_STATS, ORDER_NOTES, COMPLAINT_LOG, LINK_FAIL_COUNT
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -519,6 +604,13 @@ def load_state():
     FAVORITE_SERVICES = redis_get_json("favorite_services", {})
     BALANCE_HISTORY = redis_get_json("balance_history", {})
     LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
+    MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
+    BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
+    PANEL_STATS = redis_get_json("panel_stats", {})
+    BUYER_STATS = redis_get_json("buyer_stats", {})
+    ORDER_NOTES = redis_get_json("order_notes", {})
+    COMPLAINT_LOG = redis_get_json("complaint_log", [])
+    LINK_FAIL_COUNT = redis_get_json("link_fail_count", {})
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
@@ -553,6 +645,13 @@ def save_state():
             "favorite_services": FAVORITE_SERVICES,
             "balance_history": BALANCE_HISTORY,
             "link_audit_history": LINK_AUDIT_HISTORY[-300:],
+            "message_templates": MESSAGE_TEMPLATES,
+            "balance_warn_last": BALANCE_WARN_LAST,
+            "panel_stats": PANEL_STATS,
+            "buyer_stats": BUYER_STATS,
+            "order_notes": ORDER_NOTES,
+            "complaint_log": COMPLAINT_LOG[-100:] if isinstance(COMPLAINT_LOG, list) else [],
+            "link_fail_count": LINK_FAIL_COUNT,
         }
 
         result = redis_mset_json(data_to_save)
@@ -816,7 +915,7 @@ def add_daily_stat(product_name: str, price: float = 0):
         add_to(WEEKLY_STATS)
         add_to(MONTHLY_STATS)
         add_sales_history(price)
-        save_state()
+        # save_state burada çağrılmaz; record_itemsatis_sale tek sefer yazdırır.
 
 
 def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price, link="") -> bool:
@@ -870,6 +969,84 @@ def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, li
             del ORDER_HISTORY[:-500]
         save_state()
 
+
+
+
+def record_buyer_stats(buyer: str, price: float = 0):
+    """Müşteri bazlı sipariş sayısı ve harcama istatistiği tutar."""
+    global BUYER_STATS
+    buyer = str(buyer or "Bilinmiyor").strip() or "Bilinmiyor"
+    now_s = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+    item = BUYER_STATS.get(buyer, {}) if isinstance(BUYER_STATS, dict) else {}
+    try:
+        count = int(item.get("count", 0) or 0) + 1
+        total_spent = float(item.get("total_spent", 0) or 0) + float(price or 0)
+    except Exception:
+        count, total_spent = 1, float(price or 0)
+    BUYER_STATS[buyer] = {
+        "count": count,
+        "total_spent": round(total_spent, 2),
+        "first_order": item.get("first_order") or now_s,
+        "last_order": now_s,
+    }
+    if count == VIP_ORDER_THRESHOLD:
+        send_telegram_sale(
+            f"VIP müşteri eşiğine ulaştı.\n\n"
+            f"Müşteri: {buyer}\n"
+            f"Toplam sipariş: {count}\n"
+            f"Toplam harcama: {format_tl_amount(total_spent)}"
+        )
+
+
+def update_panel_stats(panel_key: str, result: str, duration_minutes: int | None = None):
+    """Panel bazında başarı/başarısız/partial istatistikleri tutar."""
+    global PANEL_STATS
+    panel_key = normalize_panel_key(panel_key or "unknown")
+    item = PANEL_STATS.get(panel_key, {}) if isinstance(PANEL_STATS, dict) else {}
+    item.setdefault("success", 0)
+    item.setdefault("failed", 0)
+    item.setdefault("partial", 0)
+    item.setdefault("completed_total_minutes", 0)
+    item.setdefault("completed_count", 0)
+    item.setdefault("last_update", "")
+    if result == "success":
+        item["success"] += 1
+        if duration_minutes is not None:
+            item["completed_total_minutes"] += max(0, int(duration_minutes))
+            item["completed_count"] += 1
+    elif result == "partial":
+        item["partial"] += 1
+    else:
+        item["failed"] += 1
+    item["last_update"] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+    PANEL_STATS[panel_key] = item
+
+
+def increment_link_fail_count(link: str):
+    """Aynı link tekrar tekrar hata üretirse otomatik blacklist'e alır."""
+    if not BLACKLIST_AUTO_LEARN:
+        return
+    global LINK_FAIL_COUNT
+    normalized = normalize_link_for_check(link or "")
+    if not normalized:
+        return
+    current = int((LINK_FAIL_COUNT or {}).get(normalized, 0) or 0) + 1
+    LINK_FAIL_COUNT[normalized] = current
+    if current >= BLACKLIST_AUTO_FAIL_COUNT and normalized not in BLACKLIST:
+        BLACKLIST.add(normalized)
+        send_telegram_alert(
+            f"Link otomatik blacklist'e alındı.\n\n"
+            f"Link: {normalized}\n"
+            f"Hata sayısı: {current}"
+        )
+
+
+def add_order_note(smm_order_id: str, note: str):
+    smm_order_id = str(smm_order_id or "").strip()
+    note = str(note or "").strip()
+    if smm_order_id and note:
+        ORDER_NOTES[smm_order_id] = {"note": note, "updated_at": now_tr().strftime("%Y-%m-%d %H:%M:%S")}
+        save_state()
 
 def calculate_profit(sale_tl: float, cost_tl: float) -> dict:
     sale_tl = float(sale_tl or 0)
@@ -1747,7 +1924,7 @@ def normalize_package_component(component: dict) -> dict:
         quantity = int(component.get("quantity") or 0)
     except Exception:
         quantity = 0
-    component_id = str(component.get("id") or component.get("component_id") or f"cmp_{int(time.time() * 1000)}")
+    component_id = str(component.get("id") or component.get("component_id") or f"cmp_{secrets.token_hex(8)}")
     return {
         "id": component_id,
         "name": str(component.get("name") or component.get("type") or "Paket Bileşeni").strip() or "Paket Bileşeni",
@@ -1849,7 +2026,7 @@ def add_package_component(advert_id: str, name: str, panel: str, service_id: str
     if quantity <= 0 or quantity > 1000000:
         raise ValueError("Adet 1 ile 1.000.000 arasında olmalı")
     component = normalize_package_component({
-        "id": f"cmp_{int(time.time() * 1000)}",
+        "id": f"cmp_{secrets.token_hex(8)}",
         "name": name or "Paket Bileşeni",
         "panel": panel_key,
         "service_id": service_id,
@@ -1936,7 +2113,7 @@ def parse_numeric_balance(value) -> float | None:
             text = text.replace(".", "").replace(",", ".")
         else:
             text = text.replace(",", ".")
-        text = re.sub(r"[^0-9.\-]", "", text)
+        text = re.sub(r"[^0-9.-]", "", text)
         if not text:
             return None
         return float(text)
@@ -2045,6 +2222,168 @@ def format_panel_rate_tl(panel_key: str, rate_value) -> str:
         numeric = numeric * get_usd_to_try_rate()
     return format_tl_amount(numeric)
 
+
+
+def panel_rate_to_tl(panel_key: str, rate_value) -> float | None:
+    """Panel servis fiyatını TL cinsine çevirir. Rate çoğu panelde 1000 adet fiyatıdır."""
+    numeric = parse_numeric_balance(rate_value)
+    if numeric is None:
+        return None
+    currency = guess_panel_rate_currency(panel_key, rate_value)
+    if currency == "USD":
+        numeric *= get_usd_to_try_rate()
+    return float(numeric)
+
+
+def estimate_service_cost_tl(panel_key: str, rate_value, quantity) -> float | None:
+    """Panel rate değerinden sipariş maliyetini TL olarak hesaplar.
+    SMM panel standardında rate genelde 1000 adet fiyatıdır.
+    """
+    rate_tl = panel_rate_to_tl(panel_key, rate_value)
+    if rate_tl is None:
+        return None
+    try:
+        qty = int(quantity or 0)
+    except Exception:
+        qty = 0
+    return round((rate_tl / 1000.0) * qty, 4)
+
+
+def fetch_panel_service_rate(service: dict) -> dict:
+    """Servis ID için panelden güncel rate bilgisini çeker ve cache'i günceller."""
+    panel_key = normalize_panel_key((service or {}).get("panel_key") or (service or {}).get("panel") or "")
+    service_id = str((service or {}).get("service_id") or "").strip()
+    if not panel_key or not service_id:
+        return {"ok": False, "error": "panel_key_or_service_id_missing"}
+
+    api_url = (service or {}).get("api_url")
+    api_key = (service or {}).get("api_key")
+    panel_name = (service or {}).get("panel") or get_panel_config(panel_key).get("name", panel_key)
+    if not api_url or not api_key:
+        return {"ok": False, "error": "panel_config_missing"}
+
+    cache_key = f"{panel_key}:{service_id}"
+    cache_ts_key = f"rate_checked_at:{cache_key}"
+    cached_rate = SERVICE_PRICE_CACHE.get(cache_key)
+    last_checked = int(SERVICE_PRICE_CACHE.get(cache_ts_key, 0) or 0)
+    throttle_seconds = int(os.getenv("SERVICE_RATE_FETCH_THROTTLE_SECONDS", "300"))
+    if cached_rate and last_checked and (int(time.time()) - last_checked) < throttle_seconds:
+        return {"ok": True, "rate": cached_rate, "service_name": get_panel_service_display_name(service), "cached": True}
+
+    services_data = get_panel_services(api_url, api_key, panel_name)
+    if isinstance(services_data, dict) and "error" in services_data:
+        return {"ok": False, "error": services_data.get("error")}
+    if not isinstance(services_data, list):
+        return {"ok": False, "error": "services_response_not_list"}
+
+    for item in services_data:
+        if isinstance(item, dict) and str(item.get("service")) == service_id:
+            service_name = get_panel_service_display_name(service, item)
+            rate_raw = str(item.get("rate", ""))
+            if rate_raw:
+                SERVICE_PRICE_CACHE[f"{panel_key}:{service_id}"] = rate_raw
+                SERVICE_PRICE_CACHE[f"rate_checked_at:{panel_key}:{service_id}"] = int(time.time())
+                SERVICE_PRICE_CACHE.pop(f"missing:{panel_key}:{service_id}", None)
+            return {"ok": True, "rate": rate_raw, "service_name": service_name, "raw": item}
+
+    return {"ok": False, "error": "service_not_found"}
+
+
+def check_anti_loss_guardrail_for_services(services: list[dict], sale_price_tl: float, context: str = "") -> dict:
+    """Sipariş panele gitmeden önce tahmini toplam panel maliyetini net satış geliriyle karşılaştırır."""
+    if not ANTI_LOSS_ENABLED:
+        return {"ok": True, "disabled": True}
+    try:
+        sale_price_tl = float(sale_price_tl or 0)
+    except Exception:
+        sale_price_tl = 0.0
+    if sale_price_tl <= 0:
+        return {"ok": True, "skipped": "sale_price_missing"}
+
+    total_cost = 0.0
+    service_rows = []
+    unknown_rows = []
+
+    for service in services:
+        panel_key = normalize_panel_key(service.get("panel_key") or service.get("panel") or "")
+        rate_info = fetch_panel_service_rate(service)
+        if not rate_info.get("ok"):
+            unknown_rows.append({
+                "panel": service.get("panel", panel_key),
+                "service_id": service.get("service_id", ""),
+                "error": rate_info.get("error", "rate_unknown"),
+            })
+            continue
+        cost_tl = estimate_service_cost_tl(panel_key, rate_info.get("rate"), service.get("quantity"))
+        if cost_tl is None:
+            unknown_rows.append({
+                "panel": service.get("panel", panel_key),
+                "service_id": service.get("service_id", ""),
+                "error": "cost_unknown",
+            })
+            continue
+        total_cost += float(cost_tl)
+        service_rows.append({
+            "panel": service.get("panel", panel_key),
+            "panel_key": panel_key,
+            "service_id": service.get("service_id", ""),
+            "quantity": service.get("quantity", ""),
+            "rate": rate_info.get("rate", ""),
+            "service_name": rate_info.get("service_name", ""),
+            "cost_tl": round(float(cost_tl), 2),
+        })
+
+    net_income = round(sale_price_tl * (1 - ITEMSATIS_COMMISSION_RATE), 2)
+    min_profit = float(ANTI_LOSS_MIN_PROFIT_TL or 0)
+    projected_profit = round(net_income - total_cost, 2)
+
+    if total_cost > 0 and projected_profit < min_profit:
+        return {
+            "ok": False,
+            "sale_price_tl": round(sale_price_tl, 2),
+            "net_income_tl": net_income,
+            "panel_cost_tl": round(total_cost, 2),
+            "projected_profit_tl": projected_profit,
+            "min_profit_tl": min_profit,
+            "services": service_rows,
+            "unknown": unknown_rows,
+            "context": context,
+        }
+
+    if unknown_rows:
+        log("warning", "anti_loss_rate_unknown", context=context, unknown=unknown_rows)
+
+    return {
+        "ok": True,
+        "sale_price_tl": round(sale_price_tl, 2),
+        "net_income_tl": net_income,
+        "panel_cost_tl": round(total_cost, 2),
+        "projected_profit_tl": projected_profit,
+        "services": service_rows,
+        "unknown": unknown_rows,
+    }
+
+
+def format_anti_loss_message(title: str, product_name: str, order_id: str, guard: dict) -> str:
+    service_lines = []
+    for row in guard.get("services", [])[:10]:
+        service_lines.append(
+            f"- {row.get('panel')} | ID {row.get('service_id')} | {row.get('quantity')} adet | Maliyet: {format_tl_amount(row.get('cost_tl', 0))}"
+        )
+    if guard.get("unknown"):
+        service_lines.append(f"- Fiyatı okunamayan servis: {len(guard.get('unknown', []))} adet")
+    details = "\n".join(service_lines) or "- Detay yok"
+    return (
+        f"{title}\n\n"
+        f"Ürün/Paket: {product_name}\n"
+        f"Itemsatış ID: {order_id}\n"
+        f"Satış: {format_tl_amount(guard.get('sale_price_tl', 0))}\n"
+        f"Net gelir: {format_tl_amount(guard.get('net_income_tl', 0))}\n"
+        f"Panel maliyeti: {format_tl_amount(guard.get('panel_cost_tl', 0))}\n"
+        f"Tahmini kâr: {format_tl_amount(guard.get('projected_profit_tl', 0))}\n\n"
+        f"Servisler:\n{details}\n\n"
+        f"Sipariş panele gönderilmedi. Fiyat/ilan/panel servisini kontrol et."
+    )
 
 def record_balance_history(panel_key: str, balance_data: dict):
     """Panel bakiyesini günlük geçmişe yazar."""
@@ -2333,15 +2672,29 @@ def check_low_balance(balance, currency, panel_name="Panel"):
         balance_tl = convert_balance_to_try(balance, currency)
         if balance_tl is None:
             return
-        if balance_tl <= 100:
+
+        if balance_tl <= BALANCE_WARN_THRESHOLD_TL:
+            panel_key = normalize_panel_key(panel_name)
+            now_ts = int(time.time())
+            last_warn = int(BALANCE_WARN_LAST.get(panel_key, 0) or 0)
+            repeat_seconds = BALANCE_WARN_REPEAT_MINUTES * 60
+
+            if last_warn and (now_ts - last_warn) < repeat_seconds:
+                log("info", "low_balance_warning_suppressed", panel=panel_name, balance_tl=balance_tl)
+                return
+
+            BALANCE_WARN_LAST[panel_key] = now_ts
+            save_state()
             log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency, balance_tl=balance_tl)
-            send_telegram(f"{panel_name} bakiyesi 100 TL altına düştü.\n\nKalan: {format_tl_amount(balance_tl)}\n\nLütfen kontrol et.")
+            send_telegram_alert(
+                f"{panel_name} bakiyesi {format_tl_amount(BALANCE_WARN_THRESHOLD_TL)} altına düştü.\n\n"
+                f"Kalan: {format_tl_amount(balance_tl)}\n\nLütfen kontrol et."
+            )
     except Exception as e:
         log("error", "balance_check_error", error=str(e))
 
 
 
-BACKGROUND_TASKS_STARTED = False
 
 
 async def periodic_runner(name: str, interval_seconds: int, func, initial_delay: int = 30):
@@ -2363,35 +2716,21 @@ async def periodic_runner(name: str, interval_seconds: int, func, initial_delay:
 
 @app.on_event("startup")
 async def startup_event():
-    global BACKGROUND_TASKS_STARTED
-
     validate_environment()
 
-    if BACKGROUND_TASKS_STARTED:
-        log("warning", "background_tasks_already_started")
-        return
+    task_specs = {
+        "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
+        "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
+    }
 
-    BACKGROUND_TASKS_STARTED = True
+    for name, (interval, func, delay) in task_specs.items():
+        existing = _BACKGROUND_TASKS.get(name)
+        if existing and not existing.done():
+            log("info", "background_task_already_running", task=name)
+            continue
+        _BACKGROUND_TASKS[name] = asyncio.create_task(periodic_runner(name, interval, func, delay))
 
-    asyncio.create_task(
-        periodic_runner(
-            "background_check_orders",
-            int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")),
-            check_orders,
-            45,
-        )
-    )
-
-    asyncio.create_task(
-        periodic_runner(
-            "background_check_services",
-            int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")),
-            check_services,
-            90,
-        )
-    )
-
-    log("info", "background_tasks_started")
+    log("info", "background_tasks_started", tasks=list(_BACKGROUND_TASKS.keys()))
 
 
 load_state()
@@ -4879,29 +5218,24 @@ def admin_failed_orders(user: str = Depends(get_current_admin)):
     return HTMLResponse(content=html)
 
 
-@app.post("/admin/retry-order")
-def admin_retry_order(smm_order_id: str = Form(...), user: str = Depends(get_current_admin)):
-    target = None
-    for item in reversed(FAILED_ORDERS):
-        if str(item.get("smm_order_id", "")) == str(smm_order_id) and item.get("retryable"):
-            target = item
-            break
 
+def retry_failed_order_item(target: dict) -> dict:
+    """Tek bir failed order kaydını güvenli şekilde yeniden dener."""
     if not target:
-        raise HTTPException(status_code=404, detail="Retry yapılabilir başarısız sipariş bulunamadı")
-
+        return {"ok": False, "error": "target_missing"}
     if target.get("retried"):
-        raise HTTPException(status_code=400, detail="Bu sipariş daha önce tekrar denendi")
+        return {"ok": False, "error": "already_retried"}
+    if not target.get("retryable"):
+        return {"ok": False, "error": "not_retryable"}
 
     advert_id = str(target.get("advert_id", ""))
-    all_services = get_all_services(include_inactive=True)
-    raw_service = all_services.get(advert_id)
+    raw_service = get_all_services(include_inactive=True).get(advert_id)
     if not raw_service:
-        raise HTTPException(status_code=400, detail="Bu ilan için servis ayarı bulunamadı")
+        return {"ok": False, "error": "service_config_missing"}
 
     service = get_service_config(raw_service)
     if not service.get("api_url") or not service.get("api_key"):
-        raise HTTPException(status_code=400, detail="Panel bilgileri eksik")
+        return {"ok": False, "error": "panel_config_missing"}
 
     smm_result = create_panel_order(
         service["api_url"],
@@ -4913,9 +5247,7 @@ def admin_retry_order(smm_order_id: str = Form(...), user: str = Depends(get_cur
     )
 
     if "error" in smm_result:
-        log("error", "retry_order_failed", smm_order_id=smm_order_id, error=smm_result.get("error"))
-        send_telegram(f"Retry başarısız.\n\nSMM ID: {smm_order_id}\nHata: {smm_result.get('error')}")
-        raise HTTPException(status_code=400, detail=smm_result.get("error"))
+        return {"ok": False, "error": smm_result.get("error")}
 
     new_smm_order_id = smm_result.get("order", "Bilinmiyor")
     add_pending_order(
@@ -4934,12 +5266,88 @@ def admin_retry_order(smm_order_id: str = Form(...), user: str = Depends(get_cur
     )
     target["retried"] = True
     target["retry_smm_order_id"] = str(new_smm_order_id)
+    target["retried_at"] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
     save_state()
+    return {"ok": True, "new_smm_order_id": new_smm_order_id, "panel": service.get("panel", "")}
+
+
+def bulk_retry_failed_orders_worker():
+    """Retryable failed siparişleri arka planda sırayla yeniden dener; lock ile çift çalışmayı engeller."""
+    global BULK_RETRY_RUNNING
+    if not _BULK_RETRY_LOCK.acquire(blocking=False):
+        log("warning", "bulk_retry_already_running")
+        return
+
+    BULK_RETRY_RUNNING = True
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    errors = []
+    try:
+        candidates = [item for item in FAILED_ORDERS if item.get("retryable") and not item.get("retried")]
+        candidates = candidates[:max(1, BULK_RETRY_MAX)]
+        log("info", "bulk_retry_started", total=len(candidates))
+        for item in candidates:
+            result = retry_failed_order_item(item)
+            if result.get("ok"):
+                success_count += 1
+            else:
+                err = str(result.get("error", "unknown"))
+                if err in {"already_retried", "not_retryable"}:
+                    skipped_count += 1
+                else:
+                    failed_count += 1
+                    errors.append(f"{item.get('smm_order_id', item.get('order_id', '-'))}: {err}")
+            time.sleep(max(0, BULK_RETRY_DELAY_SECONDS))
+    except Exception as e:
+        failed_count += 1
+        errors.append(str(e))
+        log("error", "bulk_retry_error", error=str(e))
+    finally:
+        BULK_RETRY_RUNNING = False
+        _BULK_RETRY_LOCK.release()
+        send_telegram(
+            "Bulk retry tamamlandı.\n\n"
+            f"Başarılı: {success_count}\n"
+            f"Hatalı: {failed_count}\n"
+            f"Atlanan: {skipped_count}\n"
+            f"Limit: {BULK_RETRY_MAX}\n"
+            + (("\nHatalar:\n" + "\n".join(errors[:10])) if errors else "")
+        )
+        log("info", "bulk_retry_finished", success=success_count, failed=failed_count, skipped=skipped_count)
+
+
+@app.post("/admin/retry-order")
+def admin_retry_order(smm_order_id: str = Form(...), user: str = Depends(get_current_admin)):
+    target = None
+    for item in reversed(FAILED_ORDERS):
+        if str(item.get("smm_order_id", "")) == str(smm_order_id) and item.get("retryable"):
+            target = item
+            break
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Retry yapılabilir başarısız sipariş bulunamadı")
+
+    result = retry_failed_order_item(target)
+    if not result.get("ok"):
+        log("error", "retry_order_failed", smm_order_id=smm_order_id, error=result.get("error"))
+        send_telegram(f"Retry başarısız.\n\nSMM ID: {smm_order_id}\nHata: {result.get('error')}")
+        raise HTTPException(status_code=400, detail=str(result.get("error")))
 
     send_telegram(
-        f"Retry başlatıldı.\n\nÜrün: {target.get('product_name', 'Bilinmiyor')}\nPanel: {service['panel']}\n"
-        f"Eski SMM ID: {smm_order_id}\nYeni SMM ID: {new_smm_order_id}"
+        f"Retry başlatıldı.\n\nÜrün: {target.get('product_name', 'Bilinmiyor')}\nPanel: {result.get('panel', '')}\n"
+        f"Eski SMM ID: {smm_order_id}\nYeni SMM ID: {result.get('new_smm_order_id')}"
     )
+    return RedirectResponse("/admin/failed-orders", status_code=303)
+
+
+@app.post("/admin/retry-all")
+def admin_retry_all(user: str = Depends(get_current_admin)):
+    if _BULK_RETRY_LOCK.locked():
+        raise HTTPException(status_code=409, detail="Bulk retry zaten çalışıyor")
+    thread = threading.Thread(target=bulk_retry_failed_orders_worker, daemon=True)
+    thread.start()
+    send_telegram("Bulk retry başlatıldı. Uygun başarısız siparişler sırayla yeniden denenecek.")
     return RedirectResponse("/admin/failed-orders", status_code=303)
 
 
@@ -5962,6 +6370,8 @@ def check_orders():
                 platform=item.get("platform", runtime_service.get("platform", "")),
                 retryable=True,
             )
+            update_panel_stats(item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""), "partial" if status == "partial" else "failed")
+            increment_link_fail_count(item.get("link", ""))
             send_telegram(
                 f"⚠️ SMM sipariş sorunlu duruma düştü.\n\n"
                 f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
@@ -5990,6 +6400,8 @@ def check_orders():
 
         if status in COMPLETED_PANEL_STATUSES:
             log("success", "order_completed", smm_order_id=item.get("smm_order_id"), product=item.get("product_name"))
+            duration_minutes = int((time.time() - int(item.get("created_at", time.time()) or time.time())) / 60)
+            update_panel_stats(item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""), "success", duration_minutes)
             send_telegram(
                 f"SMM siparişi tamamlandı.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
                 f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\nLink: {item.get('link', '')}\n\n"
@@ -6178,7 +6590,7 @@ def normalize_panel_rate(value) -> str:
             text = text.replace(".", "").replace(",", ".")
         else:
             text = text.replace(",", ".")
-        text = re.sub(r"[^0-9.\-]", "", text)
+        text = re.sub(r"[^0-9.-]", "", text)
         if not text:
             return ""
         return f"{float(text):.6f}".rstrip("0").rstrip(".")
@@ -6357,8 +6769,11 @@ async def itemsatis_webhook(request: Request):
 
     report_product_name = get_itemsatis_report_name(advert_id, product_name)
 
-    record_itemsatis_sale(data=data, order_id=order_id, advert_id=advert_id, buyer=buyer,
+    sale_recorded = record_itemsatis_sale(data=data, order_id=order_id, advert_id=advert_id, buyer=buyer,
                           product_name=report_product_name, price=price)
+    if sale_recorded:
+        record_buyer_stats(buyer, price)
+        save_state()
 
     log("info", "sale_received", order_id=order_id, product=report_product_name, buyer=buyer, price=price)
 
@@ -6414,6 +6829,17 @@ async def itemsatis_webhook(request: Request):
         success_rows = []
         failed_rows = []
         components = package.get("components", []) or []
+
+        guard_services = []
+        for guard_component in components:
+            guard_component = normalize_package_component(guard_component)
+            if guard_component.get("active", True):
+                guard_services.append(get_service_config(guard_component))
+        anti_loss = check_anti_loss_guardrail_for_services(guard_services, price, f"Paket: {package_name}")
+        if not anti_loss.get("ok"):
+            add_failed_order(order_id, advert_id, package_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel="package", retryable=False)
+            send_telegram(format_anti_loss_message("Dikkat: Zararına paket satış engellendi.", package_name, order_id, anti_loss))
+            return {"ok": False, "error": "anti_loss_guardrail", "type": "package_order", "guard": anti_loss}
 
         for component in components:
             component = normalize_package_component(component)
@@ -6516,6 +6942,12 @@ async def itemsatis_webhook(request: Request):
             send_telegram(f"Panel bilgileri eksik.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPanel: {service['panel']}\n\nRender Environment ayarlarını kontrol et.")
             return {"ok": False, "error": "panel_config_missing"}
 
+        anti_loss = check_anti_loss_guardrail_for_services([service], price, f"Itemsatış ilanı {advert_id}")
+        if not anti_loss.get("ok"):
+            add_failed_order(order_id, advert_id, service_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel=service.get("panel", ""), retryable=False)
+            send_telegram(format_anti_loss_message("Dikkat: Zararına satış engellendi.", service_name, order_id, anti_loss))
+            return {"ok": False, "error": "anti_loss_guardrail", "guard": anti_loss}
+
         balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
 
         if "error" in balance_data:
@@ -6605,6 +7037,8 @@ async def telegram_webhook(request: Request):
             "/blacklist add değer - Kara listeye ekle\n"
             "/blacklist remove değer - Kara listeden çıkar\n"
             "/blacklist list - Kara listeyi göster\n"
+            "/panel-stats - Panel başarı oranları\n"
+            "/note smm_id not - Sipariş notu ekle\n"
             "/report - Bugünkü özet\n"
             "/week-report - Haftalık özet\n"
             "/month-report - Aylık özet\n"
@@ -6721,6 +7155,35 @@ async def telegram_webhook(request: Request):
             send_telegram(f"Kara listeden çıkarıldı: {value}")
             return {"ok": True}
         send_telegram("Kullanım: /blacklist add/remove/list")
+        return {"ok": True}
+
+
+    if command == "/panel-stats":
+        if not PANEL_STATS:
+            send_telegram("Panel istatistiği henüz yok.")
+            return {"ok": True}
+        lines = ["Panel Başarı Raporu:\n"]
+        for key, item in PANEL_STATS.items():
+            success = int(item.get("success", 0) or 0)
+            failed = int(item.get("failed", 0) or 0)
+            partial = int(item.get("partial", 0) or 0)
+            total = success + failed + partial
+            rate = (success / total * 100) if total else 0
+            avg = 0
+            if int(item.get("completed_count", 0) or 0) > 0:
+                avg = int(item.get("completed_total_minutes", 0) or 0) / int(item.get("completed_count", 1) or 1)
+            panel_name = get_panel_config(key).get("name", key)
+            lines.append(f"{panel_name}: %{rate:.1f} başarı | Başarılı {success} | Hata {failed} | Partial {partial} | Ortalama {avg:.0f} dk")
+        send_telegram("\n".join(lines))
+        return {"ok": True}
+
+    if command == "/note":
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3:
+            send_telegram("Kullanım: /note smm_id not metni")
+            return {"ok": True}
+        add_order_note(parts[1], parts[2])
+        send_telegram(f"Not kaydedildi.\nSMM ID: {parts[1]}")
         return {"ok": True}
 
     if command == "/report":
