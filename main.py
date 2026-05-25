@@ -11,8 +11,8 @@ import secrets
 import threading
 import html
 import requests
-from collections import defaultdict
-from datetime import datetime, timedelta
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 from fastapi import FastAPI, Request, HTTPException, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -62,8 +62,10 @@ CHAT_ID_ALERTS = os.getenv("CHAT_ID_ALERTS", "") or CHAT_ID
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
+REQUIRE_WEBHOOK_SECRET = os.getenv("REQUIRE_WEBHOOK_SECRET", "false").lower() == "true"
 WEBHOOK_IP_WHITELIST = [ip.strip() for ip in os.getenv("WEBHOOK_IP_WHITELIST", "").split(",") if ip.strip()]
 STATE_LOCK = threading.RLock()
+TR_TIMEZONE = timezone(timedelta(hours=3))
 
 
 ITEMSATIS_COMMISSION_RATE = 0.07
@@ -190,11 +192,11 @@ BALANCE_HISTORY = {}
 LINK_AUDIT_HISTORY = []
 
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
-LOG_HISTORY = []
+MAX_LOG_HISTORY = 200
+LOG_HISTORY = deque(maxlen=MAX_LOG_HISTORY)
 _RATE_LIMIT_STORE = defaultdict(list)
 MESSAGE_TEMPLATES = {}
 BALANCE_WARN_LAST = {}
-MAX_LOG_HISTORY = 200
 LOG_FLUSH_INTERVAL_SECONDS = int(os.getenv("LOG_FLUSH_INTERVAL_SECONDS", "30"))
 _LOG_DIRTY = False
 _LOG_LAST_FLUSH = 0
@@ -216,6 +218,8 @@ USD_TO_TRY_REFRESH_SECONDS = int(os.getenv("USD_TO_TRY_REFRESH_SECONDS", "21600"
 # Anti-loss ve toplu retry ayarları
 ANTI_LOSS_ENABLED = os.getenv("ANTI_LOSS_ENABLED", "true").lower() == "true"
 ANTI_LOSS_MIN_PROFIT_TL = float(os.getenv("ANTI_LOSS_MIN_PROFIT_TL", "0"))
+ANTI_LOSS_MIN_PROFIT_PERCENT = float(os.getenv("ANTI_LOSS_MIN_PROFIT_PERCENT", "0"))
+ANTI_LOSS_BLOCK_UNKNOWN_COST = os.getenv("ANTI_LOSS_BLOCK_UNKNOWN_COST", "true").lower() == "true"
 BULK_RETRY_MAX = int(os.getenv("BULK_RETRY_MAX", "30"))
 BULK_RETRY_DELAY_SECONDS = float(os.getenv("BULK_RETRY_DELAY_SECONDS", "2"))
 BALANCE_WARN_REPEAT_MINUTES = int(os.getenv("BALANCE_WARN_REPEAT_MINUTES", "60"))
@@ -230,6 +234,8 @@ PANEL_STATS = {}
 BUYER_STATS = {}
 ORDER_NOTES = {}
 LINK_FAIL_COUNT = {}
+PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "3000"))
+PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "3000"))
 
 # ─── PROFESYONEL PANEL DAYANIKLILIĞI: CIRCUIT BREAKER + REDIS QUEUE ──────────
 CIRCUIT_THRESHOLD = int(os.getenv("CIRCUIT_THRESHOLD", "3"))
@@ -260,11 +266,18 @@ def validate_environment():
         "ADMIN_PASSWORD": ADMIN_PASSWORD,
     }
     missing = [name for name, value in required.items() if not value or (name == "ADMIN_PASSWORD" and value == "changeme")]
+    if REQUIRE_WEBHOOK_SECRET and not WEBHOOK_SECRET_TOKEN and "WEBHOOK_SECRET_TOKEN" not in missing:
+        missing.append("WEBHOOK_SECRET_TOKEN")
     if missing:
         try:
             logger.warning("environment_missing_or_unsafe", missing=missing)
         except Exception:
             print("ENV WARNING:", missing, flush=True)
+    if not WEBHOOK_SECRET_TOKEN:
+        try:
+            logger.warning("webhook_secret_token_empty", message="Üretimde WEBHOOK_SECRET_TOKEN tanımlaman önerilir.")
+        except Exception:
+            pass
     return missing
 
 
@@ -303,6 +316,9 @@ def is_webhook_authorized(request: Request) -> bool:
         return False
 
     if not WEBHOOK_SECRET_TOKEN:
+        if REQUIRE_WEBHOOK_SECRET:
+            log("warning", "webhook_secret_required_but_missing", ip=client_ip)
+            return False
         return True
 
     provided = (
@@ -315,7 +331,7 @@ def is_webhook_authorized(request: Request) -> bool:
 
 
 def now_tr():
-    return datetime.utcnow() + timedelta(hours=3)
+    return datetime.now(TR_TIMEZONE)
 
 
 # ─── YENİ: GELİŞMİŞ LOGLAMA ──────────────────────────────────────────────────
@@ -326,7 +342,7 @@ def flush_logs(force: bool = False):
         return
     now_ts = time.time()
     if force or (now_ts - _LOG_LAST_FLUSH) >= LOG_FLUSH_INTERVAL_SECONDS:
-        redis_set_json("log_history", LOG_HISTORY[-MAX_LOG_HISTORY:])
+        redis_set_json("log_history", list(LOG_HISTORY)[-MAX_LOG_HISTORY:])
         _LOG_LAST_FLUSH = now_ts
         _LOG_DIRTY = False
 
@@ -346,8 +362,6 @@ def log(level: str, event: str, **kwargs):
 
     with STATE_LOCK:
         LOG_HISTORY.append(entry)
-        if len(LOG_HISTORY) > MAX_LOG_HISTORY:
-            LOG_HISTORY.pop(0)
         _LOG_DIRTY = True
 
     # Sadece aralık dolduysa Redis'e yaz.
@@ -499,13 +513,41 @@ def redis_request(command):
             json=command,
             timeout=20,
         )
-        return r.json()
+        if r.status_code >= 400:
+            logger.error("redis_http_error", status=r.status_code, response=r.text[:300])
+            return None
+        try:
+            result = r.json()
+        except Exception as e:
+            logger.error("redis_json_error", error=str(e), response=r.text[:300])
+            return None
+        if isinstance(result, dict) and result.get("error"):
+            logger.error("redis_command_error", error=str(result.get("error"))[:300], command=str(command)[:120])
+            return None
+        return result
     except Exception as e:
         try:
             logger.error("redis_error", error=str(e))
         except Exception:
             print("REDIS ERROR:", str(e), flush=True)
         return None
+
+
+def redis_response_ok(result) -> bool:
+    return isinstance(result, dict) and not result.get("error")
+
+
+def redis_set_succeeded(result) -> bool:
+    return redis_response_ok(result) and str(result.get("result", "")).upper() == "OK"
+
+
+def redis_lpush_succeeded(result) -> bool:
+    if not redis_response_ok(result):
+        return False
+    try:
+        return int(result.get("result", 0) or 0) > 0
+    except Exception:
+        return False
 
 
 def redis_get_json(key, default):
@@ -699,9 +741,29 @@ def enqueue_itemsatis_webhook(data: dict, *, attempts: int = 0, queue_id: str = 
         "last_error": str(last_error or "")[:500],
         "payload": data,
     }
-    redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+    result = redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+    if not redis_lpush_succeeded(result):
+        log("error", "itemsatis_webhook_queue_write_failed", queue_id=queue_id, redis_result=str(result)[:300])
+        raise RuntimeError("Itemsatis webhook Redis kuyruğuna yazılamadı")
     log("info", "itemsatis_webhook_queued", queue_id=queue_id, attempts=attempts, not_before=not_before)
     return queue_id
+
+
+def push_itemsatis_queue_item(item: dict, event: str = "itemsatis_queue_requeued") -> bool:
+    """Var olan queue item'ını ana kuyruğa güvenli döndürür; Redis yazımı doğrulanmadan başarılı saymaz."""
+    safe_item = item if isinstance(item, dict) else {"payload": item}
+    result = redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, safe_item)
+    if redis_lpush_succeeded(result):
+        log("info", event, queue_id=safe_item.get("id"), attempts=safe_item.get("attempts"))
+        return True
+    log("error", "itemsatis_queue_requeue_failed", queue_id=safe_item.get("id"), event=event, redis_result=str(result)[:300])
+    send_telegram_error(
+        f"Itemsatış kuyruğuna yeniden yazma başarısız.\n\n"
+        f"Queue ID: {safe_item.get('id', '-')}\n"
+        f"İşlem: {event}\n"
+        f"Redis sonucu: {str(result)[:300]}"
+    )
+    return False
 
 
 def move_queue_item_to_dead(item: dict, reason: str):
@@ -729,11 +791,12 @@ def recover_stuck_itemsatis_processing():
             item["attempts"] = int(item.get("attempts", 0) or 0) + 1
             item["not_before"] = now_ts + QUEUE_RETRY_DELAY_SEC
             item["last_error"] = "Recovered from stuck processing queue"
-            redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
             if item["attempts"] >= QUEUE_ITEM_MAX_ATTEMPTS:
                 move_queue_item_to_dead(item, "Max attempts after stuck recovery")
+                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
             else:
-                redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+                if push_itemsatis_queue_item(item, "itemsatis_stuck_job_requeued"):
+                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
             recovered += 1
         if recovered:
             log("warning", "itemsatis_stuck_jobs_recovered", count=recovered)
@@ -745,8 +808,13 @@ async def itemsatis_queue_worker():
     """Redis tabanlı mini webhook worker. Ekstra paket istemez; siparişleri sırayla işler."""
     log("info", "itemsatis_queue_worker_started")
     recover_stuck_itemsatis_processing()
+    last_stuck_recovery = int(time.time())
     while True:
         try:
+            now_loop = int(time.time())
+            if now_loop - last_stuck_recovery >= max(60, int(QUEUE_STUCK_RECOVERY_SEC / 2)):
+                recover_stuck_itemsatis_processing()
+                last_stuck_recovery = now_loop
             raw = redis_rpoplpush_raw(ITEMSATIS_WEBHOOK_QUEUE_KEY, ITEMSATIS_WEBHOOK_PROCESSING_KEY)
             if not raw:
                 await asyncio.sleep(QUEUE_WORKER_SLEEP_SEC)
@@ -760,8 +828,8 @@ async def itemsatis_queue_worker():
             now_ts = int(time.time())
             not_before = int(item.get("not_before", 0) or 0)
             if not_before > now_ts:
-                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
-                redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
+                if push_itemsatis_queue_item(item, "itemsatis_not_before_requeued"):
+                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                 await asyncio.sleep(min(QUEUE_WORKER_SLEEP_SEC + 3, max(1, not_before - now_ts)))
                 continue
             item["processing_started_at"] = now_ts
@@ -771,24 +839,25 @@ async def itemsatis_queue_worker():
                 redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                 log("info", "itemsatis_queue_processed", queue_id=item.get("id"), result=str(result)[:300])
             except CircuitOpenForOrder as e:
-                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                 attempts = int(item.get("attempts", 0) or 0) + 1
                 item["attempts"] = attempts
                 item["not_before"] = int(time.time()) + int(e.retry_after)
                 item["last_error"] = str(e)
                 if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
                     move_queue_item_to_dead(item, f"Circuit open max attempts: {e}")
+                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                 else:
-                    redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
-                    log("warning", "itemsatis_requeued_circuit_open", queue_id=item.get("id"), panel=e.panel_name, attempts=attempts)
+                    if push_itemsatis_queue_item(item, "itemsatis_requeued_circuit_open"):
+                        redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                        log("warning", "itemsatis_requeued_circuit_open", queue_id=item.get("id"), panel=e.panel_name, attempts=attempts)
             except Exception as e:
-                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                 attempts = int(item.get("attempts", 0) or 0) + 1
                 item["attempts"] = attempts
                 item["not_before"] = int(time.time()) + QUEUE_RETRY_DELAY_SEC
                 item["last_error"] = str(e)
                 if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
                     move_queue_item_to_dead(item, f"Max attempts: {e}")
+                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                     send_telegram_error(
                         f"Itemsatış queue dead\'e düştü.\n\n"
                         f"Queue ID: {item.get('id')}\n"
@@ -796,8 +865,9 @@ async def itemsatis_queue_worker():
                         f"Hata: {str(e)[:500]}"
                     )
                 else:
-                    redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
-                    log("warning", "itemsatis_requeued_error", queue_id=item.get("id"), attempts=attempts, error=str(e))
+                    if push_itemsatis_queue_item(item, "itemsatis_requeued_error"):
+                        redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                        log("warning", "itemsatis_requeued_error", queue_id=item.get("id"), attempts=attempts, error=str(e))
         except Exception as e:
             log("error", "itemsatis_queue_worker_error", error=str(e))
             send_telegram_error(f"Itemsatış queue worker kritik hata:\n{str(e)[:700]}")
@@ -915,14 +985,14 @@ def retry_dead_queue_item(queue_id: str = "", retry_all: bool = False) -> int:
         if not retry_all and not queue_id:
             continue
 
-        redis_lrem_value(ITEMSATIS_WEBHOOK_DEAD_KEY, raw)
         item["attempts"] = 0
         item["not_before"] = 0
         item["last_error"] = f"Admin tarafından dead queue'dan tekrar kuyruğa alındı: {now_tr().strftime('%Y-%m-%d %H:%M:%S')}"
         item.pop("dead_at", None)
         item.pop("dead_reason", None)
-        redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, item)
-        moved += 1
+        if push_itemsatis_queue_item(item, "dead_queue_requeued_by_admin"):
+            redis_lrem_value(ITEMSATIS_WEBHOOK_DEAD_KEY, raw)
+            moved += 1
 
     if moved:
         log("warning", "dead_queue_requeued_by_admin", queue_id=queue_id, retry_all=retry_all, moved=moved)
@@ -988,7 +1058,7 @@ def load_state():
     MONTHLY_STATS = redis_get_json("monthly_stats", {})
     LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
     LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
-    LOG_HISTORY = redis_get_json("log_history", [])
+    LOG_HISTORY = deque(redis_get_json("log_history", [])[-MAX_LOG_HISTORY:], maxlen=MAX_LOG_HISTORY)
     PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
@@ -1005,6 +1075,7 @@ def load_state():
     BUYER_STATS = redis_get_json("buyer_stats", {})
     ORDER_NOTES = redis_get_json("order_notes", {})
     LINK_FAIL_COUNT = redis_get_json("link_fail_count", {})
+    trim_processed_memory()
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
@@ -1015,6 +1086,7 @@ def save_state():
     """
     with STATE_LOCK:
         sanitize_pending_orders_for_storage()
+        trim_processed_memory()
 
         data_to_save = {
             "recorded_sales": list(RECORDED_SALES),
@@ -1121,6 +1193,123 @@ def make_sale_key(data, order_id, advert_id, buyer, product_name, price, link=""
     fingerprint = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
     safe_link = normalize_link_for_check(link)
     return f"sale_fallback:{advert_id}:{buyer}:{product_name}:{price}:{safe_link}:{fingerprint}"
+
+
+def cap_set_size(values, limit: int) -> set:
+    """Processed order/link setlerinin Redis ve RAM'de sınırsız büyümesini engeller."""
+    try:
+        limit = max(100, int(limit or 3000))
+        if not isinstance(values, set):
+            values = set(values or [])
+        if len(values) <= limit:
+            return values
+        return set(list(values)[-limit:])
+    except Exception:
+        return set(values or [])
+
+
+def trim_processed_memory():
+    global PROCESSED_ORDERS, PROCESSED_LINKS
+    PROCESSED_ORDERS = cap_set_size(PROCESSED_ORDERS, PROCESSED_ORDERS_MAX)
+    PROCESSED_LINKS = cap_set_size(PROCESSED_LINKS, PROCESSED_LINKS_MAX)
+
+
+def is_valid_smm_order_id(value) -> bool:
+    """Panelden gelen SMM order id gerçek mi? Bilinmiyor/boş değer pending'e girmemeli."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    bad_values = {"bilinmiyor", "none", "null", "false", "0", "-", "nan"}
+    return text.lower() not in bad_values
+
+
+def get_smm_order_id_from_result(result: dict) -> str:
+    if not isinstance(result, dict):
+        return ""
+    for key in ("order", "order_id", "id"):
+        value = result.get(key)
+        if is_valid_smm_order_id(value):
+            return str(value).strip()
+    return ""
+
+
+def build_finance_summary(price_tl: float, cost_tl: float | None = None) -> str:
+    """Telegram sipariş mesajları için satış / maliyet / kâr özeti üretir."""
+    try:
+        sale = float(price_tl or 0)
+    except Exception:
+        sale = 0.0
+
+    if cost_tl is None:
+        cost_tl = 0.0
+    try:
+        cost = float(cost_tl or 0)
+    except Exception:
+        cost = 0.0
+
+    profit = calculate_profit(sale, cost)
+    lines = [
+        "💰 Finans Özeti:",
+        f"Satış: {format_tl_amount(profit.get('sale_price', sale))}",
+        f"Panel maliyeti: {format_tl_amount(profit.get('panel_cost', cost))}" if cost > 0 else "Panel maliyeti: Hesaplanamadı",
+        f"Itemsatış komisyonu (%{int(ITEMSATIS_COMMISSION_RATE * 100)}): {format_tl_amount(profit.get('commission', 0))}" if sale > 0 else "Itemsatış komisyonu: Hesaplanamadı",
+    ]
+    if sale > 0 and cost > 0:
+        lines.append(f"Net kâr: {format_tl_amount(profit.get('profit', 0))} | Marj: %{profit.get('margin_pct', 0)}")
+    elif sale > 0:
+        lines.append("Net kâr: Panel maliyeti bilinmediği için hesaplanamadı")
+    return "\n".join(lines)
+
+
+def build_buyer_summary(buyer: str) -> str:
+    """Telegram sipariş mesajları için müşteri geçmişi özeti üretir."""
+    buyer = str(buyer or "Bilinmiyor").strip() or "Bilinmiyor"
+    stats = BUYER_STATS.get(buyer, {}) if isinstance(BUYER_STATS, dict) else {}
+    try:
+        count = int(stats.get("count", 0) or 0)
+        total_spent = float(stats.get("total_spent", 0) or 0)
+    except Exception:
+        count, total_spent = 0, 0.0
+    vip = "Evet" if count >= VIP_ORDER_THRESHOLD else "Hayır"
+    return f"👤 Müşteri: {buyer}\nSipariş sayısı: {count}\nToplam harcama: {format_tl_amount(total_spent)}\nVIP: {vip}"
+
+
+def estimate_order_cost_from_service(service: dict, quantity=None) -> float | None:
+    """Servis config/cache üzerinden sipariş maliyetini TL tahmin eder."""
+    if not isinstance(service, dict):
+        return None
+    panel_key = normalize_panel_key(service.get("panel_key") or service.get("panel") or "")
+    service_id = str(service.get("service_id") or "").strip()
+    qty = quantity if quantity is not None else service.get("quantity")
+    if not panel_key or not service_id:
+        return None
+    rate = SERVICE_PRICE_CACHE.get(f"{panel_key}:{service_id}")
+    if not rate:
+        try:
+            fetched = fetch_panel_service_rate(service)
+            if fetched.get("ok"):
+                rate = fetched.get("rate")
+        except Exception as e:
+            log("warning", "service_cost_estimate_failed", panel=panel_key, service_id=service_id, error=str(e))
+            rate = None
+    if not rate:
+        return None
+    return estimate_service_cost_tl(panel_key, rate, qty)
+
+
+def estimate_package_cost_tl(components: list) -> float | None:
+    total = 0.0
+    found = False
+    for component in components or []:
+        try:
+            service = get_service_config(normalize_package_component(component))
+            cost = estimate_order_cost_from_service(service)
+            if cost is not None:
+                total += float(cost)
+                found = True
+        except Exception:
+            continue
+    return round(total, 4) if found else None
 
 
 def add_failed_order(order_id, advert_id, product_name, reason, detail="", **extra):
@@ -2706,17 +2895,39 @@ def check_anti_loss_guardrail_for_services(services: list[dict], sale_price_tl: 
         })
 
     net_income = round(sale_price_tl * (1 - ITEMSATIS_COMMISSION_RATE), 2)
-    min_profit = float(ANTI_LOSS_MIN_PROFIT_TL or 0)
+    min_profit_tl = float(ANTI_LOSS_MIN_PROFIT_TL or 0)
+    min_profit_percent = float(ANTI_LOSS_MIN_PROFIT_PERCENT or 0)
+    min_profit_by_percent = round(net_income * (min_profit_percent / 100), 2) if min_profit_percent > 0 else 0
+    min_profit = max(min_profit_tl, min_profit_by_percent)
     projected_profit = round(net_income - total_cost, 2)
 
-    if total_cost > 0 and projected_profit < min_profit:
+    if unknown_rows and ANTI_LOSS_BLOCK_UNKNOWN_COST:
         return {
             "ok": False,
+            "reason": "unknown_cost_blocked",
             "sale_price_tl": round(sale_price_tl, 2),
             "net_income_tl": net_income,
             "panel_cost_tl": round(total_cost, 2),
             "projected_profit_tl": projected_profit,
             "min_profit_tl": min_profit,
+            "min_profit_fixed_tl": min_profit_tl,
+            "min_profit_percent": min_profit_percent,
+            "services": service_rows,
+            "unknown": unknown_rows,
+            "context": context,
+        }
+
+    if total_cost > 0 and projected_profit < min_profit:
+        return {
+            "ok": False,
+            "reason": "low_profit_blocked",
+            "sale_price_tl": round(sale_price_tl, 2),
+            "net_income_tl": net_income,
+            "panel_cost_tl": round(total_cost, 2),
+            "projected_profit_tl": projected_profit,
+            "min_profit_tl": min_profit,
+            "min_profit_fixed_tl": min_profit_tl,
+            "min_profit_percent": min_profit_percent,
             "services": service_rows,
             "unknown": unknown_rows,
             "context": context,
@@ -2731,6 +2942,9 @@ def check_anti_loss_guardrail_for_services(services: list[dict], sale_price_tl: 
         "net_income_tl": net_income,
         "panel_cost_tl": round(total_cost, 2),
         "projected_profit_tl": projected_profit,
+        "min_profit_tl": min_profit,
+        "min_profit_fixed_tl": min_profit_tl,
+        "min_profit_percent": min_profit_percent,
         "services": service_rows,
         "unknown": unknown_rows,
     }
@@ -2745,6 +2959,11 @@ def format_anti_loss_message(title: str, product_name: str, order_id: str, guard
     if guard.get("unknown"):
         service_lines.append(f"- Fiyatı okunamayan servis: {len(guard.get('unknown', []))} adet")
     details = "\n".join(service_lines) or "- Detay yok"
+    reason = str(guard.get("reason") or "")
+    reason_text = "\nSebep: Panel maliyeti okunamadı; güvenli mod siparişi durdurdu.\n" if reason == "unknown_cost_blocked" else ""
+    min_profit_text = ""
+    if guard.get("min_profit_tl") is not None:
+        min_profit_text = f"Minimum kâr: {format_tl_amount(guard.get('min_profit_tl', 0))}\n"
     return (
         f"{title}\n\n"
         f"Ürün/Paket: {product_name}\n"
@@ -2752,7 +2971,9 @@ def format_anti_loss_message(title: str, product_name: str, order_id: str, guard
         f"Satış: {format_tl_amount(guard.get('sale_price_tl', 0))}\n"
         f"Net gelir: {format_tl_amount(guard.get('net_income_tl', 0))}\n"
         f"Panel maliyeti: {format_tl_amount(guard.get('panel_cost_tl', 0))}\n"
-        f"Tahmini kâr: {format_tl_amount(guard.get('projected_profit_tl', 0))}\n\n"
+        f"Tahmini kâr: {format_tl_amount(guard.get('projected_profit_tl', 0))}\n"
+        f"{min_profit_text}"
+        f"{reason_text}\n"
         f"Servisler:\n{details}\n\n"
         f"Sipariş panele gönderilmedi. Fiyat/ilan/panel servisini kontrol et."
     )
@@ -3471,7 +3692,7 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
     if is_panel_circuit_open(panel_id):
         msg = f"Circuit Breaker aktif. {panel_id} geçici kapalı."
         log("warning", "circuit_open_skip_request", panel=panel_id, action=action)
-        if _queue_context_active() and action in {"balance", "services"}:
+        if _queue_context_active():
             raise CircuitOpenForOrder(panel_id, msg, retry_after=get_panel_circuit_retry_after(panel_id))
         return {"error": msg, "circuit_open": True, "retryable": True}
     payload = {"key": api_key, "action": action}
@@ -4108,6 +4329,428 @@ canvas { max-width: 100%; }
   .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
 }
 
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -4213,24 +4856,6 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 })();
 </script>
 
-<script>
-(function(){
-  function applyMobileTableLabels(){
-    document.querySelectorAll('table').forEach(function(table){
-      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
-      table.querySelectorAll('tbody tr').forEach(function(row){
-        Array.from(row.children).forEach(function(cell, i){
-          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
-            cell.setAttribute('data-label', heads[i]);
-          }
-        });
-      });
-    });
-  }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
-  else applyMobileTableLabels();
-})();
-</script>
 
 </body>
 </html>
@@ -4771,6 +5396,428 @@ canvas { max-width: 100%; }
   .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
 }
 
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -4871,24 +5918,6 @@ canvas { max-width: 100%; }
 })();
 </script>
 
-<script>
-(function(){
-  function applyMobileTableLabels(){
-    document.querySelectorAll('table').forEach(function(table){
-      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
-      table.querySelectorAll('tbody tr').forEach(function(row){
-        Array.from(row.children).forEach(function(cell, i){
-          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
-            cell.setAttribute('data-label', heads[i]);
-          }
-        });
-      });
-    });
-  }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
-  else applyMobileTableLabels();
-})();
-</script>
 
 </body>
 </html>
@@ -5367,6 +6396,428 @@ canvas { max-width: 100%; }
   .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
 }
 
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -5459,24 +6910,6 @@ async function updateManualCost(){
 })();
 </script>
 
-<script>
-(function(){
-  function applyMobileTableLabels(){
-    document.querySelectorAll('table').forEach(function(table){
-      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
-      table.querySelectorAll('tbody tr').forEach(function(row){
-        Array.from(row.children).forEach(function(cell, i){
-          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
-            cell.setAttribute('data-label', heads[i]);
-          }
-        });
-      });
-    });
-  }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
-  else applyMobileTableLabels();
-})();
-</script>
 
 </body>
 </html>
@@ -5529,6 +6962,24 @@ def admin_manual_order_submit(
 
     fetched_service_name = fetch_panel_service_name_by_id(panel_key, service_id)
     final_product_name = str(product_name or "").strip() or fetched_service_name or f"{panel_conf['name']} Servis {service_id}"
+    manual_service = {
+        "panel_key": panel_key,
+        "panel": panel_conf.get("name", panel_key),
+        "api_url": panel_conf.get("api_url", ""),
+        "api_key": panel_conf.get("api_key", ""),
+        "service_id": service_id,
+        "quantity": quantity,
+    }
+    balance_data = panel_balance(panel_conf["api_url"], panel_conf["api_key"], panel_conf.get("name", panel_key))
+    if "error" in balance_data:
+        raise HTTPException(status_code=400, detail=f"Panel bakiyesi alınamadı: {balance_data.get('error')}")
+    manual_cost = estimate_order_cost_from_service(manual_service)
+    current_balance_tl = convert_balance_to_try(balance_data.get("balance"), balance_data.get("currency", ""))
+    if current_balance_tl is not None and manual_cost is not None and current_balance_tl < manual_cost:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Panel bakiyesi yetersiz. Bakiye: {format_tl_amount(current_balance_tl)}, tahmini maliyet: {format_tl_amount(manual_cost)}",
+        )
 
     smm_result = create_panel_order(
         panel_conf["api_url"],
@@ -5543,7 +6994,11 @@ def admin_manual_order_submit(
         log("error", "manual_order_failed", panel=panel_key, service_id=service_id, error=smm_result.get("error"))
         raise HTTPException(status_code=400, detail=f"Panel sipariş hatası: {smm_result.get('error')}")
 
-    smm_order_id = smm_result.get("order", "Bilinmiyor")
+    smm_order_id = get_smm_order_id_from_result(smm_result)
+    if not smm_order_id:
+        log("error", "manual_order_missing_smm_id", panel=panel_key, service_id=service_id, response=str(smm_result)[:500])
+        raise HTTPException(status_code=400, detail="Panel siparişi oluştu gibi görünüyor ama SMM order ID dönmedi. Panelden manuel kontrol et; bot pending'e eklemedi.")
+
     manual_order_id = f"manual-{now_tr().strftime('%Y%m%d%H%M%S')}"
     manual_advert_id = f"manual-{panel_key}-{service_id}"
 
@@ -5564,6 +7019,7 @@ def admin_manual_order_submit(
     )
 
     log("success", "manual_order_created", panel=panel_key, service_id=service_id, smm_order_id=smm_order_id)
+    manual_cost = estimate_order_cost_from_service(manual_service)
     send_telegram(
         f"Manuel SMM siparişi panele girildi.\n\n"
         f"Ürün: {final_product_name}\n"
@@ -5571,7 +7027,8 @@ def admin_manual_order_submit(
         f"Servis ID: {service_id}\n"
         f"SMM ID: {smm_order_id}\n"
         f"Adet: {quantity}\n"
-        f"Link: {panel_link}"
+        f"Link: {panel_link}\n\n"
+        f"{build_finance_summary(0, manual_cost)}"
     )
 
     msg = f"Sipariş panele girildi. SMM ID: {smm_order_id}"
@@ -5957,6 +7414,428 @@ canvas { max-width: 100%; }
   .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
 }
 
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -6009,24 +7888,6 @@ canvas { max-width: 100%; }
 })();
 </script>
 
-<script>
-(function(){
-  function applyMobileTableLabels(){
-    document.querySelectorAll('table').forEach(function(table){
-      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
-      table.querySelectorAll('tbody tr').forEach(function(row){
-        Array.from(row.children).forEach(function(cell, i){
-          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
-            cell.setAttribute('data-label', heads[i]);
-          }
-        });
-      });
-    });
-  }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
-  else applyMobileTableLabels();
-})();
-</script>
 
 </body>
 </html>
@@ -6439,6 +8300,428 @@ canvas { max-width: 100%; }
   .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
 }
 
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -6489,24 +8772,6 @@ canvas { max-width: 100%; }
 })();
 </script>
 
-<script>
-(function(){
-  function applyMobileTableLabels(){
-    document.querySelectorAll('table').forEach(function(table){
-      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
-      table.querySelectorAll('tbody tr').forEach(function(row){
-        Array.from(row.children).forEach(function(cell, i){
-          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
-            cell.setAttribute('data-label', heads[i]);
-          }
-        });
-      });
-    });
-  }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
-  else applyMobileTableLabels();
-})();
-</script>
 
 </body>
 </html>
@@ -6551,7 +8816,10 @@ def retry_failed_order_item(target: dict) -> dict:
     if "error" in smm_result:
         return {"ok": False, "error": smm_result.get("error")}
 
-    new_smm_order_id = smm_result.get("order", "Bilinmiyor")
+    new_smm_order_id = get_smm_order_id_from_result(smm_result)
+    if not new_smm_order_id:
+        return {"ok": False, "error": "panel_order_id_missing", "manual_check_required": True}
+
     add_pending_order(
         target.get("order_id", "Bilinmiyor"),
         advert_id,
@@ -7032,6 +9300,428 @@ canvas { max-width: 100%; }
   .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
 }
 
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -7326,24 +10016,6 @@ setInterval(loadAll, 30000);
 })();
 </script>
 
-<script>
-(function(){
-  function applyMobileTableLabels(){
-    document.querySelectorAll('table').forEach(function(table){
-      var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){ return th.textContent.trim(); });
-      table.querySelectorAll('tbody tr').forEach(function(row){
-        Array.from(row.children).forEach(function(cell, i){
-          if(cell.tagName && cell.tagName.toLowerCase() === 'td' && heads[i] && !cell.getAttribute('data-label')){
-            cell.setAttribute('data-label', heads[i]);
-          }
-        });
-      });
-    });
-  }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyMobileTableLabels);
-  else applyMobileTableLabels();
-})();
-</script>
 
 </body>
 </html>
@@ -7365,6 +10037,428 @@ DASHBOARD_HTML = """
 <style>
 :root{color-scheme:dark;--bg:#070a17;--panel:#0d1326;--card:#111a32;--card2:#0b1022;--border:rgba(148,163,184,.18);--text:#f8fafc;--muted:#94a3b8;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--blue:#38bdf8;--purple:#a78bfa;--shadow:0 18px 55px rgba(0,0,0,.30);--radius:22px}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 10% 0%,rgba(124,58,237,.18),transparent 32%),radial-gradient(circle at 90% 0%,rgba(34,211,238,.10),transparent 28%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;line-height:1.5}.wrap{max-width:1280px;margin:0 auto;padding:24px}.top{display:flex;gap:14px;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap}.brand h1{margin:0;font-size:28px;letter-spacing:-.04em}.brand p{margin:4px 0 0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap}.btn,button{border:1px solid var(--border);background:rgba(15,23,42,.75);color:var(--text);border-radius:14px;padding:11px 14px;text-decoration:none;font-weight:800;cursor:pointer}.btn:hover,button:hover{border-color:rgba(167,139,250,.55);transform:translateY(-1px)}button.green,.green{background:linear-gradient(135deg,#22c55e,#16a34a);border:0;color:white}.red{background:linear-gradient(135deg,#ef4444,#b91c1c);border:0;color:white}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.card{background:linear-gradient(180deg,rgba(17,26,50,.95),rgba(11,16,34,.92));border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);min-width:0}.stat .label{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:900}.stat .value{font-size:38px;font-weight:950;margin-top:8px;letter-spacing:-.04em;word-break:break-word}.stat .sub{color:var(--muted);font-size:13px;margin-top:4px}.line{height:3px;border-radius:9px;background:var(--purple);margin:-20px -20px 16px}.line.green{background:var(--green)}.line.red{background:var(--red)}.line.yellow{background:var(--yellow)}.line.blue{background:var(--blue)}.two{display:grid;grid-template-columns:1.2fr .8fr;gap:16px;margin-top:16px}.list{display:grid;gap:10px}.row{display:flex;justify-content:space-between;gap:12px;border:1px solid rgba(148,163,184,.10);background:rgba(2,6,23,.28);border-radius:14px;padding:12px}.muted{color:var(--muted)}.pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:900;background:rgba(148,163,184,.12);color:var(--muted)}.pill.ok{background:rgba(34,197,94,.15);color:#86efac}.pill.bad{background:rgba(239,68,68,.15);color:#fca5a5}.pill.warn{background:rgba(245,158,11,.15);color:#fcd34d}pre{white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px;color:#cbd5e1}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}.danger-note{border-color:rgba(239,68,68,.30);background:rgba(239,68,68,.08)}@media(max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}}@media(max-width:640px){.wrap{padding:14px}.grid{grid-template-columns:1fr}.top{align-items:stretch}.nav{display:grid;grid-template-columns:1fr 1fr;width:100%}.btn,button{width:100%;text-align:center}.stat .value{font-size:34px}.row{display:grid;grid-template-columns:1fr}.card{padding:16px;border-radius:18px}.line{margin:-16px -16px 14px}}
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -7551,7 +10645,7 @@ def api_failed(user: str = Depends(get_current_admin)):
 
 @app.get("/api/logs")
 def api_logs(user: str = Depends(get_current_admin)):
-    return {"logs": LOG_HISTORY[-80:]}
+    return {"logs": list(LOG_HISTORY)[-80:]}
 
 
 @app.get("/api/history")
@@ -8000,6 +11094,428 @@ canvas { max-width: 100%; }
   .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
 }
 
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 </head>
 <body>
@@ -8148,6 +11664,12 @@ def build_system_check() -> dict:
     return {
         "ok": not bool(duplicate_routes),
         "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "webhook_security": {
+            "secret_configured": bool(WEBHOOK_SECRET_TOKEN),
+            "require_secret": bool(REQUIRE_WEBHOOK_SECRET),
+            "ip_whitelist_count": len(WEBHOOK_IP_WHITELIST),
+            "warning": "" if WEBHOOK_SECRET_TOKEN else "WEBHOOK_SECRET_TOKEN boş. Üretimde token tanımlaman önerilir.",
+        },
         "routes_count": len(app.routes),
         "duplicate_routes": duplicate_routes,
         "missing_env": missing_env,
@@ -8607,6 +12129,428 @@ canvas { max-width: 100%; }
 .itemsatis-stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
 .itemsatis-stat { min-width:0; overflow:hidden; }
 @media (max-width: 700px) { .itemsatis-stats { grid-template-columns:1fr !important; } .itemsatis-stat { width:100%; } }
+/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
+:root {
+  --v15-bg-deep: #050816;
+  --v15-panel: rgba(15, 23, 42, .78);
+  --v15-panel-strong: rgba(15, 23, 42, .94);
+  --v15-border: rgba(148, 163, 184, .20);
+  --v15-border-strong: rgba(168, 85, 247, .32);
+  --v15-glow-purple: rgba(139, 92, 246, .28);
+  --v15-glow-cyan: rgba(34, 211, 238, .18);
+  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
+  --v15-radius: 24px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
+    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
+  z-index: -2;
+}
+
+header,
+.topbar {
+  border-color: var(--v15-border);
+  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
+  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+.logo,
+.brand,
+h1,
+h2,
+h3 {
+  letter-spacing: -0.035em;
+}
+
+.container,
+.shell,
+.wrap {
+  width: min(1560px, calc(100% - 32px));
+}
+
+.card,
+.stat,
+.stat-card,
+.notice,
+.filter-box,
+.package-card,
+.component-card,
+.chart-wrap {
+  border: 1px solid var(--v15-border);
+  background:
+    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
+    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
+  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
+  border-radius: var(--v15-radius);
+}
+
+.card:hover,
+.stat:hover,
+.stat-card:hover,
+.package-card:hover,
+.component-card:hover {
+  border-color: rgba(196,181,253,.34);
+  transform: translateY(-1px);
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+
+.card-title,
+.stat-label,
+.label {
+  letter-spacing: .12em;
+}
+
+.stat-value,
+.value {
+  letter-spacing: -0.055em;
+}
+
+.badge,
+.pill,
+.price-badge {
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  white-space: nowrap;
+}
+
+button,
+.btn,
+.link-btn,
+.refresh-btn,
+input[type="submit"] {
+  min-height: 42px;
+  touch-action: manipulation;
+  font-weight: 800;
+  letter-spacing: -.01em;
+}
+
+button:hover,
+.btn:hover,
+.link-btn:hover,
+.refresh-btn:hover,
+input[type="submit"]:hover {
+  transform: translateY(-1px);
+}
+
+input,
+select,
+textarea {
+  min-height: 44px;
+  border-color: rgba(148,163,184,.22) !important;
+  background: rgba(2,6,23,.45) !important;
+  color: #f8fafc !important;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(168,85,247,.72) !important;
+  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
+}
+
+textarea { resize: vertical; }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th {
+  color: #c4b5fd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+td, th { vertical-align: middle; }
+
+.log-list,
+pre,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
+}
+
+.log-list::-webkit-scrollbar,
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.card::-webkit-scrollbar {
+  height: 7px;
+  width: 7px;
+}
+
+.log-list::-webkit-scrollbar-thumb,
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb {
+  background: rgba(139,92,246,.45);
+  border-radius: 999px;
+}
+
+.nav,
+.top-actions,
+.actions,
+.toolbar {
+  gap: 10px;
+}
+
+.nav a,
+.top-actions a,
+.actions a,
+.toolbar a,
+.toolbar button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card:has(table),
+.notice:has(table),
+.filter-box:has(table) {
+  overflow-x: auto;
+}
+
+.price-badge,
+.value,
+.stat-value {
+  text-shadow: 0 0 24px rgba(139,92,246,.15);
+}
+
+@media (max-width: 900px) {
+  header,
+  .topbar {
+    position: static;
+    width: calc(100% - 20px);
+    margin: 10px auto 0;
+    padding: 12px;
+    border-radius: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logo,
+  .brand {
+    font-size: clamp(20px, 6vw, 28px);
+    line-height: 1.05;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 20px);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .two,
+  .form-grid,
+  .components-grid,
+  .packages {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 18px !important;
+    border-radius: 20px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .nav a,
+  .top-actions a,
+  .actions a,
+  .toolbar a,
+  .toolbar button,
+  .btn,
+  .link-btn,
+  .refresh-btn,
+  button,
+  input[type="submit"] {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px !important;
+    border-radius: 14px !important;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100% !important;
+    font-size: 16px !important;
+    border-radius: 14px !important;
+  }
+
+  label,
+  .label {
+    font-size: 13px;
+  }
+
+  table {
+    min-width: 720px;
+    font-size: 13px;
+  }
+
+  td, th {
+    padding: 10px 12px !important;
+  }
+
+  .stat-value,
+  .value {
+    font-size: clamp(30px, 12vw, 46px) !important;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  .stat-label {
+    font-size: 11px !important;
+  }
+
+  .log-entry,
+  .order-row,
+  .history-row,
+  .line,
+  .component-line {
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .muted,
+  .small,
+  .sub,
+  .stat-sub,
+  .order-detail {
+    font-size: 13px !important;
+    line-height: 1.55;
+  }
+
+  pre {
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 14px; }
+
+  header,
+  .topbar {
+    width: calc(100% - 14px);
+    margin-top: 7px;
+    border-radius: 16px;
+  }
+
+  .container,
+  .shell,
+  .wrap {
+    width: calc(100% - 14px);
+  }
+
+  .card,
+  .stat,
+  .stat-card,
+  .notice,
+  .filter-box,
+  .package-card,
+  .component-card,
+  .chart-wrap {
+    padding: 15px !important;
+    border-radius: 18px !important;
+  }
+
+  .nav,
+  .top-actions,
+  .actions,
+  .toolbar {
+    grid-template-columns: 1fr !important;
+  }
+
+  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
+  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
+  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
+
+  .stat-value,
+  .value {
+    font-size: clamp(28px, 14vw, 42px) !important;
+  }
+
+  .badge,
+  .pill,
+  .price-badge {
+    display: inline-flex;
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .row,
+  .order-row,
+  .history-row,
+  .line,
+  .package-head,
+  .component-line {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  table {
+    min-width: 640px;
+  }
+
+  .card:has(table),
+  .notice:has(table),
+  .filter-box:has(table) {
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  body {
+    padding-left: max(0px, env(safe-area-inset-left));
+    padding-right: max(0px, env(safe-area-inset-right));
+  }
+}
+
 </style>
 """
 
@@ -9269,7 +13213,7 @@ def admin_link_audit(user: str = Depends(get_current_admin)):
 
 @app.get("/admin/failed-actions", response_class=HTMLResponse)
 def admin_failed_actions(user: str = Depends(get_current_admin)):
-    rows = "".join([f"<tr><td data-label='Ürün'>{o.get('product_name')}</td><td data-label='Sipariş'>{o.get('order_id')}</td><td data-label='SMM'>{o.get('smm_order_id','-')}</td><td data-label='Panel'>{o.get('panel','-')}</td><td data-label='Sebep'>{o.get('reason')}</td><td data-label='Link'>{o.get('link','')}</td><td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'><input type='hidden' name='smm_order_id' value='{o.get('smm_order_id','')}'><button class='green'>Tamamlandı İşaretle</button></form><form method='post' action='/admin/failed/blacklist-link'><input type='hidden' name='link' value=\"{str(o.get('link','')).replace(chr(34),'&quot;')}\"><button class='red'>Linki Blacklist</button></form></td></tr>" for o in reversed(FAILED_ORDERS[-50:])])
+    rows = "".join([f"<tr><td data-label='Ürün'>{o.get('product_name')}</td><td data-label='Sipariş'>{o.get('order_id')}</td><td data-label='SMM'>{o.get('smm_order_id','-')}</td><td data-label='Panel'>{o.get('panel','-')}</td><td data-label='Sebep'>{o.get('reason')}</td><td data-label='Link'>{o.get('link','')}</td><td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'><input type='hidden' name='smm_order_id' value='{o.get('smm_order_id','')}'><input type='hidden' name='order_id' value='{o.get('order_id','')}'><button class='green' type='submit'>Tamamlandı İşaretle</button></form><form method='post' action='/admin/failed/blacklist-link'><input type='hidden' name='link' value=\"{str(o.get('link','')).replace(chr(34),'&quot;')}\"><button class='red'>Linki Blacklist</button></form></td></tr>" for o in reversed(FAILED_ORDERS[-50:])])
     body = f"<div class='card'><div class='muted'>Başarısız siparişler için hızlı çözüm merkezi.</div><table class='table'><thead><tr><th>Ürün</th><th>Sipariş</th><th>SMM</th><th>Panel</th><th>Sebep</th><th>Link</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Başarısız sipariş yok.</td></tr>'}</tbody></table></div>"
     return simple_admin_page("Hatalı Sipariş Çözüm Merkezi", body)
 
@@ -9282,14 +13226,74 @@ def admin_failed_blacklist_link(link: str = Form(...), user: str = Depends(get_c
 
 
 @app.post("/admin/failed/mark-completed")
-def admin_failed_mark_completed(smm_order_id: str = Form(""), user: str = Depends(get_current_admin)):
-    for item in FAILED_ORDERS:
-        if str(item.get("smm_order_id", "")) == str(smm_order_id):
+def admin_failed_mark_completed(
+    smm_order_id: str = Form(""),
+    order_id: str = Form(""),
+    user: str = Depends(get_current_admin),
+):
+    """Hata merkezindeki siparişi manuel tamamlandı sayar, geçmişe taşır ve failed listesinden kaldırır."""
+    target_smm_id = str(smm_order_id or "").strip()
+    target_order_id = str(order_id or "").strip()
+    removed = False
+    for index, item in enumerate(list(FAILED_ORDERS)):
+        item_smm_id = str(item.get("smm_order_id", "")).strip()
+        item_order_id = str(item.get("order_id", "")).strip()
+        matches_smm = bool(target_smm_id) and item_smm_id == target_smm_id
+        matches_order = bool(target_order_id) and item_order_id == target_order_id
+        if matches_smm or matches_order:
             item["manual_completed"] = True
-            add_order_history(item.get("order_id", "Bilinmiyor"), item.get("advert_id", ""), item.get("product_name", "Bilinmeyen Ürün"), item.get("panel", ""), item.get("smm_order_id", ""), item.get("link", ""), item.get("price", 0))
+            item["manual_completed_at"] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+            add_order_history(
+                item.get("order_id", "Bilinmiyor"),
+                item.get("advert_id", ""),
+                item.get("product_name", "Bilinmeyen Ürün"),
+                item.get("panel", ""),
+                item.get("smm_order_id", ""),
+                item.get("link", ""),
+                item.get("price", 0),
+            )
+            try:
+                FAILED_ORDERS.pop(index)
+            except Exception:
+                pass
+            removed = True
             save_state()
+            send_telegram(
+                f"Sipariş manuel tamamlandı işaretlendi.\n\n"
+                f"Itemsatış ID: {item.get('order_id', '-') }\n"
+                f"SMM ID: {item.get('smm_order_id', '-') }\n"
+                f"Ürün: {item.get('product_name', '-')}"
+            )
             break
+    if not removed:
+        log("warning", "manual_completed_failed_not_found", smm_order_id=target_smm_id, order_id=target_order_id)
     return RedirectResponse("/admin/failed-actions", status_code=303)
+
+
+@app.get("/health")
+def health():
+    try:
+        redis_ok = bool(build_redis_health().get("ok")) if "build_redis_health" in globals() else bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+    except Exception:
+        redis_ok = False
+    return {
+        "ok": True,
+        "status": "running",
+        "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "redis_ok": redis_ok,
+        "pending": len(PENDING_ORDERS),
+        "failed": len(FAILED_ORDERS),
+        "queue": {
+            "waiting": redis_llen(ITEMSATIS_WEBHOOK_QUEUE_KEY),
+            "processing": redis_llen(ITEMSATIS_WEBHOOK_PROCESSING_KEY),
+            "dead": redis_llen(ITEMSATIS_WEBHOOK_DEAD_KEY),
+        },
+    }
+
+
+@app.head("/health")
+def health_head():
+    return {"ok": True}
 
 @app.get("/test")
 def test_message():
@@ -9302,9 +13306,13 @@ def test_head():
 
 
 @app.get("/my-ip")
-def my_ip():
-    r = requests.get("https://api.ipify.org?format=json", timeout=30)
-    return r.json()
+def my_ip(user: str = Depends(get_current_admin)):
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=30)
+        return r.json()
+    except Exception as e:
+        log("error", "my_ip_lookup_failed", error=str(e))
+        return {"ok": False, "error": str(e)}
 
 
 @app.head("/check-orders")
@@ -9849,6 +13857,22 @@ def process_itemsatis_webhook_payload(data: dict):
                     continue
 
                 component_link = normalize_panel_link(customer_link, service.get("platform", detected_link_platform or package_platform))
+                balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
+                if "error" in balance_data:
+                    error_text = f"Bakiye alınamadı: {balance_data.get('error')}"
+                    failed_rows.append((component_name, service.get("panel", "Panel"), error_text))
+                    add_failed_order(order_id, advert_id, component_label, "Paket panel bakiyesi alınamadı", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""), retryable=True)
+                    continue
+                balance = balance_data.get("balance", "")
+                currency = balance_data.get("currency", "")
+                check_low_balance(balance, currency, service.get("panel", ""), service.get("panel_key", ""))
+                estimated_cost = estimate_order_cost_from_service(service)
+                current_balance_tl = convert_balance_to_try(balance, currency)
+                if current_balance_tl is not None and estimated_cost is not None and current_balance_tl < estimated_cost:
+                    error_text = f"Panel bakiyesi yetersiz. Bakiye: {format_tl_amount(current_balance_tl)}, tahmini maliyet: {format_tl_amount(estimated_cost)}"
+                    failed_rows.append((component_name, service.get("panel", "Panel"), error_text))
+                    add_failed_order(order_id, advert_id, component_label, "Paket panel bakiyesi yetersiz", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""), retryable=True)
+                    continue
                 smm_result = create_panel_order(
                     service["api_url"],
                     service["api_key"],
@@ -9864,7 +13888,13 @@ def process_itemsatis_webhook_payload(data: dict):
                     add_failed_order(order_id, advert_id, component_label, "Paket panel sipariş hatası", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""))
                     continue
 
-                smm_order_id = smm_result.get("order", "Bilinmiyor")
+                smm_order_id = get_smm_order_id_from_result(smm_result)
+                if not smm_order_id:
+                    error_text = f"Panel order ID dönmedi. Cevap: {str(smm_result)[:300]}"
+                    failed_rows.append((component_name, service.get("panel", "Panel"), error_text))
+                    add_failed_order(order_id, advert_id, component_label, "Panel order ID eksik", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""), retryable=False)
+                    continue
+
                 add_pending_order(
                     order_id,
                     advert_id,
@@ -9890,8 +13920,12 @@ def process_itemsatis_webhook_payload(data: dict):
 
             success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id}" for name, panel, smm_id in success_rows]) or "Yok"
             failed_text = "\n".join([f"❌ {name} | {panel} | {err}" for name, panel, err in failed_rows]) or "Yok"
+            package_cost = estimate_package_cost_tl(components)
             send_telegram(
-                f"Paket sipariş işlendi.\n\nPaket: {package_name}\nItemsatış ID: {order_id}\nLink: {customer_link}\n\nBaşarılı:\n{success_text}\n\nHatalı:\n{failed_text}"
+                f"Paket sipariş işlendi.\n\nPaket: {package_name}\nItemsatış ID: {order_id}\nLink: {customer_link}\n\n"
+                f"Başarılı:\n{success_text}\n\nHatalı:\n{failed_text}\n\n"
+                f"{build_finance_summary(price, package_cost)}\n\n"
+                f"{build_buyer_summary(buyer)}"
             )
 
             if not success_rows:
@@ -9953,6 +13987,17 @@ def process_itemsatis_webhook_payload(data: dict):
             balance = balance_data.get("balance", "Bilinmiyor")
             currency = balance_data.get("currency", "")
             check_low_balance(balance, currency, service["panel"])
+            estimated_cost = estimate_order_cost_from_service(service)
+            current_balance_tl = convert_balance_to_try(balance, currency)
+            if current_balance_tl is not None and estimated_cost is not None and current_balance_tl < estimated_cost:
+                detail = f"Bakiye: {format_tl_amount(current_balance_tl)}, tahmini maliyet: {format_tl_amount(estimated_cost)}"
+                add_failed_order(order_id, advert_id, service_name, "Panel bakiyesi yetersiz", detail, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""), retryable=True)
+                notify_customer_order_failed(order_id, service_name)
+                send_telegram(
+                    f"Panel bakiyesi yetersiz olduğu için sipariş panele gönderilmedi.\n\n"
+                    f"Sipariş ID: {order_id}\nÜrün: {service_name}\nPanel: {service.get('panel', '')}\n{detail}"
+                )
+                return {"ok": False, "error": "insufficient_panel_balance"}
 
             smm_result = create_panel_order(service["api_url"], service["api_key"],
                                             service["service_id"], customer_link, service["quantity"], service.get("panel", ""))
@@ -9963,7 +14008,16 @@ def process_itemsatis_webhook_payload(data: dict):
                 send_telegram(f"Panel siparişi başarısız.\n\nSipariş ID: {order_id}\nHata: {smm_result.get('error')}")
                 return {"ok": False, "error": "panel_order_error"}
 
-            smm_order_id = smm_result.get("order", "Bilinmiyor")
+            smm_order_id = get_smm_order_id_from_result(smm_result)
+            if not smm_order_id:
+                add_failed_order(order_id, advert_id, service_name, "Panel order ID eksik", str(smm_result)[:500], link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""), retryable=False)
+                notify_customer_order_failed(order_id, service_name)
+                send_telegram(
+                    f"Panel siparişi belirsiz cevap verdi.\n\n"
+                    f"Sipariş ID: {order_id}\nÜrün: {service_name}\nPanel: {service.get('panel', '')}\n"
+                    f"Panel order ID dönmediği için bot pending'e eklemedi. Panelden manuel kontrol gerekli."
+                )
+                return {"ok": False, "error": "panel_order_id_missing", "manual_check_required": True}
 
             PROCESSED_LINKS.add(duplicate_link_key)
             PROCESSED_ORDERS.add(order_key)
@@ -9987,10 +14041,18 @@ def process_itemsatis_webhook_payload(data: dict):
             # YENİ: Müşteriye sipariş başladı bildirimi
             notify_customer_order_started(order_id, service_name, customer_link)
 
+            estimated_cost = estimate_order_cost_from_service(service)
+            current_balance_tl = convert_balance_to_try(balance, currency)
+            after_balance_text = ""
+            if current_balance_tl is not None and estimated_cost is not None:
+                after_balance_text = f"\nTahmini sipariş sonrası bakiye: {format_tl_amount(current_balance_tl - estimated_cost)}"
+
             send_telegram(
                 f"SMM siparişi panele girildi.\n\nÜrün: {service_name}\nPanel: {service['panel']}\n"
                 f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
-                f"Adet: {service['quantity']}\nBakiye: {format_tl_amount(convert_balance_to_try(balance, currency) or 0)}"
+                f"Adet: {service['quantity']}\nBakiye: {format_tl_amount(current_balance_tl or 0)}{after_balance_text}\n\n"
+                f"{build_finance_summary(price, estimated_cost)}\n\n"
+                f"{build_buyer_summary(buyer)}"
             )
 
             return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
@@ -10020,13 +14082,25 @@ async def itemsatis_webhook(request: Request):
         log("info", "webhook_ignored_before_queue", event=event)
         return {"ignored": True, "event": event}
     order_id = get_order_id(data)
+    seen_key = ""
+    seen_locked = False
     if order_id and str(order_id) != "Bilinmiyor":
         seen_key = f"itemsatis:webhook_seen:{order_id}"
         seen = redis_set_raw(seen_key, "1", ex=86400, nx=True)
         if isinstance(seen, dict) and seen.get("result") is None:
             log("warning", "webhook_duplicate_seen_before_queue", order_id=order_id)
             return {"ok": True, "status": "already_queued", "order_id": order_id}
-    queue_id = enqueue_itemsatis_webhook(data)
+        if not redis_set_succeeded(seen):
+            log("error", "webhook_duplicate_lock_failed", order_id=order_id, redis_result=str(seen)[:300])
+            raise HTTPException(status_code=503, detail="Redis duplicate lock failed")
+        seen_locked = True
+    try:
+        queue_id = enqueue_itemsatis_webhook(data)
+    except Exception as e:
+        if seen_locked and seen_key:
+            redis_delete_key(seen_key)
+        log("error", "webhook_queue_failed", order_id=order_id, error=str(e))
+        raise HTTPException(status_code=503, detail="Webhook queue write failed")
     return {"ok": True, "status": "queued", "queue_id": queue_id}
 
 
