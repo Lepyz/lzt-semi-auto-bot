@@ -4124,6 +4124,7 @@ canvas { max-width: 100%; }
   <a href="/admin/packages"><button type="button">Paketler</button></a>
   <a href="/admin/service-search"><button type="button">Servis Ara</button></a>
   <a href="/admin/itemsatis-adverts"><button type="button">Itemsatış İlanları</button></a>
+  <a href="/admin/adverts-bind"><button type="button">İlan Bağla</button></a>
   <a href="/admin/queue-dead"><button type="button">Queue Dead</button></a>
   <a href="/admin/favorites"><button type="button">Favoriler</button></a>
   <a href="/admin/package-test"><button type="button">Paket Test</button></a>
@@ -8485,7 +8486,7 @@ def simple_admin_page(title: str, body: str) -> HTMLResponse:
     nav = """
     <div class="toolbar">
       <a href="/admin">Admin</a><a href="/">Dashboard</a><a href="/admin/service-search">Servis Ara</a>
-      <a href="/admin/itemsatis-adverts">Itemsatış İlanları</a><a href="/admin/queue-dead">Queue Dead</a>
+      <a href="/admin/itemsatis-adverts">Itemsatış İlanları</a><a href="/admin/adverts-bind">İlan Bağla</a><a href="/admin/queue-dead">Queue Dead</a>
       <a href="/admin/favorites">Favoriler</a><a href="/admin/package-test">Paket Test</a>
       <a href="/admin/balance-history">Bakiye Geçmişi</a><a href="/admin/link-audit">Link Geçmişi</a>
       <a href="/admin/failed-actions">Hata Merkezi</a><a href="/admin/profit-calculator">Kâr Hesapla</a>
@@ -8493,6 +8494,170 @@ def simple_admin_page(title: str, body: str) -> HTMLResponse:
     """
     html = f"<!doctype html><html lang='tr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title>{ADMIN_TOOL_CSS}</head><body><main class='wrap'><h1>{title}</h1>{nav}{body}</main></body></html>"
     return HTMLResponse(html)
+
+
+
+# ─── İLAN → SERVİS / PAKET BAĞLAMA SİHİRBAZI ────────────────────────────────
+def infer_advert_binding_fields(name: str) -> dict:
+    """İlan adından platform, adet ve arama terimini tahmin eder. Yanlışsa admin formdan düzeltir."""
+    raw = str(name or "").strip()
+    text = normalize_text(raw)
+    platform = "other"
+    platform_keywords = {
+        "instagram": ["instagram", "insta", "ig"],
+        "tiktok": ["tiktok", "tik tok"],
+        "youtube": ["youtube", "yt", "shorts"],
+        "x": ["twitter", " x ", "tweet"],
+        "twitch": ["twitch"],
+        "kick": ["kick"],
+    }
+    padded = f" {text} "
+    for key, words in platform_keywords.items():
+        if any(w in padded for w in words):
+            platform = key
+            break
+
+    quantity = 1000
+    try:
+        # 20k / 20 bin / 20.000 gibi ifadeleri yakala.
+        m = re.search(r"(\d+(?:[\.,]\d+)?)\s*(k|bin)\b", text)
+        if m:
+            number = float(m.group(1).replace(",", "."))
+            quantity = int(number * 1000)
+        else:
+            numbers = []
+            for m in re.finditer(r"\b(\d{1,7})(?:[\.,](\d{3}))?\b", text):
+                token = m.group(0).replace(".", "").replace(",", "")
+                try:
+                    value = int(token)
+                except Exception:
+                    continue
+                # yıl, ay, gün gibi ürün adlarındaki yanıltıcı küçük sayıları tamamen eleme; en büyük makul adet seçilir.
+                if 1 <= value <= 1000000:
+                    numbers.append(value)
+            if numbers:
+                quantity = max(numbers)
+    except Exception:
+        quantity = 1000
+    quantity = max(1, min(int(quantity or 1000), 1000000))
+
+    service_words = []
+    if "takip" in text or "follower" in text:
+        service_words.append("takipçi")
+    if "beğeni" in text or "begeni" in text or "like" in text:
+        service_words.append("beğeni")
+    if "izlen" in text or "view" in text:
+        service_words.append("izlenme")
+    if "yorum" in text or "comment" in text:
+        service_words.append("yorum")
+    if "favori" in text or "kaydet" in text or "save" in text:
+        service_words.append("favori")
+    if "paylaş" in text or "paylas" in text or "share" in text:
+        service_words.append("paylaşım")
+    if "türk" in text or "turk" in text:
+        service_words.append("türk")
+    if "paket" in text:
+        service_words.append("paket")
+
+    query_parts = []
+    if platform != "other":
+        query_parts.append(platform)
+    query_parts.extend(service_words[:4])
+    search_query = " ".join(dict.fromkeys([p for p in query_parts if p])).strip()
+    if not search_query:
+        # Uzun ilan adını direkt arama diye göndermeyelim, ilk anlamlı kelimeleri kullan.
+        search_query = " ".join([w for w in re.sub(r"[^a-zA-ZçğıöşüÇĞİÖŞÜ0-9 ]", " ", raw).split() if len(w) > 2][:4])
+
+    is_package = "paket" in text or len([w for w in ["takip", "beğeni", "begeni", "izlen", "favori", "paylaş", "paylas", "yorum"] if w in text]) >= 2
+    return {"platform": platform, "quantity": quantity, "search_query": search_query, "is_package": is_package}
+
+
+def get_itemsatis_advert_record(advert_id: str) -> dict:
+    advert_id = str(advert_id or "").strip()
+    for item in collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=False):
+        if str((item or {}).get("advert_id")) == advert_id:
+            return dict(item or {})
+    name = get_itemsatis_report_name(advert_id, "") if advert_id else ""
+    return {"advert_id": advert_id, "name": name or f"Itemsatış İlanı {advert_id}", "url": "", "source": "fallback"}
+
+
+def get_advert_binding_status(advert_id: str) -> dict:
+    advert_id = str(advert_id or "").strip()
+    has_service = advert_id in get_all_services(include_inactive=True)
+    has_package = advert_id in get_package_configs(include_inactive=True)
+    if has_service and has_package:
+        return {"status": "both", "label": "Servis + Paket bağlı", "class": "ok"}
+    if has_service:
+        return {"status": "service", "label": "Servise bağlı", "class": "ok"}
+    if has_package:
+        return {"status": "package", "label": "Pakete bağlı", "class": "ok"}
+    return {"status": "missing", "label": "Bağlanmamış", "class": "pending"}
+
+
+def build_panel_select_options(selected: str = "") -> str:
+    selected_key = normalize_panel_key(selected or "")
+    return "".join([
+        f'<option value="{html.escape(k)}" {"selected" if k == selected_key else ""}>{html.escape(v.get("name", k))} ({html.escape(k)})</option>'
+        for k, v in PANEL_MAP.items()
+    ])
+
+
+def build_platform_options(selected: str = "") -> str:
+    selected = normalize_text(selected or "other") or "other"
+    platforms = ["instagram", "tiktok", "youtube", "x", "twitch", "kick", "other"]
+    return "".join([f'<option value="{p}" {"selected" if p == selected else ""}>{p}</option>' for p in platforms])
+
+
+def service_search_rows_for_binding(items: list, advert_id: str, quantity: int, platform: str, mode: str = "service", component_name: str = "") -> str:
+    rows = []
+    advert_id_e = html.escape(str(advert_id))
+    for item in items or []:
+        panel_key = str(item.get("panel_key", ""))
+        service_id = str(item.get("service_id", ""))
+        safe_name = html.escape(str(item.get("name", "")))
+        safe_category = html.escape(str(item.get("category", "")))
+        safe_panel = html.escape(str(item.get("panel_name", panel_key)))
+        rate_tl = html.escape(str(item.get("rate_tl", "")))
+        rate_value = "" if item.get("rate_tl_value") is None else str(item.get("rate_tl_value"))
+        cost_html = "-"
+        try:
+            if rate_value:
+                cost = (float(rate_value) / 1000) * int(quantity or 0)
+                cost_html = f"{cost:.4f} TL"
+        except Exception:
+            pass
+        if mode == "package":
+            action = (
+                f"<form method='post' action='/admin/bind-package/add-component'>"
+                f"<input type='hidden' name='advert_id' value='{advert_id_e}'>"
+                f"<input type='hidden' name='panel' value='{html.escape(panel_key)}'>"
+                f"<input type='hidden' name='service_id' value='{html.escape(service_id)}'>"
+                f"<input type='number' name='quantity' value='{int(quantity or 1000)}' min='1' max='1000000' required>"
+                f"<input name='component_name' value='{html.escape(component_name or str(item.get('name',''))[:60])}' placeholder='Bileşen adı'>"
+                f"<input type='hidden' name='platform' value='{html.escape(platform)}'>"
+                f"<button class='green'>Bileşen Olarak Ekle</button></form>"
+            )
+        else:
+            action = (
+                f"<form method='post' action='/admin/bind-service/save'>"
+                f"<input type='hidden' name='advert_id' value='{advert_id_e}'>"
+                f"<input type='hidden' name='panel' value='{html.escape(panel_key)}'>"
+                f"<input type='hidden' name='service_id' value='{html.escape(service_id)}'>"
+                f"<input type='hidden' name='quantity' value='{int(quantity or 1000)}'>"
+                f"<input type='hidden' name='platform' value='{html.escape(platform)}'>"
+                f"<button class='green'>Bu Servise Bağla</button></form>"
+            )
+        rows.append(
+            f"<tr data-rate-tl='{html.escape(rate_value)}'><td data-label='Panel'>{safe_panel}</td>"
+            f"<td data-label='ID'><code>{html.escape(service_id)}</code></td>"
+            f"<td data-label='Servis'>{safe_name}</td>"
+            f"<td data-label='Kategori'>{safe_category}</td>"
+            f"<td data-label='Fiyat'>{rate_tl} / 1000</td>"
+            f"<td data-label='Tahmini Maliyet'>{html.escape(cost_html)}</td>"
+            f"<td data-label='Min/Max'>{html.escape(str(item.get('min','')))} / {html.escape(str(item.get('max','')))}</td>"
+            f"<td data-label='İşlem'>{action}</td></tr>"
+        )
+    return "".join(rows)
 
 
 @app.get("/admin/service-search", response_class=HTMLResponse)
@@ -8592,7 +8757,7 @@ def admin_itemsatis_adverts(refresh: int = 0, history: int = 0, user: str = Depe
 <td data-label='Durum'><span class='pill {pill_class}'>{label}</span></td>
 <td data-label='Kaynak'>{source}</td>
 <td data-label='Link'>{url_html}</td>
-<td data-label='İşlem'><form method='post' action='/admin/itemsatis-adverts/delete' onsubmit="return confirm('Bu ilan cache listesinden silinsin mi? Servis/paket eşleşmesi silinmez.');"><input type='hidden' name='advert_id' value='{html.escape(advert_id)}'><button class='red'>Sil</button></form></td>
+<td data-label='İşlem'><div class='toolbar' style='gap:6px;align-items:stretch;'><a class='btn' href='/admin/bind-service?advert_id={html.escape(advert_id)}'>Servise Bağla</a><a class='btn' href='/admin/bind-package?advert_id={html.escape(advert_id)}'>Pakete Bağla</a><form method='post' action='/admin/itemsatis-adverts/delete' onsubmit="return confirm('Bu ilan cache listesinden silinsin mi? Servis/paket eşleşmesi silinmez.');"><input type='hidden' name='advert_id' value='{html.escape(advert_id)}'><button class='red'>Sil</button></form></div></td>
 </tr>"""
         )
     history_link = "/admin/itemsatis-adverts?history=1" if not history else "/admin/itemsatis-adverts"
@@ -8614,7 +8779,7 @@ def admin_itemsatis_adverts(refresh: int = 0, history: int = 0, user: str = Depe
         <a class='btn' href='/admin/itemsatis-adverts?refresh=1'>Hızlı Yenile</a>
         <a class='btn' href='{history_link}'>{history_text}</a>
         <form method='post' action='/admin/itemsatis-adverts/clear' style='display:inline;' onsubmit="return confirm('İçe aktarılan ilan cache temizlensin mi? Dinamik servis/paket ayarları silinmez.');"><button class='red' type='submit'>İlan Cache Temizle</button></form>
-        <a class='btn' href='/admin'>Servis Bağlama Sayfasına Git</a>
+        <a class='btn' href='/admin/adverts-bind'>İlan Bağlama Sihirbazı</a>
       </div>
       <div class='itemsatis-stats'>
         <div class='itemsatis-stat'><b>Listelenen ilan</b><span class='stat'>{total_count}</span></div>
@@ -8721,6 +8886,183 @@ def admin_itemsatis_adverts_clear(user: str = Depends(get_current_admin)):
 def admin_itemsatis_adverts_refresh(user: str = Depends(get_current_admin)):
     fetch_itemsatis_public_adverts(force=True)
     return RedirectResponse("/admin/itemsatis-adverts", status_code=303)
+
+@app.get("/admin/adverts-bind", response_class=HTMLResponse)
+def admin_adverts_bind(status: str = "missing", q: str = "", user: str = Depends(get_current_admin)):
+    status = normalize_text(status or "missing")
+    q_norm = normalize_text(q or "")
+    items = collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=False)
+    rows = []
+    counts = {"all": 0, "missing": 0, "service": 0, "package": 0, "both": 0}
+    for item in items:
+        advert_id = str((item or {}).get("advert_id", "")).strip()
+        if not advert_id:
+            continue
+        name_raw = str((item or {}).get("name") or f"Itemsatış İlanı {advert_id}")
+        bind = get_advert_binding_status(advert_id)
+        counts["all"] += 1
+        counts[bind["status"]] = counts.get(bind["status"], 0) + 1
+        if status not in {"", "all"} and bind["status"] != status:
+            continue
+        if q_norm and q_norm not in normalize_text(f"{advert_id} {name_raw}"):
+            continue
+        infer = infer_advert_binding_fields(name_raw)
+        source = html.escape(str((item or {}).get("source", "")))
+        rows.append(
+            f"<tr><td data-label='İlan ID'><code>{html.escape(advert_id)}</code></td>"
+            f"<td data-label='İlan'>{html.escape(name_raw)}<div class='muted'>Kaynak: {source}</div></td>"
+            f"<td data-label='Durum'><span class='badge {html.escape(bind['class'])}'>{html.escape(bind['label'])}</span></td>"
+            f"<td data-label='Tahmin'>{html.escape(infer['platform'])} / {int(infer['quantity'])}<div class='muted'>{html.escape(infer['search_query']) or '-'}</div></td>"
+            f"<td data-label='İşlem'><div class='toolbar' style='gap:6px;align-items:stretch;'>"
+            f"<a class='btn' href='/admin/bind-service?advert_id={html.escape(advert_id)}'>Servise Bağla</a>"
+            f"<a class='btn' href='/admin/bind-package?advert_id={html.escape(advert_id)}'>Pakete Bağla</a>"
+            f"<a class='btn' href='/admin/itemsatis-adverts'>İlan Listesi</a>"
+            f"</div></td></tr>"
+        )
+    filters = " ".join([
+        f"<a class='btn' href='/admin/adverts-bind?status={key}'>{label}: {counts.get(key,0)}</a>"
+        for key, label in [("missing","Bağlanmamış"),("service","Servis"),("package","Paket"),("both","İkisi"),("all","Tümü")]
+    ])
+    body = f"""
+    <div class='card'><div class='muted'>İlanları servis veya paketle hızlı bağlamak için bu sihirbazı kullan. İlan adından platform/adet/arama önerisi otomatik tahmin edilir; yanlışsa formda düzeltebilirsin.</div>
+      <div class='toolbar'>{filters}</div>
+      <form class='grid' method='get'><input type='hidden' name='status' value='{html.escape(status)}'><input name='q' value='{html.escape(q)}' placeholder='İlan adı veya ID ara'><button>Filtrele</button></form>
+    </div>
+    <div class='card'><table class='table'><thead><tr><th>ID</th><th>İlan</th><th>Durum</th><th>Tahmin</th><th>İşlem</th></tr></thead><tbody>{''.join(rows) or '<tr><td>Bu filtrede ilan yok. Önce Itemsatış İlanları sayfasından içe aktar.</td></tr>'}</tbody></table></div>
+    """
+    return simple_admin_page("İlan Bağlama Sihirbazı", body)
+
+
+@app.get("/admin/bind-service", response_class=HTMLResponse)
+def admin_bind_service_page(advert_id: str, panel: str = "", q: str = "", quantity: int = 0, platform: str = "", user: str = Depends(get_current_admin)):
+    advert = get_itemsatis_advert_record(advert_id)
+    name = str(advert.get("name") or f"Itemsatış İlanı {advert_id}")
+    infer = infer_advert_binding_fields(name)
+    panel_key = normalize_panel_key(panel or "medyabayim")
+    quantity = int(quantity or infer.get("quantity") or 1000)
+    platform = normalize_text(platform or infer.get("platform") or "other") or "other"
+    q = str(q or infer.get("search_query") or "")
+    result = search_panel_services(panel_key, q, 80) if q else {"items": []}
+    rows = service_search_rows_for_binding(result.get("items", []), advert_id, quantity, platform, "service")
+    existing = get_all_services(include_inactive=True).get(str(advert_id), {})
+    existing_note = ""
+    if existing:
+        existing_note = f"<div class='notice warning'>Bu ilan zaten servise bağlı: {html.escape(str(existing.get('panel')))} / {html.escape(str(existing.get('service_id')))} / {html.escape(str(existing.get('quantity')))}</div>"
+    body = f"""
+    <div class='card'><h2>{html.escape(name)}</h2><div class='muted'>İlan ID: <code>{html.escape(str(advert_id))}</code></div>{existing_note}</div>
+    <div class='card'><h2>Direkt Servis Bağla</h2><form class='grid' method='post' action='/admin/bind-service/save'>
+      <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
+      <select name='panel'>{build_panel_select_options(panel_key)}</select>
+      <input name='service_id' placeholder='Panel Servis ID' pattern='^\\d+$' required>
+      <input type='number' name='quantity' value='{quantity}' min='1' max='1000000' required>
+      <select name='platform'>{build_platform_options(platform)}</select>
+      <button class='green'>Kaydet</button>
+    </form></div>
+    <div class='card'><h2>Servis Ara ve Tek Tıkla Bağla</h2><form class='grid' method='get'>
+      <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
+      <select name='panel'>{build_panel_select_options(panel_key)}</select>
+      <input name='q' value='{html.escape(q)}' placeholder='Örn: instagram türk takipçi'>
+      <input type='number' name='quantity' value='{quantity}' min='1' max='1000000'>
+      <select name='platform'>{build_platform_options(platform)}</select>
+      <button>Ara</button>
+    </form></div>
+    <div class='card'><table class='table'><thead><tr><th>Panel</th><th>ID</th><th>Servis</th><th>Kategori</th><th>Fiyat</th><th>Maliyet</th><th>Min/Max</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Arama yap veya sonuç yok.</td></tr>'}</tbody></table></div>
+    """
+    return simple_admin_page("İlanı Servise Bağla", body)
+
+
+@app.post("/admin/bind-service/save")
+def admin_bind_service_save(advert_id: str = Form(...), panel: str = Form(...), service_id: str = Form(...), quantity: int = Form(...), platform: str = Form("other"), user: str = Depends(get_current_admin)):
+    try:
+        set_dynamic_service(advert_id, panel, service_id, quantity, platform, True)
+        advert = get_itemsatis_advert_record(advert_id)
+        panel_service_name = fetch_panel_service_name_by_id(panel, service_id)
+        if panel_service_name:
+            cache_panel_service_name(panel, service_id, panel_service_name)
+        prime_service_price_cache(panel, service_id, str(advert.get("name") or f"Itemsatış ilanı {advert_id}"))
+        log("success", "advert_bound_to_service", advert_id=advert_id, panel=panel, service_id=service_id, quantity=quantity)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RedirectResponse("/admin/adverts-bind?status=missing", status_code=303)
+
+
+@app.get("/admin/bind-package", response_class=HTMLResponse)
+def admin_bind_package_page(advert_id: str, panel: str = "", q: str = "", quantity: int = 0, platform: str = "", component_name: str = "", user: str = Depends(get_current_admin)):
+    advert = get_itemsatis_advert_record(advert_id)
+    name = str(advert.get("name") or f"Paket {advert_id}")
+    infer = infer_advert_binding_fields(name)
+    platform = normalize_text(platform or infer.get("platform") or "tiktok") or "tiktok"
+    quantity = int(quantity or infer.get("quantity") or 1000)
+    q = str(q or infer.get("search_query") or "")
+    panel_key = normalize_panel_key(panel or "medyabayim")
+    package = get_package_configs(include_inactive=True).get(str(advert_id), {})
+    if not component_name:
+        component_name = "Paket Bileşeni"
+    comp_rows = []
+    for comp in (package or {}).get("components", []) or []:
+        comp_rows.append(f"<tr><td data-label='Bileşen'>{html.escape(str(comp.get('name','')))}</td><td data-label='Panel'>{html.escape(str(comp.get('panel','')))}</td><td data-label='Servis ID'><code>{html.escape(str(comp.get('service_id','')))}</code></td><td data-label='Adet'>{html.escape(str(comp.get('quantity','')))}</td><td data-label='Platform'>{html.escape(str(comp.get('platform','')))}</td></tr>")
+    result = search_panel_services(panel_key, q, 80) if q else {"items": []}
+    search_rows = service_search_rows_for_binding(result.get("items", []), advert_id, quantity, platform, "package", component_name)
+    body = f"""
+    <div class='card'><h2>{html.escape(name)}</h2><div class='muted'>İlan ID: <code>{html.escape(str(advert_id))}</code></div><div class='notice'>Paket yoksa ilk bileşen eklerken otomatik oluşturulur.</div></div>
+    <div class='card'><h2>Paket Oluştur / Güncelle</h2><form class='grid' method='post' action='/admin/bind-package/save'>
+      <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
+      <input name='name' value='{html.escape(str((package or {}).get('name') or name))}' placeholder='Paket adı'>
+      <select name='platform'>{build_platform_options(platform)}</select>
+      <button class='green'>Paketi Kaydet / Aktif Et</button>
+    </form></div>
+    <div class='card'><h2>Mevcut Bileşenler</h2><table class='table'><thead><tr><th>Bileşen</th><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Platform</th></tr></thead><tbody>{''.join(comp_rows) or '<tr><td>Henüz bileşen yok.</td></tr>'}</tbody></table></div>
+    <div class='card'><h2>Direkt Bileşen Ekle</h2><form class='grid' method='post' action='/admin/bind-package/add-component'>
+      <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
+      <input name='component_name' value='{html.escape(component_name)}' placeholder='Bileşen adı örn: İzlenme'>
+      <select name='panel'>{build_panel_select_options(panel_key)}</select>
+      <input name='service_id' placeholder='Panel Servis ID' pattern='^\\d+$' required>
+      <input type='number' name='quantity' value='{quantity}' min='1' max='1000000' required>
+      <select name='platform'>{build_platform_options(platform)}</select>
+      <button class='green'>Bileşen Ekle</button>
+    </form></div>
+    <div class='card'><h2>Servis Ara ve Bileşen Olarak Ekle</h2><form class='grid' method='get'>
+      <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
+      <select name='panel'>{build_panel_select_options(panel_key)}</select>
+      <input name='q' value='{html.escape(q)}' placeholder='Örn: tiktok izlenme'>
+      <input name='component_name' value='{html.escape(component_name)}' placeholder='Bileşen adı'>
+      <input type='number' name='quantity' value='{quantity}' min='1' max='1000000'>
+      <select name='platform'>{build_platform_options(platform)}</select>
+      <button>Ara</button>
+    </form></div>
+    <div class='card'><table class='table'><thead><tr><th>Panel</th><th>ID</th><th>Servis</th><th>Kategori</th><th>Fiyat</th><th>Maliyet</th><th>Min/Max</th><th>İşlem</th></tr></thead><tbody>{search_rows or '<tr><td>Arama yap veya sonuç yok.</td></tr>'}</tbody></table></div>
+    """
+    return simple_admin_page("İlanı Pakete Bağla", body)
+
+
+@app.post("/admin/bind-package/save")
+def admin_bind_package_save(advert_id: str = Form(...), name: str = Form(""), platform: str = Form("tiktok"), user: str = Depends(get_current_admin)):
+    try:
+        advert = get_itemsatis_advert_record(advert_id)
+        set_package(advert_id, name or str(advert.get("name") or f"Paket {advert_id}"), platform, True)
+        log("success", "advert_package_saved", advert_id=advert_id, platform=platform)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RedirectResponse(f"/admin/bind-package?advert_id={advert_id}", status_code=303)
+
+
+@app.post("/admin/bind-package/add-component")
+def admin_bind_package_add_component(advert_id: str = Form(...), component_name: str = Form("Paket Bileşeni"), panel: str = Form(...), service_id: str = Form(...), quantity: int = Form(...), platform: str = Form("tiktok"), user: str = Depends(get_current_admin)):
+    try:
+        advert = get_itemsatis_advert_record(advert_id)
+        if str(advert_id) not in PACKAGE_CONFIGS:
+            set_package(advert_id, str(advert.get("name") or f"Paket {advert_id}"), platform, True)
+        comp = add_package_component(advert_id, component_name, panel, service_id, quantity, platform)
+        panel_service_name = fetch_panel_service_name_by_id(panel, service_id)
+        if panel_service_name:
+            cache_panel_service_name(panel, service_id, panel_service_name)
+        prime_service_price_cache(panel, service_id, f"Paket: {str(advert.get('name') or advert_id)} / {component_name}")
+        log("success", "advert_package_component_added", advert_id=advert_id, panel=panel, service_id=service_id, component=comp.get("name"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RedirectResponse(f"/admin/bind-package?advert_id={advert_id}", status_code=303)
+
+
 @app.get("/admin/favorites", response_class=HTMLResponse)
 def admin_favorites(user: str = Depends(get_current_admin)):
     rows = "".join([
