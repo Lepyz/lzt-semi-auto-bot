@@ -226,11 +226,16 @@ BALANCE_WARN_REPEAT_MINUTES = int(os.getenv("BALANCE_WARN_REPEAT_MINUTES", "60")
 BALANCE_WARN_THRESHOLD_TL = float(os.getenv("BALANCE_WARN_THRESHOLD_TL", "100"))
 CHECK_BALANCE_INTERVAL_SECONDS = int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300"))
 VIP_ORDER_THRESHOLD = int(os.getenv("VIP_ORDER_THRESHOLD", "5"))
+PROFIT_TARGET_MARGIN_PERCENT = float(os.getenv("PROFIT_TARGET_MARGIN_PERCENT", "30"))
+PROFIT_MIN_TL = float(os.getenv("PROFIT_MIN_TL", "2"))
+HIGH_VALUE_ORDER_TL = float(os.getenv("HIGH_VALUE_ORDER_TL", "250"))
+PRODUCT_HEALTH_MIN_MARGIN_PERCENT = float(os.getenv("PRODUCT_HEALTH_MIN_MARGIN_PERCENT", "18"))
 BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "true").lower() == "true"
 BLACKLIST_AUTO_FAIL_COUNT = int(os.getenv("BLACKLIST_AUTO_FAIL_COUNT", "2"))
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
 PANEL_STATS = {}
+SERVICE_COMPLETION_STATS = {}
 BUYER_STATS = {}
 ORDER_NOTES = {}
 LINK_FAIL_COUNT = {}
@@ -1043,7 +1048,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, PANEL_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -1072,6 +1077,7 @@ def load_state():
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
     BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
     PANEL_STATS = redis_get_json("panel_stats", {})
+    SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
     BUYER_STATS = redis_get_json("buyer_stats", {})
     ORDER_NOTES = redis_get_json("order_notes", {})
     LINK_FAIL_COUNT = redis_get_json("link_fail_count", {})
@@ -1114,6 +1120,7 @@ def save_state():
             "message_templates": MESSAGE_TEMPLATES,
             "balance_warn_last": BALANCE_WARN_LAST,
             "panel_stats": PANEL_STATS,
+            "service_completion_stats": SERVICE_COMPLETION_STATS,
             "buyer_stats": BUYER_STATS,
             "order_notes": ORDER_NOTES,
             "link_fail_count": LINK_FAIL_COUNT,
@@ -1256,6 +1263,7 @@ def build_finance_summary(price_tl: float, cost_tl: float | None = None) -> str:
     ]
     if sale > 0 and cost > 0:
         lines.append(f"Net kâr: {format_tl_amount(profit.get('profit', 0))} | Marj: %{profit.get('margin_pct', 0)}")
+        lines.append(build_pricing_advice(sale, cost))
     elif sale > 0:
         lines.append("Net kâr: Panel maliyeti bilinmediği için hesaplanamadı")
     return "\n".join(lines)
@@ -1320,6 +1328,7 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail="", **ext
         "product_name": str(product_name),
         "reason": str(reason),
         "detail": str(detail),
+        "category": classify_failed_reason(reason, detail),
         "created_at": int(time.time()),
     }
 
@@ -1534,7 +1543,7 @@ def blacklist_remove(value: str):
         save_state()
 
 
-def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0):
+def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0, duration_minutes=None, estimated_completion_minutes=None):
     entry = {
         "order_id": str(order_id),
         "advert_id": str(advert_id),
@@ -1543,6 +1552,8 @@ def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, li
         "smm_order_id": str(smm_order_id),
         "link": str(link),
         "price": float(price or 0),
+        "duration_minutes": int(duration_minutes or 0) if duration_minutes is not None else "",
+        "estimated_completion_minutes": float(estimated_completion_minutes or 0) if estimated_completion_minutes else "",
         "completed_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
     }
     with STATE_LOCK:
@@ -1602,6 +1613,102 @@ def update_panel_stats(panel_key: str, result: str, duration_minutes: int | None
     PANEL_STATS[panel_key] = item
 
 
+def make_service_completion_key(panel_key: str, service_id: str) -> str:
+    panel_key = normalize_panel_key(panel_key or "unknown")
+    service_id = str(service_id or "").strip() or "unknown"
+    return f"{panel_key}:{service_id}"
+
+
+def update_service_completion_stats(panel_key: str, service_id: str, duration_minutes: int):
+    """Servis bazında ortalama tamamlanma süresi tutar; yeni siparişlerde daha doğru tahmin verir."""
+    global SERVICE_COMPLETION_STATS
+    key = make_service_completion_key(panel_key, service_id)
+    item = SERVICE_COMPLETION_STATS.get(key, {}) if isinstance(SERVICE_COMPLETION_STATS, dict) else {}
+    count = int(item.get("completed_count", 0) or 0) + 1
+    total_minutes = int(item.get("completed_total_minutes", 0) or 0) + max(0, int(duration_minutes or 0))
+    SERVICE_COMPLETION_STATS[key] = {
+        "panel_key": normalize_panel_key(panel_key or "unknown"),
+        "service_id": str(service_id or ""),
+        "completed_count": count,
+        "completed_total_minutes": total_minutes,
+        "avg_completion_minutes": round(total_minutes / count, 1) if count else 0,
+        "last_duration_minutes": max(0, int(duration_minutes or 0)),
+        "last_update": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def get_average_completion_minutes(panel_key: str = "", service_id: str = "", panel_name: str = "") -> tuple[float, str]:
+    """Önce servis ortalamasını, yoksa panel ortalamasını döndürür."""
+    panel_key = normalize_panel_key(panel_key or panel_name or "unknown")
+    service_id = str(service_id or "").strip()
+    if service_id:
+        row = (SERVICE_COMPLETION_STATS or {}).get(make_service_completion_key(panel_key, service_id), {})
+        try:
+            service_count = int(row.get("completed_count", 0) or 0)
+            service_avg = float(row.get("avg_completion_minutes", 0) or 0)
+            if service_count > 0 and service_avg > 0:
+                return service_avg, "servis"
+        except Exception:
+            pass
+
+    panel_row = (PANEL_STATS or {}).get(panel_key, {})
+    try:
+        completed_count = int(panel_row.get("completed_count", 0) or 0)
+        total_minutes = int(panel_row.get("completed_total_minutes", 0) or 0)
+        if completed_count > 0 and total_minutes > 0:
+            return round(total_minutes / completed_count, 1), "panel"
+    except Exception:
+        pass
+    return 0, ""
+
+
+def format_duration_minutes(minutes) -> str:
+    try:
+        minutes = int(round(float(minutes or 0)))
+    except Exception:
+        minutes = 0
+    if minutes <= 0:
+        return "Henüz veri yok"
+    hours, mins = divmod(minutes, 60)
+    if hours and mins:
+        return f"{hours} saat {mins} dk"
+    if hours:
+        return f"{hours} saat"
+    return f"{mins} dk"
+
+
+def build_completion_estimate(panel_key: str = "", service_id: str = "", panel_name: str = "") -> dict:
+    avg_minutes, source = get_average_completion_minutes(panel_key, service_id, panel_name)
+    estimated_at = ""
+    if avg_minutes > 0:
+        estimated_at = (now_tr() + timedelta(minutes=int(round(avg_minutes)))).strftime("%H:%M")
+    return {
+        "avg_minutes": round(float(avg_minutes or 0), 1),
+        "source": source,
+        "text": format_duration_minutes(avg_minutes),
+        "estimated_at": estimated_at,
+    }
+
+
+def build_completion_estimate_text(panel_key: str = "", service_id: str = "", panel_name: str = "") -> str:
+    estimate = build_completion_estimate(panel_key, service_id, panel_name)
+    if not estimate.get("avg_minutes"):
+        return "Ortalama tamamlanma: Henüz veri yok"
+    source = "servis" if estimate.get("source") == "servis" else "panel"
+    return f"Ortalama tamamlanma: {estimate['text']} ({source} ortalaması, tahmini {estimate['estimated_at']})"
+
+
+def get_delay_alert_threshold_seconds(item: dict) -> int:
+    """Gecikme alarmını sabit süre yerine geçmiş tamamlanma ortalamasına göre ayarlar."""
+    try:
+        avg_minutes = float((item or {}).get("avg_completion_minutes", 0) or 0)
+    except Exception:
+        avg_minutes = 0
+    if avg_minutes <= 0:
+        return 5400
+    return max(1800, int(avg_minutes * 1.75 * 60))
+
+
 def increment_link_fail_count(link: str):
     """Aynı link tekrar tekrar hata üretirse otomatik blacklist'e alır."""
     if not BLACKLIST_AUTO_LEARN:
@@ -1643,6 +1750,247 @@ def calculate_profit(sale_tl: float, cost_tl: float) -> dict:
         "profit": profit,
         "margin_pct": round(margin_pct, 2),
     }
+
+
+def round_price_for_market(value: float) -> float:
+    """Önerilen satış fiyatını pazaryeri için okunur bir etikete yuvarlar."""
+    try:
+        value = float(value or 0)
+    except Exception:
+        return 0.0
+    if value <= 0:
+        return 0.0
+    if value < 20:
+        return round(max(1, value) + 0.49, 2)
+    return round(int(value) + 0.90, 2)
+
+
+def calculate_recommended_sale_price(cost_tl: float, target_margin_pct: float | None = None, min_profit_tl: float | None = None) -> dict:
+    """Panel maliyetinden komisyon sonrası hedef kâra göre önerilen satış fiyatı üretir."""
+    try:
+        cost = float(cost_tl or 0)
+    except Exception:
+        cost = 0.0
+    if cost <= 0:
+        return {"ok": False, "error": "cost_missing", "recommended_price": 0}
+
+    target_margin = float(PROFIT_TARGET_MARGIN_PERCENT if target_margin_pct is None else target_margin_pct)
+    min_profit = float(PROFIT_MIN_TL if min_profit_tl is None else min_profit_tl)
+    target_profit = max(min_profit, cost * max(0, target_margin) / 100)
+    required_net = cost + target_profit
+    divisor = max(0.01, 1 - ITEMSATIS_COMMISSION_RATE)
+    raw_price = required_net / divisor
+    recommended = round_price_for_market(raw_price)
+    profit = calculate_profit(recommended, cost)
+    return {
+        "ok": True,
+        "cost_tl": round(cost, 2),
+        "target_margin_percent": target_margin,
+        "min_profit_tl": min_profit,
+        "recommended_price": recommended,
+        "projected_profit_tl": round(float(profit.get("profit", 0) or 0), 2),
+        "projected_margin_percent": profit.get("margin_pct", 0),
+    }
+
+
+def build_pricing_advice(price_tl: float, cost_tl: float | None = None) -> str:
+    """Sipariş mesajlarında fiyat doğru mu sorusuna kısa, aksiyon alınabilir cevap verir."""
+    try:
+        sale = float(price_tl or 0)
+    except Exception:
+        sale = 0.0
+    try:
+        cost = float(cost_tl or 0) if cost_tl is not None else 0.0
+    except Exception:
+        cost = 0.0
+    if sale <= 0 or cost <= 0:
+        return "Fiyat önerisi: Maliyet veya satış fiyatı eksik olduğu için hesaplanamadı."
+
+    profit = calculate_profit(sale, cost)
+    advice = calculate_recommended_sale_price(cost)
+    recommended = float(advice.get("recommended_price", 0) or 0)
+    margin = float(profit.get("margin_pct", 0) or 0)
+    current_profit = float(profit.get("profit", 0) or 0)
+    if recommended > sale:
+        gap = recommended - sale
+        return f"Fiyat önerisi: Bu ürün {format_tl_amount(recommended)} civarına çıkarılırsa hedef kâr daha sağlıklı olur. Fark: {format_tl_amount(gap)}"
+    if margin >= PRODUCT_HEALTH_MIN_MARGIN_PERCENT:
+        return f"Fiyat önerisi: Mevcut fiyat sağlıklı görünüyor. Net kâr: {format_tl_amount(current_profit)}"
+    return f"Fiyat önerisi: Marj düşük (%{round(margin, 1)}). Fiyat veya panel servisi kontrol edilmeli."
+
+
+def build_order_growth_tip(platform: str = "", product_name: str = "") -> str:
+    """Satıcıya sipariş başı geliri artırabilecek kısa upsell önerisi verir."""
+    text = normalize_text(f"{platform} {product_name}")
+    if "instagram" in text or "insta" in text:
+        return "Ek satış önerisi: Takipçi alan müşteriye beğeni, kaydetme veya keşfet paketi sun."
+    if "tiktok" in text:
+        return "Ek satış önerisi: İzlenme alan müşteriye beğeni + takipçi paketi sun."
+    if "youtube" in text or "yt" in text:
+        return "Ek satış önerisi: İzlenme alan müşteriye abone + beğeni paketi sun."
+    if "twitter" in text or "x " in text:
+        return "Ek satış önerisi: Etkileşim alan müşteriye takipçi + görüntülenme paketi sun."
+    return "Ek satış önerisi: Müşteriye aynı platform için tamamlayıcı paket öner."
+
+
+def classify_failed_reason(reason: str, detail: str = "") -> str:
+    text = normalize_text(f"{reason} {detail}")
+    if "bakiye" in text or "balance" in text:
+        return "balance"
+    if "link" in text:
+        return "link"
+    if "zarar" in text or "anti_loss" in text or "maliyet" in text or "cost" in text:
+        return "profit"
+    if "blacklist" in text or "kara" in text:
+        return "blacklist"
+    if "order id" in text or "belirsiz" in text:
+        return "manual_check"
+    if "panel" in text or "api" in text or "servis" in text:
+        return "panel"
+    return "other"
+
+
+def build_lost_order_summary(limit: int = 50) -> dict:
+    """Başarısız siparişleri hafifçe sınıflandırır; ağır panel sorgusu yapmaz."""
+    buckets = defaultdict(lambda: {"count": 0, "estimated_lost_tl": 0.0})
+    rows = FAILED_ORDERS[-max(1, int(limit or 50)):]
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        category = classify_failed_reason(item.get("reason", ""), item.get("detail", ""))
+        buckets[category]["count"] += 1
+        try:
+            buckets[category]["estimated_lost_tl"] += float(item.get("price", 0) or 0)
+        except Exception:
+            pass
+    return {
+        "total_failed_sample": len(rows),
+        "items": {k: {"count": v["count"], "estimated_lost_tl": round(v["estimated_lost_tl"], 2)} for k, v in buckets.items()},
+    }
+
+
+def get_advert_sales_stat(advert_id: str, product_name: str = "") -> dict:
+    report_name = get_itemsatis_report_name(advert_id, product_name)
+    sources = [DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS]
+    best = {"count": 0, "gross": 0.0, "source": ""}
+    for name, source in [("daily", DAILY_STATS), ("weekly", WEEKLY_STATS), ("monthly", MONTHLY_STATS)]:
+        item = normalize_stat_item((source or {}).get(report_name, {}))
+        if item["count"] >= best["count"]:
+            best = {"count": item["count"], "gross": item["gross"], "source": name}
+    avg_sale = round(best["gross"] / best["count"], 2) if best["count"] else 0
+    best["avg_sale_tl"] = avg_sale
+    best["product_name"] = report_name
+    return best
+
+
+def score_product_health(cost_tl: float | None, avg_sale_tl: float, failed_count: int = 0, completion_avg: float = 0) -> tuple[int, list[str]]:
+    score = 100
+    notes = []
+    if not cost_tl or cost_tl <= 0:
+        score -= 28
+        notes.append("maliyet bilinmiyor")
+    if avg_sale_tl <= 0:
+        score -= 14
+        notes.append("satış ortalaması yok")
+    if cost_tl and avg_sale_tl:
+        profit = calculate_profit(avg_sale_tl, cost_tl)
+        margin = float(profit.get("margin_pct", 0) or 0)
+        if margin < PRODUCT_HEALTH_MIN_MARGIN_PERCENT:
+            score -= 26
+            notes.append(f"marj düşük (%{round(margin, 1)})")
+    if failed_count >= 3:
+        score -= 20
+        notes.append("hata sayısı yüksek")
+    elif failed_count:
+        score -= 8
+        notes.append("hata var")
+    if completion_avg and completion_avg > 180:
+        score -= 10
+        notes.append("tamamlanma yavaş")
+    return max(0, min(100, score)), notes
+
+
+def build_product_growth_insights(limit: int = 12) -> dict:
+    """Kâr, fiyat ve sağlık skorlarını mevcut cache/state üzerinden hesaplar."""
+    rows = []
+    failed_by_advert = defaultdict(int)
+    for item in FAILED_ORDERS[-100:]:
+        if isinstance(item, dict):
+            failed_by_advert[str(item.get("advert_id", ""))] += 1
+
+    for advert_id, raw in get_all_services(include_inactive=True).items():
+        service = get_service_config(raw)
+        cost = estimate_order_cost_from_service(service)
+        sales = get_advert_sales_stat(advert_id)
+        avg_sale = float(sales.get("avg_sale_tl", 0) or 0)
+        advice = calculate_recommended_sale_price(cost or 0)
+        completion_avg, completion_source = get_average_completion_minutes(service.get("panel_key", ""), service.get("service_id", ""), service.get("panel", ""))
+        score, notes = score_product_health(cost, avg_sale, failed_by_advert.get(str(advert_id), 0), completion_avg)
+        profit = calculate_profit(avg_sale, cost or 0) if avg_sale and cost else {}
+        rows.append({
+            "advert_id": str(advert_id),
+            "product_name": sales.get("product_name") or str(advert_id),
+            "panel": service.get("panel", ""),
+            "service_id": service.get("service_id", ""),
+            "sales_count": int(sales.get("count", 0) or 0),
+            "avg_sale_tl": avg_sale,
+            "estimated_cost_tl": round(float(cost or 0), 2),
+            "estimated_profit_tl": round(float(profit.get("profit", 0) or 0), 2) if profit else 0,
+            "margin_percent": profit.get("margin_pct", 0) if profit else 0,
+            "recommended_price_tl": advice.get("recommended_price", 0) if advice.get("ok") else 0,
+            "health_score": score,
+            "notes": notes,
+            "avg_completion_minutes": completion_avg,
+            "completion_source": completion_source,
+        })
+
+    rows.sort(key=lambda x: (x["health_score"], -x["sales_count"]))
+    needs_attention = rows[:max(1, int(limit or 12))]
+    top_profit = sorted([r for r in rows if r["estimated_profit_tl"] > 0], key=lambda x: x["estimated_profit_tl"], reverse=True)[:5]
+    price_raise = [r for r in rows if r["recommended_price_tl"] and r["avg_sale_tl"] and r["recommended_price_tl"] > r["avg_sale_tl"]]
+    price_raise = sorted(price_raise, key=lambda x: x["recommended_price_tl"] - x["avg_sale_tl"], reverse=True)[:5]
+    return {
+        "generated_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_products": len(rows),
+        "needs_attention": needs_attention,
+        "top_profit": top_profit,
+        "price_raise_candidates": price_raise,
+        "lost_orders": build_lost_order_summary(),
+    }
+
+
+def build_growth_report_text() -> str:
+    insights = build_product_growth_insights(limit=8)
+    lines = ["Kâr ve Satış Fırsat Raporu\n"]
+    price_rows = insights.get("price_raise_candidates", [])[:5]
+    if price_rows:
+        lines.append("Fiyatı artırılabilecek ürünler:")
+        for row in price_rows:
+            lines.append(
+                f"- {row.get('product_name')} | Ortalama satış {format_tl_amount(row.get('avg_sale_tl', 0))} -> öneri {format_tl_amount(row.get('recommended_price_tl', 0))}"
+            )
+    else:
+        lines.append("Fiyat artışı için net aday görünmüyor.")
+
+    top_profit = insights.get("top_profit", [])[:5]
+    if top_profit:
+        lines.append("\nEn iyi kâr bırakanlar:")
+        for row in top_profit:
+            lines.append(f"- {row.get('product_name')} | tahmini kâr {format_tl_amount(row.get('estimated_profit_tl', 0))} | marj %{row.get('margin_percent', 0)}")
+
+    attention = insights.get("needs_attention", [])[:5]
+    if attention:
+        lines.append("\nKontrol edilmesi gereken ürünler:")
+        for row in attention:
+            note = ", ".join(row.get("notes", [])[:3]) or "not yok"
+            lines.append(f"- Skor {row.get('health_score')}/100 | {row.get('product_name')} | {note}")
+
+    lost = insights.get("lost_orders", {}).get("items", {})
+    if lost:
+        lines.append("\nKayıp sipariş nedenleri:")
+        for key, item in sorted(lost.items(), key=lambda x: x[1].get("count", 0), reverse=True):
+            lines.append(f"- {key}: {item.get('count', 0)} adet")
+    return "\n".join(lines)
 
 
 def build_sales_report(title: str, stats: dict, empty_text: str):
@@ -1741,6 +2089,7 @@ def add_pending_order(
         return
     if any(str(item.get("smm_order_id")) == str(smm_order_id) for item in PENDING_ORDERS):
         return
+    completion_estimate = build_completion_estimate(panel_key or panel, service_id, panel)
     with STATE_LOCK:
         PENDING_ORDERS.append({
             "itemsatis_order_id": str(order_id),
@@ -1758,6 +2107,9 @@ def add_pending_order(
             "delay_alert_sent": False,
             "cancelled": False,
             "price": float(price or 0),
+            "avg_completion_minutes": completion_estimate.get("avg_minutes", 0),
+            "avg_completion_source": completion_estimate.get("source", ""),
+            "estimated_completion_at": completion_estimate.get("estimated_at", ""),
         })
         log("info", "order_queued", order_id=order_id, smm_order_id=smm_order_id, product=product_name)
         save_state()
@@ -4751,6 +5103,140 @@ textarea::-webkit-scrollbar-thumb,
   }
 }
 
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
+}
+
 </style>
 </head>
 <body>
@@ -5818,6 +6304,140 @@ textarea::-webkit-scrollbar-thumb,
   }
 }
 
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
+}
+
 </style>
 </head>
 <body>
@@ -6818,6 +7438,140 @@ textarea::-webkit-scrollbar-thumb,
   }
 }
 
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
+}
+
 </style>
 </head>
 <body>
@@ -7020,6 +7774,7 @@ def admin_manual_order_submit(
 
     log("success", "manual_order_created", panel=panel_key, service_id=service_id, smm_order_id=smm_order_id)
     manual_cost = estimate_order_cost_from_service(manual_service)
+    completion_estimate_text = build_completion_estimate_text(panel_key, service_id, panel_conf.get("name", panel_key))
     send_telegram(
         f"Manuel SMM siparişi panele girildi.\n\n"
         f"Ürün: {final_product_name}\n"
@@ -7027,7 +7782,8 @@ def admin_manual_order_submit(
         f"Servis ID: {service_id}\n"
         f"SMM ID: {smm_order_id}\n"
         f"Adet: {quantity}\n"
-        f"Link: {panel_link}\n\n"
+        f"Link: {panel_link}\n"
+        f"{completion_estimate_text}\n\n"
         f"{build_finance_summary(0, manual_cost)}"
     )
 
@@ -7834,6 +8590,140 @@ textarea::-webkit-scrollbar-thumb,
     padding-left: max(0px, env(safe-area-inset-left));
     padding-right: max(0px, env(safe-area-inset-right));
   }
+}
+
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
 }
 
 </style>
@@ -8720,6 +9610,140 @@ textarea::-webkit-scrollbar-thumb,
     padding-left: max(0px, env(safe-area-inset-left));
     padding-right: max(0px, env(safe-area-inset-right));
   }
+}
+
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
 }
 
 </style>
@@ -9722,6 +10746,140 @@ textarea::-webkit-scrollbar-thumb,
   }
 }
 
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
+}
+
 </style>
 </head>
 <body>
@@ -10459,6 +11617,140 @@ textarea::-webkit-scrollbar-thumb,
   }
 }
 
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
+}
+
 </style>
 </head>
 <body>
@@ -10495,6 +11787,18 @@ textarea::-webkit-scrollbar-thumb,
       <p class="muted">Test webhookları yüzünden dashboard tutarları şiştiyse buradan sadece rapor/satış sayaçlarını sıfırlayabilirsin. Servisler, paketler, ilanlar ve Redis queue silinmez.</p>
       <form method="post" action="/admin/reset-dashboard" onsubmit="return confirm('Bu ayın dashboard/rapor verisi sıfırlansın mı?')"><button class="red">Bu Ay Dashboard Sıfırla</button></form>
       <form method="post" action="/admin/reset-sales-all" onsubmit="return confirm('Tüm satış rapor geçmişi sıfırlansın mı? Servis/paket/ilan ayarları silinmez.')" style="margin-top:10px"><button class="red">Tüm Satış Raporlarını Sıfırla</button></form>
+    </div>
+  </div>
+
+  <div class="two">
+    <div class="card">
+      <h2>Kâr ve Satış Fırsatları</h2>
+      <div class="list" id="growthRows"><div class="muted">Yükleniyor...</div></div>
+      <div class="toolbar"><a class="btn green" href="/api/growth-insights" target="_blank">Fırsat JSON</a></div>
+    </div>
+    <div class="card">
+      <h2>Kayıp Sipariş Analizi</h2>
+      <div class="list" id="lostRows"><div class="muted">Yükleniyor...</div></div>
     </div>
   </div>
 
@@ -10536,6 +11840,24 @@ async function loadAll(){
     rows.push('<div class="row"><b>Route çakışması</b><span>'+pill(!(sys.duplicate_routes||[]).length, (sys.duplicate_routes||[]).length?'Var':'Yok')+'</span></div>');
     document.getElementById('opsRows').innerHTML=rows.join('');
   }catch(e){document.getElementById('opsRows').innerHTML='<pre>'+String(e)+'</pre>';}
+  try{
+    const growth=await getJSON('/api/growth-insights');
+    const raises=(growth.price_raise_candidates||[]).slice(0,5);
+    const attention=(growth.needs_attention||[]).slice(0,5);
+    const growthRows=[];
+    if(raises.length){
+      raises.forEach(x=>growthRows.push('<div class="row"><div><b>'+String(x.product_name||x.advert_id)+'</b><div class="muted">Fiyat önerisi</div></div><span>'+money(x.avg_sale_tl||0)+' -> '+money(x.recommended_price_tl||0)+'</span></div>'));
+    }
+    if(!growthRows.length && attention.length){
+      attention.forEach(x=>growthRows.push('<div class="row"><div><b>'+String(x.product_name||x.advert_id)+'</b><div class="muted">'+String((x.notes||[]).join(', ')||'Kontrol önerilir')+'</div></div><span class="pill warn">'+(x.health_score||0)+'/100</span></div>'));
+    }
+    document.getElementById('growthRows').innerHTML=growthRows.length?growthRows.join(''):'<div class="muted">Şu an belirgin fiyat/kâr fırsatı görünmüyor.</div>';
+    const lost=growth.lost_orders&&growth.lost_orders.items?growth.lost_orders.items:{};
+    const lostRows=Object.keys(lost).sort((a,b)=>(lost[b].count||0)-(lost[a].count||0)).map(k=>'<div class="row"><b>'+k+'</b><span>'+(lost[k].count||0)+' adet</span></div>');
+    document.getElementById('lostRows').innerHTML=lostRows.length?lostRows.join(''):'<div class="muted">Kayıp sipariş kaydı yok.</div>';
+  }catch(e){
+    const g=document.getElementById('growthRows'); if(g) g.innerHTML='<pre>'+String(e)+'</pre>';
+  }
   try{
     const data=await getJSON('/api/logs');
     const logs=(data.logs||[]).slice(-12).reverse();
@@ -10700,6 +12022,30 @@ def api_panel_stats(user: str = Depends(get_current_admin)):
             "last_update": item.get("last_update", "") if isinstance(item, dict) else "",
         }
     return {"items": rows}
+
+
+@app.get("/api/service-completion-stats")
+def api_service_completion_stats(user: str = Depends(get_current_admin)):
+    """Servis bazlı ortalama tamamlanma süreleri."""
+    rows = {}
+    for key, item in (SERVICE_COMPLETION_STATS or {}).items():
+        if not isinstance(item, dict):
+            continue
+        rows[key] = {
+            "panel_key": item.get("panel_key", ""),
+            "service_id": item.get("service_id", ""),
+            "completed_count": int(item.get("completed_count", 0) or 0),
+            "avg_completion_minutes": float(item.get("avg_completion_minutes", 0) or 0),
+            "last_duration_minutes": int(item.get("last_duration_minutes", 0) or 0),
+            "last_update": item.get("last_update", ""),
+        }
+    return {"items": rows}
+
+
+@app.get("/api/growth-insights")
+def api_growth_insights(user: str = Depends(get_current_admin)):
+    """Satış, kâr ve kayıp sipariş fırsatlarını hafif state verilerinden hesaplar."""
+    return build_product_growth_insights()
 
 
 @app.get("/api/buyer-stats")
@@ -11516,6 +12862,140 @@ textarea::-webkit-scrollbar-thumb,
   }
 }
 
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
+}
+
 </style>
 </head>
 <body>
@@ -11703,6 +13183,7 @@ def build_system_check() -> dict:
             "processed_links": len(PROCESSED_LINKS),
             "log_history": len(LOG_HISTORY),
             "link_audit": len(LINK_AUDIT_HISTORY),
+            "service_completion_stats": len(SERVICE_COMPLETION_STATS or {}),
         },
     }
 
@@ -11722,7 +13203,7 @@ def api_export(user: str = Depends(get_current_admin)):
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=["order_id", "advert_id", "product_name", "panel", "smm_order_id", "link", "price", "completed_at"],
+        fieldnames=["order_id", "advert_id", "product_name", "panel", "smm_order_id", "link", "price", "duration_minutes", "estimated_completion_minutes", "completed_at"],
         extrasaction="ignore",
     )
     writer.writeheader()
@@ -12551,6 +14032,140 @@ textarea::-webkit-scrollbar-thumb,
   }
 }
 
+
+
+/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
+:root {
+  --action-primary: #2563eb;
+  --action-primary2: #1d4ed8;
+  --action-success: #16a34a;
+  --action-success2: #15803d;
+  --action-warn: #d97706;
+  --action-warn2: #b45309;
+  --action-danger: #dc2626;
+  --action-danger2: #991b1b;
+  --action-neutral: #475569;
+  --action-neutral2: #334155;
+  --touch: 44px;
+}
+body { letter-spacing: 0; }
+.card, .panel, section, table, form { min-width: 0; }
+button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+  min-height: var(--touch);
+  border-radius: 10px !important;
+  padding: 10px 14px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
+}
+button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
+.refresh-btn {
+  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
+  border-color: rgba(147,197,253,.28) !important;
+  color: #fff !important;
+}
+button.green, .btn.green, input[type="submit"].green,
+a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
+  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
+  border-color: rgba(134,239,172,.24) !important;
+  color: #fff !important;
+}
+button.red, button.delete, .btn.red, .btn.delete,
+form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
+  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
+  border-color: rgba(252,165,165,.24) !important;
+  color: #fff !important;
+}
+button.slate, button.toggle, .btn.slate, .btn.toggle,
+a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
+  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
+  border-color: rgba(203,213,225,.18) !important;
+  color: #fff !important;
+}
+button.retry, .btn.retry, form[action*="retry"] button {
+  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
+  border-color: rgba(253,230,138,.24) !important;
+  color: #fff !important;
+}
+button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
+  filter: brightness(1.04) !important;
+  transform: translateY(-1px) !important;
+}
+.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+  gap: 8px !important;
+  align-items: center !important;
+}
+.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
+input, select, textarea {
+  border-radius: 10px !important;
+  min-height: var(--touch);
+  font-size: 15px !important;
+}
+table {
+  width: 100% !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+th, td { vertical-align: top !important; }
+td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
+.row { align-items: center; }
+.pill { border-radius: 999px !important; }
+@media (max-width: 760px) {
+  body { font-size: 14px !important; }
+  header, .topbar, .wrap, .container, .shell {
+    width: calc(100% - 18px) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  header, .topbar {
+    position: static !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    align-items: stretch !important;
+  }
+  .wrap, .container, .shell {
+    padding: 12px !important;
+    border-radius: 18px !important;
+  }
+  h1 { font-size: 28px !important; }
+  h2 { font-size: 20px !important; margin-top: 20px !important; }
+  .grid, .two, .cards, .stats, .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    width: 100% !important;
+  }
+  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    justify-content: center !important;
+    text-align: center !important;
+    font-size: 14px !important;
+  }
+  input, select, textarea { width: 100% !important; font-size: 16px !important; }
+  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+  thead, tbody, tr { min-width: max-content; }
+  th, td { padding: 10px !important; font-size: 13px !important; }
+  td button, td .btn, td .rbtn { min-width: 120px; }
+  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
+  pre { max-height: 220px !important; }
+}
+@media (max-width: 420px) {
+  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
+  h1 { font-size: 24px !important; }
+  .stat .value { font-size: 30px !important; }
+}
+
 </style>
 """
 
@@ -12844,7 +14459,8 @@ def admin_itemsatis_adverts(refresh: int = 0, history: int = 0, user: str = Depe
       .itemsatis-tools {{ display:grid; grid-template-columns:1fr; gap:14px; }}
       .itemsatis-tools textarea {{ min-height:150px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
       @media(max-width:700px) {{ .itemsatis-stats {{ grid-template-columns:1fr; }} .itemsatis-stat {{ padding:14px; }} .itemsatis-stat .stat {{ font-size:25px; }} }}
-    </style>
+    
+</style>
     <div class='card'>
       <div class='muted'>Bu sayfa gerçek public profil ilanlarını yakalamaya çalışır. Özel/gizli kişiye özel ilanlar public profilde görünmeyebilir; bu durumda ilan linklerini aşağıdaki alana yapıştırarak ID + isim olarak cache'e alabilirsin. Test webhook/geçmiş siparişler artık ana listeye otomatik karışmaz.</div>
       <div class='toolbar'>
@@ -13397,12 +15013,16 @@ def check_orders():
 
         if created_at and not delay_alert_sent:
             waited_seconds = int(time.time()) - created_at
-            if waited_seconds >= 5400:
+            delay_threshold_seconds = get_delay_alert_threshold_seconds(item)
+            if waited_seconds >= delay_threshold_seconds:
                 log("warning", "order_delayed", smm_order_id=item.get("smm_order_id"), waited_minutes=waited_seconds//60)
                 send_telegram(
                     f"Sipariş gecikti.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
                     f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
-                    f"Link: {item.get('link', '')}\n\n1 saat 30 dakika geçti. Paneli kontrol et."
+                    f"Link: {item.get('link', '')}\n\n"
+                    f"Geçen süre: {format_duration_minutes(waited_seconds / 60)}\n"
+                    f"Beklenen ortalama: {format_duration_minutes(item.get('avg_completion_minutes', 0))}\n"
+                    f"Paneli kontrol et."
                 )
                 item["delay_alert_sent"] = True
                 changed = True
@@ -13411,9 +15031,15 @@ def check_orders():
             log("success", "order_completed", smm_order_id=item.get("smm_order_id"), product=item.get("product_name"))
             duration_minutes = int((time.time() - int(item.get("created_at", time.time()) or time.time())) / 60)
             update_panel_stats(item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""), "success", duration_minutes)
+            update_service_completion_stats(
+                item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""),
+                item.get("service_id") or runtime_service.get("service_id", ""),
+                duration_minutes,
+            )
             send_telegram(
                 f"SMM siparişi tamamlandı.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
                 f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\nLink: {item.get('link', '')}\n\n"
+                f"Tamamlanma süresi: {format_duration_minutes(duration_minutes)}\n"
                 f"Müşteriye değerlendirme mesajı gönderildi."
             )
             notify_customer_order_completed(item.get("itemsatis_order_id", ""), item.get("product_name", ""), item.get("link", ""))
@@ -13425,6 +15051,8 @@ def check_orders():
                 item.get("smm_order_id", ""),
                 item.get("link", ""),
                 item.get("price", 0),
+                duration_minutes,
+                item.get("avg_completion_minutes", ""),
             )
             completed_indexes.append(index)
             changed = True
@@ -13910,7 +15538,8 @@ def process_itemsatis_webhook_payload(data: dict):
                     panel_key=service.get("panel_key", ""),
                     price=0,
                 )
-                success_rows.append((component_name, service.get("panel", "Panel"), smm_order_id))
+                completion_text = build_completion_estimate_text(service.get("panel_key", ""), service.get("service_id", ""), service.get("panel", ""))
+                success_rows.append((component_name, service.get("panel", "Panel"), smm_order_id, completion_text))
 
             if success_rows:
                 PROCESSED_LINKS.add(duplicate_link_key)
@@ -13918,14 +15547,15 @@ def process_itemsatis_webhook_payload(data: dict):
                 save_state()
                 notify_customer_order_started(order_id, package_name, customer_link)
 
-            success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id}" for name, panel, smm_id in success_rows]) or "Yok"
+            success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id} | {completion_text}" for name, panel, smm_id, completion_text in success_rows]) or "Yok"
             failed_text = "\n".join([f"❌ {name} | {panel} | {err}" for name, panel, err in failed_rows]) or "Yok"
             package_cost = estimate_package_cost_tl(components)
             send_telegram(
                 f"Paket sipariş işlendi.\n\nPaket: {package_name}\nItemsatış ID: {order_id}\nLink: {customer_link}\n\n"
                 f"Başarılı:\n{success_text}\n\nHatalı:\n{failed_text}\n\n"
                 f"{build_finance_summary(price, package_cost)}\n\n"
-                f"{build_buyer_summary(buyer)}"
+                f"{build_buyer_summary(buyer)}\n\n"
+                f"{build_order_growth_tip(package_platform, package_name)}"
             )
 
             if not success_rows:
@@ -14046,13 +15676,15 @@ def process_itemsatis_webhook_payload(data: dict):
             after_balance_text = ""
             if current_balance_tl is not None and estimated_cost is not None:
                 after_balance_text = f"\nTahmini sipariş sonrası bakiye: {format_tl_amount(current_balance_tl - estimated_cost)}"
+            completion_estimate_text = build_completion_estimate_text(service.get("panel_key", ""), service.get("service_id", ""), service.get("panel", ""))
 
             send_telegram(
                 f"SMM siparişi panele girildi.\n\nÜrün: {service_name}\nPanel: {service['panel']}\n"
                 f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
-                f"Adet: {service['quantity']}\nBakiye: {format_tl_amount(current_balance_tl or 0)}{after_balance_text}\n\n"
+                f"Adet: {service['quantity']}\n{completion_estimate_text}\nBakiye: {format_tl_amount(current_balance_tl or 0)}{after_balance_text}\n\n"
                 f"{build_finance_summary(price, estimated_cost)}\n\n"
-                f"{build_buyer_summary(buyer)}"
+                f"{build_buyer_summary(buyer)}\n\n"
+                f"{build_order_growth_tip(platform, service_name)}"
             )
 
             return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
@@ -14138,6 +15770,7 @@ async def telegram_webhook(request: Request):
             "/blacklist remove değer - Kara listeden çıkar\n"
             "/blacklist list - Kara listeyi göster\n"
             "/panel-stats - Panel başarı oranları\n"
+            "/growth-report - Kâr ve satış fırsat raporu\n"
             "/note smm_id not - Sipariş notu ekle\n"
             "/report - Bugünkü özet\n"
             "/week-report - Haftalık özet\n"
@@ -14287,6 +15920,10 @@ async def telegram_webhook(request: Request):
             panel_name = get_panel_config(key).get("name", key)
             lines.append(f"{panel_name}: %{rate:.1f} başarı | Başarılı {success} | Hata {failed} | Partial {partial} | Ortalama {avg:.0f} dk")
         send_telegram("\n".join(lines))
+        return {"ok": True}
+
+    if command in ["/growth-report", "/profit-report"]:
+        send_telegram(build_growth_report_text())
         return {"ok": True}
 
     if command == "/note":
