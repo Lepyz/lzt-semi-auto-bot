@@ -3063,12 +3063,104 @@ def parse_itemsatis_adverts_from_text(raw_text: str) -> list[dict]:
         if line_end == -1:
             line_end = len(raw_text)
         line = raw_text[line_start:line_end]
-        title = _itemsatis_clean_title(line.replace(url, ""))
+        title_raw = line.replace(url, "")
+        title_raw = re.sub(rf"(?:^|[|\s-]){re.escape(advert_id)}(?:$|[|\s-])", " ", title_raw)
+        title_raw = title_raw.replace("|", " ")
+        title = _itemsatis_clean_title(title_raw)
         if _itemsatis_is_bad_title(title):
             title = f"Itemsatış İlanı {advert_id}"
         items[advert_id] = {"advert_id": advert_id, "name": title, "url": _itemsatis_absolute_url(url, get_itemsatis_profile_url()), "source": "manual_import"}
     return sorted(items.values(), key=lambda x: str(x.get("name", "")).lower())
 
+
+
+
+def build_itemsatis_import_preview(raw_text: str) -> dict:
+    """Yapıştırılan ilan çıktısını güvenli önizleme formatına çevirir.
+
+    Bu fonksiyon Redis'e yazmaz. Önce admin'e tablo gösterilir; sadece seçilenler kaydedilir.
+    """
+    raw_text = str(raw_text or "")
+    parsed = parse_itemsatis_adverts_from_text(raw_text)
+    existing_rows = collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=False)
+    existing_ids = {str(item.get("advert_id")) for item in existing_rows if isinstance(item, dict)}
+
+    accepted = []
+    suspicious = []
+    seen = set()
+
+    for item in parsed:
+        advert_id = str((item or {}).get("advert_id", "")).strip()
+        name = _itemsatis_clean_title((item or {}).get("name", ""))
+        url = str((item or {}).get("url", "")).strip()
+        reasons = []
+
+        if not advert_id or not advert_id.isdigit() or len(advert_id) < 5:
+            reasons.append("ID geçersiz")
+        if advert_id in seen:
+            reasons.append("Aynı ID tekrar ediyor")
+        if _itemsatis_is_bad_title(name) or name.startswith("Itemsatış İlanı"):
+            reasons.append("Başlık zayıf/otomatik")
+        if not url:
+            reasons.append("Link yok")
+        if advert_id in existing_ids:
+            reasons.append("Zaten listede var; seçersen güncellenir")
+
+        row = {
+            "advert_id": advert_id,
+            "name": name or f"Itemsatış İlanı {advert_id}",
+            "url": url,
+            "source": "manual_import_preview",
+            "reasons": reasons,
+            "default_checked": not any(r in reasons for r in ["ID geçersiz", "Aynı ID tekrar ediyor", "Başlık zayıf/otomatik", "Link yok"]),
+        }
+        seen.add(advert_id)
+        if row["default_checked"]:
+            accepted.append(row)
+        else:
+            suspicious.append(row)
+
+    line_count = len([line for line in raw_text.splitlines() if line.strip()])
+    return {
+        "line_count": line_count,
+        "parsed_count": len(parsed),
+        "accepted": accepted,
+        "suspicious": suspicious,
+        "total_preview": len(accepted) + len(suspicious),
+    }
+
+
+def remove_itemsatis_advert_from_cache(advert_id: str) -> bool:
+    """Yanlış içe aktarılan ilanı manuel/cache listelerinden siler. Servis/paket eşleşmesini silmez."""
+    advert_id = str(advert_id or "").strip()
+    if not advert_id:
+        return False
+    changed = False
+
+    manual_items = [item for item in get_manual_itemsatis_adverts() if str((item or {}).get("advert_id")) != advert_id]
+    if len(manual_items) != len(get_manual_itemsatis_adverts()):
+        redis_set_json(ITEMSATIS_ADVERT_MANUAL_KEY, manual_items)
+        changed = True
+
+    cache = redis_get_json(ITEMSATIS_ADVERT_CACHE_KEY, {})
+    if isinstance(cache, dict):
+        cached_items = cache.get("items", []) or []
+        new_cached = [item for item in cached_items if str((item or {}).get("advert_id")) != advert_id]
+        if len(new_cached) != len(cached_items):
+            cache["items"] = new_cached
+            cache["scraped_count"] = len(new_cached)
+            cache["updated_at"] = int(time.time())
+            cache["updated_at_text"] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+            redis_set_json(ITEMSATIS_ADVERT_CACHE_KEY, cache)
+            changed = True
+
+    return changed
+
+
+def clear_itemsatis_advert_import_cache():
+    """İlan içe aktarma/cache kayıtlarını temizler; dinamik servis ve paket ayarlarına dokunmaz."""
+    redis_set_json(ITEMSATIS_ADVERT_MANUAL_KEY, [])
+    redis_set_json(ITEMSATIS_ADVERT_CACHE_KEY, {"items": [], "updated_at": int(time.time()), "updated_at_text": now_tr().strftime("%Y-%m-%d %H:%M:%S"), "source": "cleared", "scraped_count": 0})
 
 def get_manual_itemsatis_adverts() -> list[dict]:
     data = redis_get_json(ITEMSATIS_ADVERT_MANUAL_KEY, [])
@@ -3148,9 +3240,23 @@ def fetch_itemsatis_public_adverts(force: bool = False, include_history: bool = 
     now_ts = int(time.time())
     cached_items = (cache.get("items", []) if isinstance(cache, dict) else []) or []
     profile_url = get_itemsatis_profile_url()
-    if not force and cached_items and (now_ts - int(cache.get("updated_at", 0) or 0)) < ITEMSATIS_ADVERT_CACHE_MAX_AGE_SEC:
+
+    # Hız optimizasyonu: admin sayfası her açıldığında Itemsatış'a istek atma.
+    # Itemsatış Render isteklerine sık sık 403 verdiği için canlı kontrol sadece buton/refresh ile yapılır.
+    if not force:
         items = collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=include_history)
-        return {"ok": True, "cached": True, "source": cache.get("source", "cache"), "items": items, "scraped_count": len(cached_items), "live_count": int(cache.get("scraped_count", len(cached_items)) or len(cached_items)), "updated_at_text": cache.get("updated_at_text", ""), "error": "", "profile_url": profile_url}
+        return {
+            "ok": True,
+            "cached": True,
+            "source": cache.get("source", "local_cache_manual") if isinstance(cache, dict) else "local_cache_manual",
+            "items": items,
+            "scraped_count": len(cached_items),
+            "live_count": int(cache.get("scraped_count", len(cached_items)) or len(cached_items)) if isinstance(cache, dict) else len(cached_items),
+            "updated_at_text": cache.get("updated_at_text", "") if isinstance(cache, dict) else "",
+            "error": "",
+            "profile_url": profile_url,
+        }
+
     if not profile_url or is_placeholder_itemsatis_profile_url(profile_url):
         local_items = collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=include_history)
         return {"ok": False, "cached": bool(cached_items), "source": "safe_fallback", "items": local_items, "scraped_count": 0, "live_count": 0, "updated_at_text": cache.get("updated_at_text", "") if isinstance(cache, dict) else "", "error": "Gerçek Itemsatış profil URL'i tanımlı değil. Aşağıdaki formdan profil linkini kaydet.", "profile_url": profile_url}
@@ -8480,13 +8586,14 @@ def admin_itemsatis_adverts(refresh: int = 0, history: int = 0, user: str = Depe
         url = str(item.get("url", ""))
         url_html = f"<a href='{html.escape(url)}' target='_blank' rel='noopener'>Aç</a>" if url else "-"
         rows.append(
-            f"<tr>"
-            f"<td data-label='İlan ID'><code>{html.escape(advert_id)}</code><button type='button' onclick=\"navigator.clipboard&&navigator.clipboard.writeText('{html.escape(advert_id)}')\">Kopyala</button></td>"
-            f"<td data-label='İlan Adı'>{name}</td>"
-            f"<td data-label='Durum'><span class='pill {pill_class}'>{label}</span></td>"
-            f"<td data-label='Kaynak'>{source}</td>"
-            f"<td data-label='Link'>{url_html}</td>"
-            f"</tr>"
+            f"""<tr>
+<td data-label='İlan ID'><code>{html.escape(advert_id)}</code><button type='button' onclick="navigator.clipboard&&navigator.clipboard.writeText('{html.escape(advert_id)}')">Kopyala</button></td>
+<td data-label='İlan Adı'>{name}</td>
+<td data-label='Durum'><span class='pill {pill_class}'>{label}</span></td>
+<td data-label='Kaynak'>{source}</td>
+<td data-label='Link'>{url_html}</td>
+<td data-label='İşlem'><form method='post' action='/admin/itemsatis-adverts/delete' onsubmit="return confirm('Bu ilan cache listesinden silinsin mi? Servis/paket eşleşmesi silinmez.');"><input type='hidden' name='advert_id' value='{html.escape(advert_id)}'><button class='red'>Sil</button></form></td>
+</tr>"""
         )
     history_link = "/admin/itemsatis-adverts?history=1" if not history else "/admin/itemsatis-adverts"
     history_text = "Geçmiş webhook kayıtlarını da göster" if not history else "Geçmiş webhook kayıtlarını gizle"
@@ -8506,6 +8613,7 @@ def admin_itemsatis_adverts(refresh: int = 0, history: int = 0, user: str = Depe
         <form method='post' action='/admin/itemsatis-adverts/refresh' style='display:inline;'><button class='green' type='submit'>İlanları ve Sayıyı Tekrar Kontrol Et</button></form>
         <a class='btn' href='/admin/itemsatis-adverts?refresh=1'>Hızlı Yenile</a>
         <a class='btn' href='{history_link}'>{history_text}</a>
+        <form method='post' action='/admin/itemsatis-adverts/clear' style='display:inline;' onsubmit="return confirm('İçe aktarılan ilan cache temizlensin mi? Dinamik servis/paket ayarları silinmez.');"><button class='red' type='submit'>İlan Cache Temizle</button></form>
         <a class='btn' href='/admin'>Servis Bağlama Sayfasına Git</a>
       </div>
       <div class='itemsatis-stats'>
@@ -8518,8 +8626,9 @@ def admin_itemsatis_adverts(refresh: int = 0, history: int = 0, user: str = Depe
       {count_warning}
     </div>
     <div class='card itemsatis-tools'><h2>Profil URL Ayarı</h2><form method='post' action='/admin/itemsatis-adverts/settings' class='grid'><input name='profile_url' value='{html.escape(profile_url)}' placeholder='https://www.itemsatis.com/profil/mağaza-adın veya public profil linkin'><button class='green'>Profil URL Kaydet</button></form><div class='muted'>Render Environment yerine buradan da profil linkini kaydedebilirsin. Kaydettikten sonra “İlanları ve Sayıyı Tekrar Kontrol Et” butonuna bas.</div></div>
-    <div class='card itemsatis-tools'><h2>Özel / Gizli İlan Linklerini İçe Aktar</h2><form method='post' action='/admin/itemsatis-adverts/import'><textarea name='raw_text' placeholder='Her satıra ilan adı ve link yapıştır. Örnek:\nInstagram 100 Türk Takipçi https://www.itemsatis.com/kategori/instagram-100-turk-takipci-1234567.html'></textarea><button class='green'>Yapıştırılan İlanları ID + İsim Olarak Kaydet</button></form><div class='muted'>Kişiye özel ilanlar public profilde yoksa buradan ekleyebilirsin. Bot linklerden ID'yi, satırdan ismi çıkarır.</div></div>
-    <div class='card'><table class='table'><thead><tr><th>İlan ID</th><th>İlan Adı</th><th>Durum</th><th>Kaynak</th><th>Link</th></tr></thead><tbody>{''.join(rows) or '<tr><td>Henüz ilan bulunamadı. Profil URL kaydet veya ilan linklerini içe aktar.</td></tr>'}</tbody></table></div>
+    <div class='card itemsatis-tools'><h2>Toplu İlan İçe Aktar</h2><form method='post' action='/admin/itemsatis-adverts/import-preview'><textarea name='raw_text' placeholder='Tarayıcı konsolundan çıkan listeyi buraya yapıştır. Örnek:
+Instagram 100 Türk Takipçi | 1234567 | https://www.itemsatis.com/kategori/instagram-100-turk-takipci-1234567.html'></textarea><button class='green'>Önizle ve Seç</button></form><div class='muted'>Bot önce önizleme yapar. Sadece işaretlediğin ilanlar Redis'e kaydedilir; 125 satır gelse bile yanlış olanları elemek kolaylaşır.</div></div>
+    <div class='card'><table class='table'><thead><tr><th>İlan ID</th><th>İlan Adı</th><th>Durum</th><th>Kaynak</th><th>Link</th><th>İşlem</th></tr></thead><tbody>{''.join(rows) or '<tr><td>Henüz ilan bulunamadı. Profil URL kaydet veya ilan linklerini içe aktar.</td></tr>'}</tbody></table></div>
     """
     return simple_admin_page("Itemsatış İlanları", body)
 
@@ -8530,10 +8639,81 @@ def admin_itemsatis_adverts_settings(profile_url: str = Form(""), user: str = De
     return RedirectResponse("/admin/itemsatis-adverts?refresh=1", status_code=303)
 
 
+@app.post("/admin/itemsatis-adverts/import-preview", response_class=HTMLResponse)
+def admin_itemsatis_adverts_import_preview(raw_text: str = Form(""), user: str = Depends(get_current_admin)):
+    preview = build_itemsatis_import_preview(raw_text)
+    rows = []
+    all_rows = [("Temiz Görünenler", preview.get("accepted", [])), ("Şüpheli / Kontrol Gerekli", preview.get("suspicious", []))]
+    for group_title, group_items in all_rows:
+        if not group_items:
+            continue
+        rows.append(f"<tr><td colspan='5'><b>{html.escape(group_title)}</b></td></tr>")
+        for idx, item in enumerate(group_items):
+            payload = html.escape(json.dumps({"advert_id": item.get("advert_id"), "name": item.get("name"), "url": item.get("url"), "source": "manual_import"}, ensure_ascii=False), quote=True)
+            checked = "checked" if item.get("default_checked") else ""
+            reasons = ", ".join(item.get("reasons") or []) or "-"
+            rows.append(
+                f"<tr>"
+                f"<td data-label='Seç'><input class='import-check' type='checkbox' name='selected_items' value='{payload}' {checked}></td>"
+                f"<td data-label='İlan ID'><code>{html.escape(str(item.get('advert_id','')))}</code></td>"
+                f"<td data-label='İlan Adı'>{html.escape(str(item.get('name','')))}</td>"
+                f"<td data-label='Link'>{('<a href=' + repr(html.escape(str(item.get('url','')))) + ' target=_blank>Aç</a>') if item.get('url') else '-'}</td>"
+                f"<td data-label='Not'>{html.escape(reasons)}</td>"
+                f"</tr>"
+            )
+    body = f"""
+    <div class='card'>
+      <h2>İlan İçe Aktarma Önizleme</h2>
+      <div class='itemsatis-stats'>
+        <div class='itemsatis-stat'><b>Yapıştırılan satır</b><span class='stat'>{int(preview.get('line_count', 0))}</span></div>
+        <div class='itemsatis-stat'><b>Okunan benzersiz ilan</b><span class='stat'>{int(preview.get('parsed_count', 0))}</span></div>
+        <div class='itemsatis-stat'><b>Şüpheli</b><span class='stat'>{len(preview.get('suspicious', []))}</span></div>
+      </div>
+      <div class='notice warning'>Sadece işaretli ilanlar kaydedilir. Şüpheli olanları kontrol etmeden işaretleme.</div>
+      <div class='toolbar'><button type='button' onclick="document.querySelectorAll('.import-check').forEach(x=>x.checked=true)">Tümünü Seç</button><button type='button' onclick="document.querySelectorAll('.import-check').forEach(x=>x.checked=false)">Tümünü Kaldır</button><a class='btn' href='/admin/itemsatis-adverts'>Geri Dön</a></div>
+    </div>
+    <form method='post' action='/admin/itemsatis-adverts/import-confirm'>
+      <div class='card'><table class='table'><thead><tr><th>Seç</th><th>ID</th><th>İlan Adı</th><th>Link</th><th>Not</th></tr></thead><tbody>{''.join(rows) or '<tr><td>Hiç ilan okunamadı. Konsol çıktısını veya ilan linklerini kontrol et.</td></tr>'}</tbody></table></div>
+      <div class='card'><button class='green'>Seçili İlanları Kaydet</button> <a class='btn' href='/admin/itemsatis-adverts'>İptal</a></div>
+    </form>
+    """
+    return simple_admin_page("İlan İçe Aktarma Önizleme", body)
+
+
+@app.post("/admin/itemsatis-adverts/import-confirm")
+async def admin_itemsatis_adverts_import_confirm(request: Request, user: str = Depends(get_current_admin)):
+    form = await request.form()
+    selected_values = form.getlist("selected_items")
+    items = []
+    for raw in selected_values:
+        try:
+            item = json.loads(str(raw))
+            advert_id = str(item.get("advert_id", "")).strip()
+            if advert_id and advert_id.isdigit():
+                items.append({"advert_id": advert_id, "name": _itemsatis_clean_title(item.get("name", "")) or f"Itemsatış İlanı {advert_id}", "url": str(item.get("url", "")), "source": "manual_import"})
+        except Exception as e:
+            log("warning", "itemsatis_import_confirm_item_skip", error=str(e))
+    save_manual_itemsatis_adverts(items, merge=True)
+    return RedirectResponse("/admin/itemsatis-adverts", status_code=303)
+
+
 @app.post("/admin/itemsatis-adverts/import")
 def admin_itemsatis_adverts_import(raw_text: str = Form(""), user: str = Depends(get_current_admin)):
+    # Eski endpoint geriye dönük kalsın; artık doğrudan kaydetmek yerine önizleme önerilir.
     items = parse_itemsatis_adverts_from_text(raw_text)
     save_manual_itemsatis_adverts(items, merge=True)
+    return RedirectResponse("/admin/itemsatis-adverts", status_code=303)
+
+
+@app.post("/admin/itemsatis-adverts/delete")
+def admin_itemsatis_adverts_delete(advert_id: str = Form(""), user: str = Depends(get_current_admin)):
+    remove_itemsatis_advert_from_cache(advert_id)
+    return RedirectResponse("/admin/itemsatis-adverts", status_code=303)
+
+
+@app.post("/admin/itemsatis-adverts/clear")
+def admin_itemsatis_adverts_clear(user: str = Depends(get_current_admin)):
+    clear_itemsatis_advert_import_cache()
     return RedirectResponse("/admin/itemsatis-adverts", status_code=303)
 
 
