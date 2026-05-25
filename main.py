@@ -7336,6 +7336,110 @@ setInterval(loadAll, 30000);
 """
 
 
+
+
+# ─── STABLE CLEAN DASHBOARD OVERRIDE ─────────────────────────────────────────
+# v12: Eski ağır Chart.js dashboard yerine daha hafif ve stabil dashboard.
+# Sipariş/webhook/Redis/queue mantığına dokunmaz; sadece ana panel görünümünü sadeleştirir.
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boostera Dashboard</title>
+<style>
+:root{color-scheme:dark;--bg:#070a17;--panel:#0d1326;--card:#111a32;--card2:#0b1022;--border:rgba(148,163,184,.18);--text:#f8fafc;--muted:#94a3b8;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--blue:#38bdf8;--purple:#a78bfa;--shadow:0 18px 55px rgba(0,0,0,.30);--radius:22px}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 10% 0%,rgba(124,58,237,.18),transparent 32%),radial-gradient(circle at 90% 0%,rgba(34,211,238,.10),transparent 28%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;line-height:1.5}.wrap{max-width:1280px;margin:0 auto;padding:24px}.top{display:flex;gap:14px;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap}.brand h1{margin:0;font-size:28px;letter-spacing:-.04em}.brand p{margin:4px 0 0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap}.btn,button{border:1px solid var(--border);background:rgba(15,23,42,.75);color:var(--text);border-radius:14px;padding:11px 14px;text-decoration:none;font-weight:800;cursor:pointer}.btn:hover,button:hover{border-color:rgba(167,139,250,.55);transform:translateY(-1px)}button.green,.green{background:linear-gradient(135deg,#22c55e,#16a34a);border:0;color:white}.red{background:linear-gradient(135deg,#ef4444,#b91c1c);border:0;color:white}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.card{background:linear-gradient(180deg,rgba(17,26,50,.95),rgba(11,16,34,.92));border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);min-width:0}.stat .label{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:900}.stat .value{font-size:38px;font-weight:950;margin-top:8px;letter-spacing:-.04em;word-break:break-word}.stat .sub{color:var(--muted);font-size:13px;margin-top:4px}.line{height:3px;border-radius:9px;background:var(--purple);margin:-20px -20px 16px}.line.green{background:var(--green)}.line.red{background:var(--red)}.line.yellow{background:var(--yellow)}.line.blue{background:var(--blue)}.two{display:grid;grid-template-columns:1.2fr .8fr;gap:16px;margin-top:16px}.list{display:grid;gap:10px}.row{display:flex;justify-content:space-between;gap:12px;border:1px solid rgba(148,163,184,.10);background:rgba(2,6,23,.28);border-radius:14px;padding:12px}.muted{color:var(--muted)}.pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:900;background:rgba(148,163,184,.12);color:var(--muted)}.pill.ok{background:rgba(34,197,94,.15);color:#86efac}.pill.bad{background:rgba(239,68,68,.15);color:#fca5a5}.pill.warn{background:rgba(245,158,11,.15);color:#fcd34d}pre{white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px;color:#cbd5e1}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}.danger-note{border-color:rgba(239,68,68,.30);background:rgba(239,68,68,.08)}@media(max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}}@media(max-width:640px){.wrap{padding:14px}.grid{grid-template-columns:1fr}.top{align-items:stretch}.nav{display:grid;grid-template-columns:1fr 1fr;width:100%}.btn,button{width:100%;text-align:center}.stat .value{font-size:34px}.row{display:grid;grid-template-columns:1fr}.card{padding:16px;border-radius:18px}.line{margin:-16px -16px 14px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand"><h1>Boostera Dashboard</h1><p>Stabil, hafif ve hızlı kontrol paneli</p></div>
+    <div class="nav">
+      <a class="btn" href="/admin">Admin</a>
+      <a class="btn" href="/admin/adverts-bind">İlan Bağla</a>
+      <a class="btn" href="/admin/itemsatis-adverts">İlanlar</a>
+      <a class="btn" href="/admin/queue-dead">Queue Dead</a>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card stat"><div class="line green"></div><div class="label">Bugünkü Sipariş</div><div id="todayCount" class="value">-</div><div id="todaySub" class="sub">yükleniyor</div></div>
+    <div class="card stat"><div class="line yellow"></div><div class="label">Bugünkü Brüt</div><div id="todayGross" class="value">-</div><div id="todayNet" class="sub">net hesaplanıyor</div></div>
+    <div class="card stat"><div class="line blue"></div><div class="label">Bekleyen</div><div id="pendingCount" class="value">-</div><div class="sub">panel takibindeki sipariş</div></div>
+    <div class="card stat"><div class="line red"></div><div class="label">Başarısız</div><div id="failedCount" class="value">-</div><div class="sub">kontrol gereken sipariş</div></div>
+  </div>
+
+  <div class="two">
+    <div class="card">
+      <h2>Operasyon Durumu</h2>
+      <div class="list" id="opsRows"><div class="muted">Yükleniyor...</div></div>
+      <div class="toolbar">
+        <a class="btn" href="/api/system-check" target="_blank">System Check JSON</a>
+        <a class="btn" href="/api/queue-status" target="_blank">Queue JSON</a>
+        <button onclick="loadAll()">Yenile</button>
+      </div>
+    </div>
+    <div class="card danger-note">
+      <h2>Veri Temizliği</h2>
+      <p class="muted">Test webhookları yüzünden dashboard tutarları şiştiyse buradan sadece rapor/satış sayaçlarını sıfırlayabilirsin. Servisler, paketler, ilanlar ve Redis queue silinmez.</p>
+      <form method="post" action="/admin/reset-dashboard" onsubmit="return confirm('Bu ayın dashboard/rapor verisi sıfırlansın mı?')"><button class="red">Bu Ay Dashboard Sıfırla</button></form>
+      <form method="post" action="/admin/reset-sales-all" onsubmit="return confirm('Tüm satış rapor geçmişi sıfırlansın mı? Servis/paket/ilan ayarları silinmez.')" style="margin-top:10px"><button class="red">Tüm Satış Raporlarını Sıfırla</button></form>
+    </div>
+  </div>
+
+  <div class="two">
+    <div class="card"><h2>Son Loglar</h2><div id="logs" class="list"><div class="muted">Yükleniyor...</div></div></div>
+    <div class="card"><h2>Hızlı Linkler</h2><div class="list">
+      <a class="btn" href="/admin/manual-order">Manuel Sipariş</a>
+      <a class="btn" href="/admin/search-services">Servis Ara</a>
+      <a class="btn" href="/admin/packages">Paketler</a>
+      <a class="btn" href="/admin/system-check">Sistem Kontrol</a>
+    </div></div>
+  </div>
+</div>
+<script>
+function money(v){v=Number(v||0);return v.toLocaleString('tr-TR',{maximumFractionDigits:2})+' ₺'}
+function pill(ok,text){return '<span class="pill '+(ok?'ok':'bad')+'">'+text+'</span>'}
+async function getJSON(url){const r=await fetch(url,{cache:'no-store'}); if(!r.ok) throw new Error(url+' '+r.status); return await r.json();}
+async function loadAll(){
+  try{
+    const stats=await getJSON('/api/stats');
+    document.getElementById('todayCount').textContent=stats.today_count||0;
+    document.getElementById('todaySub').textContent='bugünkü kayıtlı satış';
+    document.getElementById('todayGross').textContent=money(stats.today_gross||0);
+    document.getElementById('todayNet').textContent='net '+money(stats.today_net||0);
+    document.getElementById('pendingCount').textContent=stats.pending_count||0;
+    document.getElementById('failedCount').textContent=stats.failed_count||0;
+  }catch(e){console.error(e)}
+  try{
+    const sys=await getJSON('/api/system-check');
+    const q=sys.queue_status||{};
+    const rows=[];
+    rows.push('<div class="row"><b>Redis</b><span>'+pill(sys.redis&&sys.redis.ok, sys.redis&&sys.redis.ok?'Sağlıklı':'Kontrol gerekli')+'</span></div>');
+    rows.push('<div class="row"><b>Queue bekleyen</b><span>'+(q.queued||0)+'</span></div>');
+    rows.push('<div class="row"><b>Processing</b><span>'+(q.processing||0)+'</span></div>');
+    rows.push('<div class="row"><b>Dead queue</b><span class="pill '+((q.dead||0)>0?'bad':'ok')+'">'+(q.dead||0)+'</span></div>');
+    rows.push('<div class="row"><b>Dinamik servis</b><span>'+(sys.dynamic_services_count||0)+'</span></div>');
+    rows.push('<div class="row"><b>Paket</b><span>'+(sys.packages_count||0)+'</span></div>');
+    rows.push('<div class="row"><b>Route çakışması</b><span>'+pill(!(sys.duplicate_routes||[]).length, (sys.duplicate_routes||[]).length?'Var':'Yok')+'</span></div>');
+    document.getElementById('opsRows').innerHTML=rows.join('');
+  }catch(e){document.getElementById('opsRows').innerHTML='<pre>'+String(e)+'</pre>';}
+  try{
+    const data=await getJSON('/api/logs');
+    const logs=(data.logs||[]).slice(-12).reverse();
+    document.getElementById('logs').innerHTML=logs.length?logs.map(x=>'<div class="row"><div><b>'+String(x.level||'info').toUpperCase()+'</b><div class="muted">'+(x.ts||'')+'</div></div><pre>'+String(x.event||'')+'</pre></div>').join(''):'<div class="muted">Log yok</div>';
+  }catch(e){document.getElementById('logs').innerHTML='<pre>'+String(e)+'</pre>';}
+}
+loadAll(); setInterval(loadAll,30000);
+</script>
+</body>
+</html>
+"""
+
+
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 def dashboard(user: str = Depends(get_current_admin)):
@@ -7422,12 +7526,12 @@ def api_failed(user: str = Depends(get_current_admin)):
 
 @app.get("/api/logs")
 def api_logs(user: str = Depends(get_current_admin)):
-    return {"logs": LOG_HISTORY}
+    return {"logs": LOG_HISTORY[-80:]}
 
 
 @app.get("/api/history")
 def api_history(user: str = Depends(get_current_admin)):
-    return {"orders": ORDER_HISTORY[-500:]}
+    return {"orders": ORDER_HISTORY[-200:]}
 
 
 @app.get("/api/blacklist")
