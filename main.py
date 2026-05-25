@@ -4376,6 +4376,20 @@ def admin_reset_dashboard(user: str = Depends(get_current_admin)):
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.post("/admin/reset-sales-all")
+def admin_reset_sales_all(user: str = Depends(get_current_admin)):
+    """Admin panelden tüm satış raporlarını sıfırlar. Servis, paket, ilan, queue ve pending verilerine dokunmaz."""
+    reset_sales_stats("all")
+    log("warning", "admin_all_sales_reports_reset", user=user)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.get("/admin/reset-sales-all")
+def admin_reset_sales_all_get(user: str = Depends(get_current_admin)):
+    """Yanlışlıkla GET açılırsa 404 yerine admin paneline döndürür."""
+    return RedirectResponse("/admin", status_code=303)
+
+
 ADMIN_PACKAGES_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
@@ -7394,9 +7408,9 @@ DASHBOARD_HTML = """
     <div class="card"><h2>Son Loglar</h2><div id="logs" class="list"><div class="muted">Yükleniyor...</div></div></div>
     <div class="card"><h2>Hızlı Linkler</h2><div class="list">
       <a class="btn" href="/admin/manual-order">Manuel Sipariş</a>
-      <a class="btn" href="/admin/search-services">Servis Ara</a>
+      <a class="btn" href="/admin/service-search">Servis Ara</a>
       <a class="btn" href="/admin/packages">Paketler</a>
-      <a class="btn" href="/admin/system-check">Sistem Kontrol</a>
+      <a class="btn" href="/api/system-check" target="_blank">Sistem Kontrol</a>
     </div></div>
   </div>
 </div>
@@ -7416,10 +7430,11 @@ async function loadAll(){
   }catch(e){console.error(e)}
   try{
     const sys=await getJSON('/api/system-check');
-    const q=sys.queue_status||{};
+    const qraw=sys.queue_status||{};
+    const q=qraw.queue||qraw;
     const rows=[];
     rows.push('<div class="row"><b>Redis</b><span>'+pill(sys.redis&&sys.redis.ok, sys.redis&&sys.redis.ok?'Sağlıklı':'Kontrol gerekli')+'</span></div>');
-    rows.push('<div class="row"><b>Queue bekleyen</b><span>'+(q.queued||0)+'</span></div>');
+    rows.push('<div class="row"><b>Queue bekleyen</b><span>'+(q.waiting||0)+'</span></div>');
     rows.push('<div class="row"><b>Processing</b><span>'+(q.processing||0)+'</span></div>');
     rows.push('<div class="row"><b>Dead queue</b><span class="pill '+((q.dead||0)>0?'bad':'ok')+'">'+(q.dead||0)+'</span></div>');
     rows.push('<div class="row"><b>Dinamik servis</b><span>'+(sys.dynamic_services_count||0)+'</span></div>');
@@ -7439,6 +7454,16 @@ loadAll(); setInterval(loadAll,30000);
 </html>
 """
 
+
+
+@app.get("/admin/search-services")
+def admin_search_services_redirect(user: str = Depends(get_current_admin)):
+    return RedirectResponse("/admin/service-search", status_code=303)
+
+
+@app.get("/admin/system-check")
+def admin_system_check_redirect(user: str = Depends(get_current_admin)):
+    return RedirectResponse("/api/system-check", status_code=303)
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
