@@ -224,6 +224,18 @@ BULK_RETRY_MAX = int(os.getenv("BULK_RETRY_MAX", "30"))
 BULK_RETRY_DELAY_SECONDS = float(os.getenv("BULK_RETRY_DELAY_SECONDS", "2"))
 BALANCE_WARN_REPEAT_MINUTES = int(os.getenv("BALANCE_WARN_REPEAT_MINUTES", "60"))
 BALANCE_WARN_THRESHOLD_TL = float(os.getenv("BALANCE_WARN_THRESHOLD_TL", "100"))
+# Örn Render env: LOW_BALANCE_DISABLED_PANELS=morethanpanel
+LOW_BALANCE_DISABLED_PANELS = {
+    p.strip().lower()
+    for p in os.getenv("LOW_BALANCE_DISABLED_PANELS", "").split(",")
+    if p.strip()
+}
+LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL = {
+    part.split(":", 1)[0].strip().lower(): int(part.split(":", 1)[1].strip())
+    for part in os.getenv("LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL", "").split(",")
+    if ":" in part and part.split(":", 1)[0].strip() and part.split(":", 1)[1].strip().isdigit()
+}
+
 CHECK_BALANCE_INTERVAL_SECONDS = int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300"))
 VIP_ORDER_THRESHOLD = int(os.getenv("VIP_ORDER_THRESHOLD", "5"))
 PROFIT_TARGET_MARGIN_PERCENT = float(os.getenv("PROFIT_TARGET_MARGIN_PERCENT", "30"))
@@ -1048,7 +1060,7 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
 
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
@@ -1076,6 +1088,7 @@ def load_state():
     LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
     BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
+    LOW_BALANCE_DISABLED_PANELS = set(redis_get_json("low_balance_disabled_panels", list(LOW_BALANCE_DISABLED_PANELS)))
     PANEL_STATS = redis_get_json("panel_stats", {})
     SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
     BUYER_STATS = redis_get_json("buyer_stats", {})
@@ -1119,6 +1132,7 @@ def save_state():
             "link_audit_history": LINK_AUDIT_HISTORY[-300:],
             "message_templates": MESSAGE_TEMPLATES,
             "balance_warn_last": BALANCE_WARN_LAST,
+            "low_balance_disabled_panels": sorted(LOW_BALANCE_DISABLED_PANELS),
             "panel_stats": PANEL_STATS,
             "service_completion_stats": SERVICE_COMPLETION_STATS,
             "buyer_stats": BUYER_STATS,
@@ -2198,6 +2212,67 @@ def get_event(data: dict) -> str:
         if event:
             return event
     return ""
+
+
+ITEMSATIS_PURCHASE_EVENT_KEYWORDS = {
+    "order.created", "order_create", "order_created", "order.paid", "order_paid",
+    "purchase.created", "purchase_create", "purchase_created", "purchase.paid", "purchase_paid",
+    "sale.created", "sale_create", "sale_created", "sale.paid", "sale_paid",
+    "advert.sold", "advert_sold", "ilan.satildi", "ilan_satildi", "ilanınız satıldı", "ilaniniz satildi",
+    "new_order", "new order", "siparis", "sipariş", "satildi", "satıldı",
+}
+
+ITEMSATIS_NON_ORDER_EVENT_KEYWORDS = {
+    "listing_chat_started", "listing_chat", "chat_started",
+    "message", "message.created", "new_message", "conversation", "chat",
+    "notification", "comment", "review", "question", "support",
+    "ticket", "delivery_message", "order.message", "order_message",
+}
+
+
+def is_itemsatis_purchase_event(data: dict) -> bool:
+    """Itemsatış'tan gelen mesaj/bildirim webhooklarını sipariş sanmayı engeller.
+    Sadece gerçek satış/sipariş sinyali varsa True döner.
+    """
+    event = normalize_text(get_event(data))
+    event_simple = (
+        event.replace("ı", "i")
+        .replace("ş", "s")
+        .replace("ğ", "g")
+        .replace("ü", "u")
+        .replace("ö", "o")
+        .replace("ç", "c")
+    )
+
+    if event_simple:
+        if any(key in event_simple for key in ITEMSATIS_NON_ORDER_EVENT_KEYWORDS):
+            return False
+        if any(key in event_simple for key in ITEMSATIS_PURCHASE_EVENT_KEYWORDS):
+            return True
+
+    # Event yoksa payload içeriğine bakılır ama sadece güçlü sipariş kanıtı varsa kabul edilir.
+    order_id = get_order_id(data)
+    advert_id = get_advert_id(data)
+    product_name = get_product_name(data)
+    link = extract_customer_link(data)
+    price = get_order_price(data)
+
+    has_order_id = bool(order_id and str(order_id) != "Bilinmiyor")
+    has_advert_id = bool(advert_id)
+    has_product = bool(product_name and not is_generic_itemsatis_title(product_name))
+    has_link = bool(link)
+    has_price = float(price or 0) > 0
+
+    # Gerçek sipariş için en az order/advert + ürün + fiyat/link kombinasyonu aranır.
+    if has_order_id and has_advert_id and has_product and (has_price or has_link):
+        return True
+
+    # Bazı webhooklarda order_id gelmeyebilir; advert + ürün + fiyat + link varsa yine kabul edilebilir.
+    if has_advert_id and has_product and has_price and has_link:
+        return True
+
+    return False
+
 
 
 def is_generic_itemsatis_title(value: str) -> bool:
@@ -4143,14 +4218,36 @@ def get_panel_services(api_url, api_key, panel_name=""):
     return _panel_api_request(api_url, api_key, "services", panel_name=panel_name)
 
 
+
+def is_low_balance_warning_disabled(panel_key: str = "", panel_name: str = "") -> bool:
+    panel_key = normalize_panel_key(panel_key or panel_name or "")
+    panel_name_norm = normalize_text(panel_name or "")
+    return panel_key in LOW_BALANCE_DISABLED_PANELS or panel_name_norm in LOW_BALANCE_DISABLED_PANELS
+
+
+def get_low_balance_repeat_minutes(panel_key: str = "", panel_name: str = "") -> int:
+    panel_key = normalize_panel_key(panel_key or panel_name or "")
+    panel_name_norm = normalize_text(panel_name or "")
+    if panel_key in LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL:
+        return int(LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL[panel_key])
+    if panel_name_norm in LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL:
+        return int(LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL[panel_name_norm])
+    return int(BALANCE_WARN_REPEAT_MINUTES)
+
 def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = "", force_alert: bool = False):
     """Panel bakiyesi eşik altındaysa Telegram uyarısı gönderir.
 
     Düzeltmeler:
     - BALANCE_WARN_THRESHOLD_TL env değeri tanımlı.
-    - Aynı düşük bakiye uyarısını BALANCE_WARN_REPEAT_MINUTES aralığıyla tekrarlar.
+    - Aynı düşük bakiye uyarısını repeat_minutes aralığıyla tekrarlar.
     - Bakiye eşik üstüne çıkınca alarm hafızasını temizler.
     """
+    panel_key = normalize_panel_key(panel_key or panel_name or "")
+    if is_low_balance_warning_disabled(panel_key, panel_name):
+        log("info", "low_balance_warning_disabled", panel=panel_name or panel_key, balance_tl=balance_tl)
+        return False
+
+    repeat_minutes = get_low_balance_repeat_minutes(panel_key, panel_name)
     try:
         balance_tl = convert_balance_to_try(balance, currency)
         if balance_tl is None:
@@ -4160,7 +4257,7 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
         key = normalize_panel_key(panel_key or panel_name)
         now_ts = int(time.time())
         threshold = float(BALANCE_WARN_THRESHOLD_TL)
-        repeat_seconds = max(60, int(BALANCE_WARN_REPEAT_MINUTES) * 60)
+        repeat_seconds = max(60, int(repeat_minutes) * 60)
 
         if balance_tl > threshold:
             if key in BALANCE_WARN_LAST:
@@ -4187,7 +4284,7 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
         send_telegram_alert(
             f"{panel_name} bakiyesi {format_tl_amount(threshold)} altına düştü.\n\n"
             f"Kalan: {format_tl_amount(balance_tl)}\n"
-            f"Tekrar uyarı aralığı: {BALANCE_WARN_REPEAT_MINUTES} dk\n\n"
+            f"Tekrar uyarı aralığı: {repeat_minutes} dk\n\n"
             f"Lütfen panel bakiyesini kontrol et."
         )
         return True
@@ -5346,6 +5443,25 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 </body>
 </html>
 """
+
+
+
+@app.post("/admin/low-balance-toggle")
+def admin_low_balance_toggle(panel: str = Form(...), disabled: str = Form("true"), user: str = Depends(get_current_admin)):
+    """Panel bazlı düşük bakiye uyarısını aç/kapatır."""
+    panel_key = normalize_panel_key(panel)
+    if not panel_key:
+        return RedirectResponse("/admin", status_code=303)
+
+    if str(disabled).lower() in {"1", "true", "yes", "on", "disable", "disabled"}:
+        LOW_BALANCE_DISABLED_PANELS.add(panel_key)
+        log("warning", "low_balance_panel_disabled_by_admin", panel=panel_key)
+    else:
+        LOW_BALANCE_DISABLED_PANELS.discard(panel_key)
+        log("info", "low_balance_panel_enabled_by_admin", panel=panel_key)
+
+    redis_set_json("low_balance_disabled_panels", sorted(LOW_BALANCE_DISABLED_PANELS))
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -15512,6 +15628,11 @@ def check_services():
 
 def process_itemsatis_webhook_payload(data: dict):
     """Eski Itemsatış webhook işleme mantığı. Worker tarafından thread içinde çağrılır."""
+    if not is_itemsatis_purchase_event(data):
+        event = get_event(data)
+        log("info", "itemsatis_non_order_webhook_ignored", event=event, order_id=get_order_id(data), advert_id=get_advert_id(data))
+        return {"ok": True, "ignored": True, "reason": "non_order_webhook", "event": event}
+
     QUEUE_CONTEXT.active = True
     try:
         log("info", "webhook_received", raw=str(data)[:200])
@@ -15841,10 +15962,17 @@ async def itemsatis_webhook(request: Request):
         data = {"raw_body": body.decode("utf-8", errors="ignore")}
     log("info", "webhook_received_queued", raw=str(data)[:200])
     event = get_event(data)
+
+    # Itemsatış sohbet/mesaj/bildirim webhooklarını kuyruğa bile alma.
+    # Örn: listing_chat_started sipariş değildir.
+    if not is_itemsatis_purchase_event(data):
+        log("info", "webhook_ignored_before_queue", event=event, advert_id=get_advert_id(data), order_id=get_order_id(data), reason="non_order_webhook")
+        return {"ok": True, "ignored": True, "event": event, "reason": "non_order_webhook"}
+
     ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
     if event in ignored_events:
         log("info", "webhook_ignored_before_queue", event=event)
-        return {"ignored": True, "event": event}
+        return {"ok": True, "ignored": True, "event": event}
     order_id = get_order_id(data)
     seen_key = ""
     seen_locked = False
