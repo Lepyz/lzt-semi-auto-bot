@@ -5369,6 +5369,76 @@ def admin_panel(user: str = Depends(get_current_admin)):
     return HTMLResponse(content=html)
 
 
+
+
+def build_admin_post_confirm_page(title: str, message: str, action: str, fields: dict, cancel_url: str = "/admin") -> HTMLResponse:
+    """GET ile gelen state-changing admin işlemlerini direkt çalıştırmak yerine POST onayı ister."""
+    hidden_inputs = "\n".join(
+        f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(v))}">'
+        for k, v in (fields or {}).items()
+    )
+    content = f"""
+    <!doctype html>
+    <html lang="tr">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{html.escape(title)}</title>
+      <style>
+        body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:#050816; color:#f8fafc; font-family:Inter,system-ui,Arial,sans-serif; padding:18px; }}
+        .box {{ width:min(560px,100%); background:linear-gradient(180deg,rgba(15,23,42,.96),rgba(2,6,23,.88)); border:1px solid rgba(148,163,184,.22); border-radius:24px; padding:26px; box-shadow:0 20px 60px rgba(0,0,0,.35); }}
+        h1 {{ margin:0 0 12px; font-size:28px; letter-spacing:-.04em; }}
+        p {{ color:#cbd5e1; line-height:1.65; }}
+        .actions {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:22px; }}
+        button,a {{ min-height:48px; border-radius:14px; border:1px solid rgba(148,163,184,.24); display:flex; align-items:center; justify-content:center; text-decoration:none; font-weight:800; color:#fff; }}
+        button {{ background:linear-gradient(135deg,#22c55e,#16a34a); cursor:pointer; }}
+        a {{ background:rgba(15,23,42,.8); }}
+        @media(max-width:560px) {{ .actions {{ grid-template-columns:1fr; }} .box {{ padding:20px; }} }}
+      </style>
+    </head>
+    <body>
+      <div class="box">
+        <h1>{html.escape(title)}</h1>
+        <p>{html.escape(message)}</p>
+        <form method="post" action="{html.escape(action)}">
+          {hidden_inputs}
+          <div class="actions">
+            <button type="submit">Onayla</button>
+            <a href="{html.escape(cancel_url)}">Vazgeç</a>
+          </div>
+        </form>
+      </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=content)
+
+@app.get("/admin/add-service")
+def admin_add_service_get(
+    advert_id: str = "",
+    panel: str = "",
+    service_id: str = "",
+    quantity: int = 0,
+    platform: str = "instagram",
+    user: str = Depends(get_current_admin),
+):
+    """GET ile servis ekleme gelirse 405 yerine güvenli POST onay sayfası gösterir."""
+    advert_id = str(advert_id or "").strip()
+    panel = str(panel or "").strip()
+    service_id = str(service_id or "").strip()
+    platform = str(platform or "instagram").strip() or "instagram"
+    if advert_id and panel and service_id and int(quantity or 0) > 0:
+        return build_admin_post_confirm_page(
+            "Servis Ekleme Onayı",
+            f"İlan {advert_id} için {panel} panelindeki {service_id} servisi {int(quantity or 0)} adet olarak eklensin mi?",
+            "/admin/add-service",
+            {"advert_id": advert_id, "panel": panel, "service_id": service_id, "quantity": int(quantity or 0), "platform": platform},
+            "/admin",
+        )
+    log("warning", "admin_add_service_get_missing_fields", advert_id=advert_id, panel=panel, service_id=service_id, quantity=quantity)
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/add-service")
 def admin_add_service(
     advert_id: str = Form(...),
@@ -5397,10 +5467,46 @@ def admin_delete_service(advert_id: str = Form(...), user: str = Depends(get_cur
     return RedirectResponse("/admin", status_code=303)
 
 
+
+
+@app.get("/admin/delete-service")
+def admin_delete_service_get(advert_id: str = "", user: str = Depends(get_current_admin)):
+    """GET ile silme gelirse 405 yerine güvenli POST onay sayfası gösterir."""
+    advert_id = str(advert_id or "").strip()
+    if advert_id:
+        return build_admin_post_confirm_page(
+            "Servis Silme Onayı",
+            f"İlan {advert_id} için kayıtlı dinamik servis silinsin mi?",
+            "/admin/delete-service",
+            {"advert_id": advert_id},
+            "/admin",
+        )
+    log("warning", "admin_service_delete_get_missing_advert_id")
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/toggle-service")
 def admin_toggle_service(advert_id: str = Form(...), user: str = Depends(get_current_admin)):
     toggle_dynamic_service(advert_id)
     log("info", "admin_service_toggled", advert_id=advert_id)
+    return RedirectResponse("/admin", status_code=303)
+
+
+
+
+@app.get("/admin/toggle-service")
+def admin_toggle_service_get(advert_id: str = "", user: str = Depends(get_current_admin)):
+    """GET ile aktif/pasif gelirse 405 yerine güvenli POST onay sayfası gösterir."""
+    advert_id = str(advert_id or "").strip()
+    if advert_id:
+        return build_admin_post_confirm_page(
+            "Servis Durumu Değiştirme Onayı",
+            f"İlan {advert_id} servisinin aktif/pasif durumu değiştirilsin mi?",
+            "/admin/toggle-service",
+            {"advert_id": advert_id},
+            "/admin",
+        )
+    log("warning", "admin_service_toggle_get_missing_advert_id")
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -14660,6 +14766,32 @@ def admin_bind_service_page(advert_id: str, panel: str = "", q: str = "", quanti
     return simple_admin_page("İlanı Servise Bağla", body)
 
 
+@app.get("/admin/bind-service/save")
+def admin_bind_service_save_get(
+    advert_id: str = "",
+    panel: str = "",
+    service_id: str = "",
+    quantity: int = 0,
+    platform: str = "instagram",
+    user: str = Depends(get_current_admin),
+):
+    """GET ile tek tık bağlama gelirse 405 yerine güvenli POST onay sayfası gösterir."""
+    advert_id = str(advert_id or "").strip()
+    panel = str(panel or "").strip()
+    service_id = str(service_id or "").strip()
+    platform = str(platform or "instagram").strip() or "instagram"
+    if advert_id and panel and service_id and int(quantity or 0) > 0:
+        return build_admin_post_confirm_page(
+            "İlan Servise Bağlama Onayı",
+            f"İlan {advert_id}, {panel} panelindeki {service_id} servisine {int(quantity or 0)} adet olarak bağlansın mı?",
+            "/admin/bind-service/save",
+            {"advert_id": advert_id, "panel": panel, "service_id": service_id, "quantity": int(quantity or 0), "platform": platform},
+            "/admin/adverts-bind?status=missing",
+        )
+    log("warning", "advert_bind_service_get_missing_fields", advert_id=advert_id, panel=panel, service_id=service_id, quantity=quantity)
+    return RedirectResponse("/admin/adverts-bind?status=missing", status_code=303)
+
+
 @app.post("/admin/bind-service/save")
 def admin_bind_service_save(advert_id: str = Form(...), panel: str = Form(...), service_id: str = Form(...), quantity: int = Form(...), platform: str = Form("other"), user: str = Depends(get_current_admin)):
     try:
@@ -14933,7 +15065,7 @@ def my_ip(user: str = Depends(get_current_admin)):
 
 @app.head("/check-orders")
 def check_orders_head():
-    return check_orders()
+    return {"ok": True, "status": "alive", "endpoint": "check-orders"}
 
 
 @app.get("/check-orders")
@@ -15105,7 +15237,7 @@ def handle_cancel_command(text: str):
 
 @app.head("/daily-report")
 def daily_report_head():
-    return daily_report()
+    return {"ok": True, "status": "alive", "endpoint": "daily-report"}
 
 
 @app.get("/daily-report")
@@ -15127,7 +15259,7 @@ def daily_report():
 
 @app.head("/weekly-report")
 def weekly_report_head():
-    return weekly_report()
+    return {"ok": True, "status": "alive", "endpoint": "weekly-report"}
 
 
 @app.get("/weekly-report")
@@ -15149,7 +15281,7 @@ def weekly_report():
 
 @app.head("/monthly-report")
 def monthly_report_head():
-    return monthly_report()
+    return {"ok": True, "status": "alive", "endpoint": "monthly-report"}
 
 
 @app.get("/monthly-report")
@@ -15300,7 +15432,7 @@ def prime_service_price_cache(panel_key: str, service_id: str, context: str = ""
 
 @app.head("/check-services")
 def check_services_head():
-    return check_services()
+    return {"ok": True, "status": "alive", "endpoint": "check-services"}
 
 
 @app.get("/check-services")
