@@ -198,6 +198,12 @@ _RATE_LIMIT_STORE = defaultdict(list)
 MESSAGE_TEMPLATES = {}
 BALANCE_WARN_LAST = {}
 LOG_FLUSH_INTERVAL_SECONDS = int(os.getenv("LOG_FLUSH_INTERVAL_SECONDS", "30"))
+DASHBOARD_REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "45"))
+API_LOG_LIMIT = int(os.getenv("API_LOG_LIMIT", "40"))
+API_HISTORY_LIMIT = int(os.getenv("API_HISTORY_LIMIT", "50"))
+GROWTH_INSIGHTS_CACHE_SECONDS = int(os.getenv("GROWTH_INSIGHTS_CACHE_SECONDS", "60"))
+_GROWTH_INSIGHTS_CACHE = {"ts": 0, "data": None}
+
 _LOG_DIRTY = False
 _LOG_LAST_FLUSH = 0
 
@@ -12189,12 +12195,12 @@ def api_failed(user: str = Depends(get_current_admin)):
 
 @app.get("/api/logs")
 def api_logs(user: str = Depends(get_current_admin)):
-    return {"logs": list(LOG_HISTORY)[-80:]}
+    return {"logs": list(LOG_HISTORY)[-max(1, int(API_LOG_LIMIT)):]}
 
 
 @app.get("/api/history")
 def api_history(user: str = Depends(get_current_admin)):
-    return {"orders": ORDER_HISTORY[-200:]}
+    return {"orders": ORDER_HISTORY[-max(1, int(API_HISTORY_LIMIT)):]}
 
 
 @app.get("/api/blacklist")
@@ -12266,6 +12272,11 @@ def api_service_completion_stats(user: str = Depends(get_current_admin)):
 
 @app.get("/api/growth-insights")
 def api_growth_insights(user: str = Depends(get_current_admin)):
+    now_ts = int(time.time())
+    cached = _GROWTH_INSIGHTS_CACHE.get("data")
+    if cached is not None and (now_ts - int(_GROWTH_INSIGHTS_CACHE.get("ts", 0) or 0)) < max(5, int(GROWTH_INSIGHTS_CACHE_SECONDS)):
+        return cached
+
     """Satış, kâr ve kayıp sipariş fırsatlarını hafif state verilerinden hesaplar."""
     return build_product_growth_insights()
 
@@ -15132,6 +15143,11 @@ def admin_failed_mark_completed(
     if not removed:
         log("warning", "manual_completed_failed_not_found", smm_order_id=target_smm_id, order_id=target_order_id)
     return RedirectResponse("/admin/failed-actions", status_code=303)
+
+
+@app.get("/robots.txt")
+def robots_txt():
+    return HTMLResponse("User-agent: *\nDisallow: /\n", media_type="text/plain")
 
 
 @app.get("/health")
