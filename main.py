@@ -15824,13 +15824,22 @@ def check_services(force: bool = False):
     missing_count = 0
     initialized_count = 0
     checked_count = 0
+    services_data_by_panel = {}
 
     for service in get_price_check_targets(include_inactive=False):
         if not service.get("api_url") or not service.get("api_key"):
             log("warning", "service_panel_missing", advert_id=service.get("advert_id"), panel=service.get("panel_key"))
             continue
 
-        services_data = get_panel_services(service["api_url"], service["api_key"], service.get("panel", ""), force=force)
+        panel_cache_key = service.get("panel_key") or service.get("panel") or service.get("api_url")
+        if panel_cache_key not in services_data_by_panel:
+            services_data_by_panel[panel_cache_key] = get_panel_services(
+                service["api_url"],
+                service["api_key"],
+                service.get("panel", ""),
+                force=force,
+            )
+        services_data = services_data_by_panel[panel_cache_key]
         if isinstance(services_data, dict) and "error" in services_data:
             continue
 
