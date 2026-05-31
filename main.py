@@ -254,6 +254,87 @@ HIGH_VALUE_ORDER_TL = float(os.getenv("HIGH_VALUE_ORDER_TL", "250"))
 PRODUCT_HEALTH_MIN_MARGIN_PERCENT = float(os.getenv("PRODUCT_HEALTH_MIN_MARGIN_PERCENT", "18"))
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
+_BACKGROUND_TASK_LOCK = threading.Lock()
+
+def run_background_job(job_key: str, target, *args, **kwargs) -> dict:
+    """Ağır admin işlemlerini HTTP isteğini bekletmeden arka planda çalıştırır."""
+    job_key = str(job_key or "background_job")
+    with _BACKGROUND_TASK_LOCK:
+        item = _BACKGROUND_TASKS.get(job_key, {})
+        thread = item.get("thread") if isinstance(item, dict) else None
+        if thread and getattr(thread, "is_alive", lambda: False)():
+            return {"ok": True, "started": False, "already_running": True, "job": job_key}
+        _BACKGROUND_TASKS[job_key] = {
+            "status": "running",
+            "started_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": "",
+            "error": "",
+            "result": None,
+        }
+
+    def _runner():
+        try:
+            result = target(*args, **kwargs)
+            with _BACKGROUND_TASK_LOCK:
+                _BACKGROUND_TASKS[job_key].update({
+                    "status": "done",
+                    "finished_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": "",
+                    "result": result,
+                })
+            log("info", "background_job_done", job=job_key, result=str(result)[:500])
+        except Exception as e:
+            with _BACKGROUND_TASK_LOCK:
+                _BACKGROUND_TASKS[job_key].update({
+                    "status": "error",
+                    "finished_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": str(e)[:1000],
+                })
+            log("error", "background_job_error", job=job_key, error=str(e))
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    with _BACKGROUND_TASK_LOCK:
+        _BACKGROUND_TASKS[job_key]["thread"] = thread
+    thread.start()
+    return {"ok": True, "started": True, "already_running": False, "job": job_key}
+
+
+def get_background_job_status(job_key: str = "") -> dict:
+    with _BACKGROUND_TASK_LOCK:
+        if job_key:
+            item = dict(_BACKGROUND_TASKS.get(job_key, {}))
+            item.pop("thread", None)
+            return item
+        data = {}
+        for key, value in _BACKGROUND_TASKS.items():
+            item = dict(value or {})
+            item.pop("thread", None)
+            data[key] = item
+        return data
+
+
+def refresh_service_cache_background(panel_key: str, service_id: str, context: str = "") -> dict:
+    """Yeni eklenen servis/paket için servis adını ve fiyat cache'ini arka planda günceller."""
+    panel_key = normalize_panel_key(panel_key)
+    service_id = str(service_id or "").strip()
+    result = {"panel": panel_key, "service_id": service_id, "name_cached": False, "price_cached": False}
+    if not panel_key or not service_id:
+        return {**result, "ok": False, "error": "panel_or_service_missing"}
+    try:
+        panel_service_name = fetch_panel_service_name_by_id(panel_key, service_id)
+        if panel_service_name:
+            cache_panel_service_name(panel_key, service_id, panel_service_name)
+            result["name_cached"] = True
+    except Exception as e:
+        result["name_error"] = str(e)[:300]
+    try:
+        price_result = prime_service_price_cache(panel_key, service_id, context)
+        result["price_cached"] = bool(isinstance(price_result, dict) and price_result.get("ok"))
+        result["price_result"] = price_result
+    except Exception as e:
+        result["price_error"] = str(e)[:300]
+    return {"ok": True, **result}
+
 PANEL_STATS = {}
 SERVICE_COMPLETION_STATS = {}
 BUYER_STATS = {}
@@ -4402,9 +4483,12 @@ def get_current_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
 
-    correct_username = secrets.compare_digest(str(credentials.username or ""), str(ADMIN_USERNAME or ""))
-    correct_password = secrets.compare_digest(str(credentials.password or ""), str(ADMIN_PASSWORD or ""))
-
+    given_username = str(credentials.username or "")
+    given_password = str(credentials.password or "")
+    expected_username = str(ADMIN_USERNAME or "admin")
+    expected_password = str(ADMIN_PASSWORD or "")
+    correct_username = secrets.compare_digest(given_username.encode("utf-8"), expected_username.encode("utf-8"))
+    correct_password = secrets.compare_digest(given_password.encode("utf-8"), expected_password.encode("utf-8"))
     if not (correct_username and correct_password):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
@@ -5834,7 +5918,7 @@ def admin_add_service(
 ):
     try:
         set_dynamic_service(advert_id, panel, service_id, quantity, platform, True)
-        prime_service_price_cache(panel, service_id, f"Itemsatış ilanı {advert_id}")
+        run_background_job(f"service_cache:{normalize_panel_key(panel)}:{str(service_id).strip()}", refresh_service_cache_background, panel, service_id, f"Itemsatış ilanı {advert_id}")
         log("success", "admin_service_saved", advert_id=advert_id, panel=panel, service_id=service_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -5896,9 +5980,10 @@ def admin_toggle_service_get(advert_id: str = "", user: str = Depends(get_curren
 
 @app.post("/admin/update-services")
 def admin_update_services(user: str = Depends(get_current_admin)):
-    """Admin panelden servis fiyat kontrolünü manuel başlatır."""
-    check_services(force=True)
-    return RedirectResponse("/admin", status_code=303)
+    """Admin panelden servis fiyat kontrolünü arka planda başlatır; sayfayı bekletmez."""
+    run_background_job("check_services_force", check_services, True)
+    return RedirectResponse("/admin?bg=check_services_started", status_code=303)
+
 
 
 def refresh_panel_service_names() -> dict:
@@ -5958,16 +6043,24 @@ def refresh_panel_service_names() -> dict:
 
 @app.post("/admin/update-service-names")
 def admin_update_service_names(user: str = Depends(get_current_admin)):
-    result = refresh_panel_service_names()
-    log("info", "admin_service_names_updated", **result)
-    send_telegram(
-        "Servis isimleri güncellendi.\n\n"
-        f"Kontrol edilen: {result.get('checked', 0)}\n"
-        f"Güncellenen: {result.get('updated', 0)}\n"
-        f"Bulunamayan: {result.get('missing', 0)}"
-    )
-    return RedirectResponse("/admin", status_code=303)
+    """Servis isimlerini arka planda günceller; admin paneli bekletmez."""
+    def _job():
+        result = refresh_panel_service_names()
+        log("info", "admin_service_names_updated", **result)
+        try:
+            msg = (
+                "Servis isimleri güncellendi.\n\n"
+                f"Kontrol edilen: {result.get('checked', 0)}\n"
+                f"Güncellenen: {result.get('updated', 0)}\n"
+                f"Bulunamayan: {result.get('missing', 0)}"
+            )
+            send_telegram(msg)
+        except Exception as e:
+            log("warning", "service_name_update_telegram_failed", error=str(e))
+        return result
 
+    run_background_job("refresh_panel_service_names", _job)
+    return RedirectResponse("/admin?bg=service_names_started", status_code=303)
 
 @app.post("/admin/reset-dashboard")
 def admin_reset_dashboard(user: str = Depends(get_current_admin)):
@@ -7072,10 +7165,7 @@ def admin_package_add(
     try:
         set_package(advert_id, name, platform, True)
         comp = add_package_component(advert_id, first_component_name, first_panel, first_service_id, first_quantity, first_platform)
-        panel_service_name = fetch_panel_service_name_by_id(first_panel, first_service_id)
-        if panel_service_name:
-            cache_panel_service_name(first_panel, first_service_id, panel_service_name)
-        prime_service_price_cache(first_panel, first_service_id, f"Paket: {name} / {first_component_name}")
+        run_background_job(f"service_cache:{normalize_panel_key(first_panel)}:{str(first_service_id).strip()}", refresh_service_cache_background, first_panel, first_service_id, f"Paket: {name} / {first_component_name}")
         log("success", "admin_package_saved", advert_id=advert_id, name=name, first_component=comp.get("name"))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -7108,11 +7198,8 @@ def admin_package_add_component(
 ):
     try:
         comp = add_package_component(advert_id, name, panel, service_id, quantity, platform)
-        panel_service_name = fetch_panel_service_name_by_id(panel, service_id)
-        if panel_service_name:
-            cache_panel_service_name(panel, service_id, panel_service_name)
         package_name = str((PACKAGE_CONFIGS.get(str(advert_id), {}) or {}).get("name") or f"Paket {advert_id}")
-        prime_service_price_cache(panel, service_id, f"Paket: {package_name} / {name}")
+        run_background_job(f"service_cache:{normalize_panel_key(panel)}:{str(service_id).strip()}", refresh_service_cache_background, panel, service_id, f"Paket: {package_name} / {name}")
         log("success", "admin_package_component_added", advert_id=advert_id, panel=panel, service_id=service_id, component=comp.get("name"))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -13675,6 +13762,11 @@ def build_system_check() -> dict:
     }
 
 
+
+@app.get("/api/background-jobs")
+def api_background_jobs(user: str = Depends(get_current_admin)):
+    return {"ok": True, "jobs": get_background_job_status()}
+
 @app.get("/api/system-check")
 def api_system_check(user: str = Depends(get_current_admin)):
     return build_system_check()
@@ -13705,10 +13797,18 @@ def api_export(user: str = Depends(get_current_admin)):
     )
 
 
-@app.get("/check-panel-health")
 @app.head("/check-panel-health")
-def check_panel_health():
-    return check_all_panel_balances(force_alert=False)
+def check_panel_health_head():
+    return {"ok": True, "status": "alive", "endpoint": "check-panel-health"}
+
+
+@app.get("/check-panel-health")
+def check_panel_health(user: str = Depends(get_current_admin)):
+    run_background_job("panel_health_check", check_all_panel_balances, False)
+    return {"ok": True, "started": True, "job": "panel_health_check"}
+
+
+
 
 
 @app.head("/check-balances")
@@ -13718,8 +13818,10 @@ def check_balances_head():
 
 @app.get("/check-balances")
 def check_balances_now(user: str = Depends(get_current_admin)):
-    """Admin manuel bakiye check-up. Düşük bakiyelerde tekrar uyarı aralığını bypass eder."""
-    return check_all_panel_balances(force_alert=True)
+    """Admin manuel bakiye check-up arka planda başlar; paneli bekletmez."""
+    run_background_job("check_balances_force", check_all_panel_balances, True)
+    return {"ok": True, "started": True, "job": "check_balances_force"}
+
 
 
 
@@ -14671,7 +14773,8 @@ def simple_admin_page(title: str, body: str) -> HTMLResponse:
       <a href="/admin/failed-actions">Hata Merkezi</a><a href="/admin/profit-calculator">Kâr Hesapla</a>
     </div>
     """
-    html = f"<!doctype html><html lang='tr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title>{ADMIN_TOOL_CSS}</head><body><main class='wrap'><h1>{title}</h1>{nav}{body}</main></body></html>"
+    submit_js = "<script>document.querySelectorAll('form').forEach(function(f){f.addEventListener('submit',function(){var b=f.querySelector('button[type=submit],button:not([type])'); if(b){b.dataset.oldText=b.textContent; b.textContent='İşleniyor...'; b.disabled=true;}});});</script>"
+    html = f"<!doctype html><html lang='tr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title>{ADMIN_TOOL_CSS}</head><body><main class='wrap'><h1>{title}</h1>{nav}{body}</main>{submit_js}</body></html>"
     return HTMLResponse(html)
 
 
@@ -15182,10 +15285,7 @@ def admin_bind_service_save(advert_id: str = Form(...), panel: str = Form(...), 
     try:
         set_dynamic_service(advert_id, panel, service_id, quantity, platform, True)
         advert = get_itemsatis_advert_record(advert_id)
-        panel_service_name = fetch_panel_service_name_by_id(panel, service_id)
-        if panel_service_name:
-            cache_panel_service_name(panel, service_id, panel_service_name)
-        prime_service_price_cache(panel, service_id, str(advert.get("name") or f"Itemsatış ilanı {advert_id}"))
+        run_background_job(f"service_cache:{normalize_panel_key(panel)}:{str(service_id).strip()}", refresh_service_cache_background, panel, service_id, str(advert.get("name") or f"Itemsatış ilanı {advert_id}"))
         log("success", "advert_bound_to_service", advert_id=advert_id, panel=panel, service_id=service_id, quantity=quantity)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -15345,6 +15445,46 @@ def admin_link_audit(user: str = Depends(get_current_admin)):
 
 
 @app.get("/admin/failed-actions", response_class=HTMLResponse)
+def admin_failed_actions(user: str = Depends(get_current_admin)):
+    """Başarısız siparişleri tek ekranda inceleme ve manuel kapatma sayfası."""
+    rows = []
+    for item in reversed(FAILED_ORDERS[-100:]):
+        if not isinstance(item, dict):
+            continue
+        smm_order_id = str(item.get("smm_order_id", "") or "")
+        order_id = str(item.get("order_id", "") or "")
+        product_name = str(item.get("product_name", "Bilinmeyen Ürün") or "")
+        panel = str(item.get("panel", "") or "")
+        reason = str(item.get("reason") or item.get("error") or item.get("detail") or "")
+        created_at = str(item.get("created_at") or item.get("failed_at") or item.get("ts") or "")
+        retryable = "Evet" if item.get("retryable") else "Hayır"
+        rows.append(
+            "<tr>"
+            f"<td data-label='Saat'>{html.escape(created_at or '-')}</td>"
+            f"<td data-label='Itemsatış ID'><code>{html.escape(order_id or '-')}</code></td>"
+            f"<td data-label='SMM ID'><code>{html.escape(smm_order_id or '-')}</code></td>"
+            f"<td data-label='Ürün'>{html.escape(product_name)}</td>"
+            f"<td data-label='Panel'>{html.escape(panel or '-')}</td>"
+            f"<td data-label='Retry'>{html.escape(retryable)}</td>"
+            f"<td data-label='Hata'>{html.escape(reason[:260] or '-')}</td>"
+            "<td data-label='İşlem'>"
+            "<form method='post' action='/admin/failed/mark-completed' "
+            "onsubmit=\"return confirm('Bu sipariş manuel tamamlandı olarak işaretlensin mi?')\">"
+            f"<input type='hidden' name='smm_order_id' value='{html.escape(smm_order_id)}'>"
+            f"<input type='hidden' name='order_id' value='{html.escape(order_id)}'>"
+            "<button class='green'>Manuel Tamamlandı</button>"
+            "</form></td></tr>"
+        )
+    body = f"""
+    <div class='card'>
+      <div class='muted'>Başarısız siparişleri burada inceleyebilir, panelden manuel tamamladığın siparişleri listeden kaldırabilirsin.</div>
+      <div class='toolbar'><a class='btn' href='/admin/failed-orders'>Klasik Başarısız Siparişler</a><a class='btn' href='/admin'>Admin</a></div>
+    </div>
+    <div class='card'><table class='table'><thead><tr><th>Saat</th><th>Itemsatış ID</th><th>SMM ID</th><th>Ürün</th><th>Panel</th><th>Retry</th><th>Hata</th><th>İşlem</th></tr></thead><tbody>{''.join(rows) or '<tr><td>Kayıt yok.</td></tr>'}</tbody></table></div>
+    """
+    return simple_admin_page("Hata Merkezi", body)
+
+
 @app.post("/admin/failed/mark-completed")
 def admin_failed_mark_completed(
     smm_order_id: str = Form(""),
