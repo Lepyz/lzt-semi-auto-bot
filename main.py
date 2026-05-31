@@ -61,8 +61,6 @@ CHAT_ID_SALES = os.getenv("CHAT_ID_SALES", "") or CHAT_ID
 CHAT_ID_ALERTS = os.getenv("CHAT_ID_ALERTS", "") or CHAT_ID
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
-REQUIRE_WEBHOOK_SECRET = os.getenv("REQUIRE_WEBHOOK_SECRET", "false").lower() == "true"
 WEBHOOK_IP_WHITELIST = [ip.strip() for ip in os.getenv("WEBHOOK_IP_WHITELIST", "").split(",") if ip.strip()]
 STATE_LOCK = threading.RLock()
 TR_TIMEZONE = timezone(timedelta(hours=3))
@@ -96,7 +94,6 @@ ITEMSATIS_ADVERT_MAX_PAGES = int(os.getenv("ITEMSATIS_ADVERT_MAX_PAGES", "12"))
 ITEMSATIS_EXPECTED_ADVERT_COUNT = int(os.getenv("ITEMSATIS_EXPECTED_ADVERT_COUNT", "0"))
 CUSTOMER_NOTIFY_ENABLED = os.getenv("CUSTOMER_NOTIFY_ENABLED", "false").lower() == "true"
 
-CS2_ADVERT_ID = "5282114"
 
 PANEL_MAP = {
     "smmrush": {
@@ -186,7 +183,6 @@ PRODUCT_NAME_CACHE = {}
 PANEL_SERVICE_NAME_CACHE = {}
 SALES_HISTORY = {}
 ORDER_HISTORY = []
-BLACKLIST = set()
 FAVORITE_SERVICES = {}
 BALANCE_HISTORY = {}
 LINK_AUDIT_HISTORY = []
@@ -248,16 +244,12 @@ PROFIT_TARGET_MARGIN_PERCENT = float(os.getenv("PROFIT_TARGET_MARGIN_PERCENT", "
 PROFIT_MIN_TL = float(os.getenv("PROFIT_MIN_TL", "2"))
 HIGH_VALUE_ORDER_TL = float(os.getenv("HIGH_VALUE_ORDER_TL", "250"))
 PRODUCT_HEALTH_MIN_MARGIN_PERCENT = float(os.getenv("PRODUCT_HEALTH_MIN_MARGIN_PERCENT", "18"))
-BLACKLIST_ENABLED = os.getenv("BLACKLIST_ENABLED", "false").lower() == "true"
-BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "false").lower() == "false"
-BLACKLIST_AUTO_FAIL_COUNT = int(os.getenv("BLACKLIST_AUTO_FAIL_COUNT", "2"))
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
 PANEL_STATS = {}
 SERVICE_COMPLETION_STATS = {}
 BUYER_STATS = {}
 ORDER_NOTES = {}
-LINK_FAIL_COUNT = {}
 PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "3000"))
 PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "3000"))
 
@@ -275,24 +267,6 @@ QUEUE_RETRY_DELAY_SEC = int(os.getenv("QUEUE_RETRY_DELAY_SEC", "120"))
 QUEUE_CIRCUIT_RETRY_DELAY_SEC = int(os.getenv("QUEUE_CIRCUIT_RETRY_DELAY_SEC", "600"))
 QUEUE_STUCK_RECOVERY_SEC = int(os.getenv("QUEUE_STUCK_RECOVERY_SEC", "600"))
 
-
-# ─── STABIL BACKUP KAPSAMI ───────────────────────────────────────────────────
-# Sadece iş için kritik config/veriler yedeklenir. Eski deneme log/rapor/state yükleri backup'a girmez.
-BACKUP_KEYS = [
-    "dynamic_services",
-    "package_configs",
-    "itemsatis_advert_manual_items",
-    "itemsatis_advert_cache",
-    "favorite_services",
-    "panel_service_name_cache",
-    "service_price_cache",
-    "pending_orders",
-    "failed_orders",
-    "order_history",
-    "buyer_stats",
-    "message_templates",
-]
-
 QUEUE_CONTEXT = threading.local()
 
 
@@ -308,18 +282,11 @@ def validate_environment():
         "ADMIN_PASSWORD": ADMIN_PASSWORD,
     }
     missing = [name for name, value in required.items() if not value or (name == "ADMIN_PASSWORD" and value == "changeme")]
-    if REQUIRE_WEBHOOK_SECRET and not WEBHOOK_SECRET_TOKEN and "WEBHOOK_SECRET_TOKEN" not in missing:
-        missing.append("WEBHOOK_SECRET_TOKEN")
     if missing:
         try:
             logger.warning("environment_missing_or_unsafe", missing=missing)
         except Exception:
             print("ENV WARNING:", missing, flush=True)
-    if not WEBHOOK_SECRET_TOKEN:
-        try:
-            logger.warning("webhook_secret_token_empty", message="Üretimde WEBHOOK_SECRET_TOKEN tanımlaman önerilir.")
-        except Exception:
-            pass
     return missing
 
 
@@ -346,7 +313,7 @@ def check_rate_limit(ip: str, limit: int = 60, window: int = 60) -> bool:
 
 
 def is_webhook_authorized(request: Request) -> bool:
-    """Webhook güvenliği: opsiyonel IP whitelist + opsiyonel token + basit rate limit."""
+    """Webhook güvenliği: opsiyonel IP whitelist + basit rate limit."""
     client_ip = get_request_ip(request)
 
     if WEBHOOK_IP_WHITELIST and client_ip not in WEBHOOK_IP_WHITELIST:
@@ -357,19 +324,7 @@ def is_webhook_authorized(request: Request) -> bool:
         log("warning", "webhook_rate_limited", ip=client_ip)
         return False
 
-    if not WEBHOOK_SECRET_TOKEN:
-        if REQUIRE_WEBHOOK_SECRET:
-            log("warning", "webhook_secret_required_but_missing", ip=client_ip)
-            return False
-        return True
-
-    provided = (
-        request.headers.get("X-Webhook-Token")
-        or request.headers.get("X-Boostera-Token")
-        or request.query_params.get("token")
-        or ""
-    )
-    return secrets.compare_digest(str(provided), WEBHOOK_SECRET_TOKEN)
+    return True
 
 
 def now_tr():
@@ -1085,40 +1040,38 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES
 
-    RECORDED_SALES = set()
-    PROCESSED_ORDERS = set()
-    PROCESSED_LINKS = set()
+    RECORDED_SALES = set(redis_get_json("recorded_sales", []))
+    PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
+    PROCESSED_LINKS = set(redis_get_json("processed_links", []))
     FAILED_ORDERS = redis_get_json("failed_orders", [])
     PENDING_ORDERS = redis_get_json("pending_orders", [])
     sanitize_pending_orders_for_storage()
-    DAILY_STATS = {}
-    LAST_DAILY_REPORT_DATE = ""
+    DAILY_STATS = redis_get_json("daily_stats", {})
+    LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
-    WEEKLY_STATS = {}
-    MONTHLY_STATS = {}
-    LAST_WEEKLY_REPORT_DATE = ""
-    LAST_MONTHLY_REPORT_DATE = ""
+    WEEKLY_STATS = redis_get_json("weekly_stats", {})
+    MONTHLY_STATS = redis_get_json("monthly_stats", {})
+    LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
+    LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
     LOG_HISTORY = deque(redis_get_json("log_history", [])[-MAX_LOG_HISTORY:], maxlen=MAX_LOG_HISTORY)
     PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
     PACKAGE_CONFIGS = redis_get_json("package_configs", {})
-    SALES_HISTORY = {}
+    SALES_HISTORY = redis_get_json("sales_history", {})
     ORDER_HISTORY = redis_get_json("order_history", [])
-    BLACKLIST = set()  # blacklist sistemi kapalı; eski kayıtlar yüklenmez
     FAVORITE_SERVICES = redis_get_json("favorite_services", {})
-    BALANCE_HISTORY = {}
-    LINK_AUDIT_HISTORY = []
+    BALANCE_HISTORY = redis_get_json("balance_history", {})
+    LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
-    BALANCE_WARN_LAST = {}
-    # LOW_BALANCE_DISABLED_PANELS env üzerinden yönetilir; Redis yüklenmez
-    PANEL_STATS = {}
-    SERVICE_COMPLETION_STATS = {}
+    BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
+    LOW_BALANCE_DISABLED_PANELS = set(redis_get_json("low_balance_disabled_panels", list(LOW_BALANCE_DISABLED_PANELS)))
+    PANEL_STATS = redis_get_json("panel_stats", {})
+    SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
     BUYER_STATS = redis_get_json("buyer_stats", {})
-    ORDER_NOTES = {}
-    LINK_FAIL_COUNT = {}  # otomatik blacklist kapalı
+    ORDER_NOTES = redis_get_json("order_notes", {})
     trim_processed_memory()
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
@@ -1133,18 +1086,35 @@ def save_state():
         trim_processed_memory()
 
         data_to_save = {
-                                                "failed_orders": FAILED_ORDERS,
+            "recorded_sales": list(RECORDED_SALES),
+            "processed_orders": list(PROCESSED_ORDERS),
+            "processed_links": list(PROCESSED_LINKS),
+            "failed_orders": FAILED_ORDERS,
             "pending_orders": PENDING_ORDERS,
-                                    "service_price_cache": SERVICE_PRICE_CACHE,
-                                                            "product_name_cache": PRODUCT_NAME_CACHE,
+            "daily_stats": DAILY_STATS,
+            "last_daily_report_date": LAST_DAILY_REPORT_DATE,
+            "service_price_cache": SERVICE_PRICE_CACHE,
+            "weekly_stats": WEEKLY_STATS,
+            "monthly_stats": MONTHLY_STATS,
+            "last_weekly_report_date": LAST_WEEKLY_REPORT_DATE,
+            "last_monthly_report_date": LAST_MONTHLY_REPORT_DATE,
+            "product_name_cache": PRODUCT_NAME_CACHE,
             "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
             "dynamic_services": DYNAMIC_SERVICES,
             "package_configs": PACKAGE_CONFIGS,
-                        "order_history": ORDER_HISTORY[-500:],
-                        "favorite_services": FAVORITE_SERVICES,
-                                    "message_templates": MESSAGE_TEMPLATES,
-                                                            "buyer_stats": BUYER_STATS,
-                                }
+            "sales_history": SALES_HISTORY,
+            "order_history": ORDER_HISTORY[-500:],
+            "favorite_services": FAVORITE_SERVICES,
+            "balance_history": BALANCE_HISTORY,
+            "link_audit_history": LINK_AUDIT_HISTORY[-300:],
+            "message_templates": MESSAGE_TEMPLATES,
+            "balance_warn_last": BALANCE_WARN_LAST,
+            "low_balance_disabled_panels": sorted(LOW_BALANCE_DISABLED_PANELS),
+            "panel_stats": PANEL_STATS,
+            "service_completion_stats": SERVICE_COMPLETION_STATS,
+            "buyer_stats": BUYER_STATS,
+            "order_notes": ORDER_NOTES,
+        }
 
         result = redis_mset_json(data_to_save)
         if result is None:
@@ -1541,28 +1511,6 @@ def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price,
     return True
 
 
-def is_blacklisted(value: str) -> bool:
-    value = str(value or "").lower().strip()
-    if not value:
-        return False
-    return value in BLACKLIST or any(str(item).lower().strip() and str(item).lower().strip() in value for item in BLACKLIST)
-
-
-def blacklist_add(value: str):
-    value = str(value or "").lower().strip()
-    if value:
-        with STATE_LOCK:
-            BLACKLIST.add(value)
-            save_state()
-
-
-def blacklist_remove(value: str):
-    value = str(value or "").lower().strip()
-    with STATE_LOCK:
-        BLACKLIST.discard(value)
-        save_state()
-
-
 def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0, duration_minutes=None, estimated_completion_minutes=None):
     entry = {
         "order_id": str(order_id),
@@ -1729,25 +1677,6 @@ def get_delay_alert_threshold_seconds(item: dict) -> int:
     return max(1800, int(avg_minutes * 1.75 * 60))
 
 
-def increment_link_fail_count(link: str):
-    """Aynı link tekrar tekrar hata üretirse otomatik blacklist'e alır."""
-    if not BLACKLIST_AUTO_LEARN:
-        return
-    global LINK_FAIL_COUNT
-    normalized = normalize_link_for_check(link or "")
-    if not normalized:
-        return
-    current = int((LINK_FAIL_COUNT or {}).get(normalized, 0) or 0) + 1
-    LINK_FAIL_COUNT[normalized] = current
-    if current >= BLACKLIST_AUTO_FAIL_COUNT and normalized not in BLACKLIST:
-        BLACKLIST.add(normalized)
-        send_telegram_alert(
-            f"Link otomatik blacklist'e alındı.\n\n"
-            f"Link: {normalized}\n"
-            f"Hata sayısı: {current}"
-        )
-
-
 def add_order_note(smm_order_id: str, note: str):
     smm_order_id = str(smm_order_id or "").strip()
     note = str(note or "").strip()
@@ -1861,8 +1790,6 @@ def classify_failed_reason(reason: str, detail: str = "") -> str:
         return "link"
     if "zarar" in text or "anti_loss" in text or "maliyet" in text or "cost" in text:
         return "profit"
-    if "blacklist" in text or "kara" in text:
-        return "blacklist"
     if "order id" in text or "belirsiz" in text:
         return "manual_check"
     if "panel" in text or "api" in text or "servis" in text:
@@ -2142,11 +2069,7 @@ LZT arama linkleri:
 1) 5 years medal:
 https://lzt.market/steam/?order_by=price_to_up&title=5%20years%20medal
 
-2) CS2 5 years:
-https://lzt.market/steam/?order_by=price_to_up&title=cs2%205%20years
 
-3) CS2 medal:
-https://lzt.market/steam/?order_by=price_to_up&title=cs2%20medal
 """
 
 
@@ -2412,9 +2335,6 @@ def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
     configured_name = str((service or {}).get("name") or "").strip()
     if configured_name and not is_generic_itemsatis_title(configured_name):
         return configured_name
-
-    if str(advert_id or "") == CS2_ADVERT_ID:
-        return "CS2 5 Yıllık Hesap"
 
     if advert_id:
         return f"Itemsatış İlanı {advert_id}"
@@ -5400,11 +5320,18 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 });
 </script>
 
+<div class="filters" style="margin:16px 0; display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; align-items:end;">
+  <div class="filter-box"><label>Hızlı Ara</label><input id="serviceQuickFilter" placeholder="İlan ID, panel, servis ID, isim..." autocomplete="off"></div>
+  <div class="filter-box"><label>Panel</label><select id="servicePanelFilter"><option value="">Tümü</option>{% for key, panel in panels.items() %}<option value="{{ key|e }}">{{ panel.name|e }}</option>{% endfor %}</select></div>
+  <div class="filter-box"><label>Platform</label><select id="servicePlatformFilter"><option value="">Tümü</option><option value="instagram">Instagram</option><option value="tiktok">TikTok</option><option value="youtube">YouTube</option><option value="x">X/Twitter</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="other">Diğer</option></select></div>
+  <div class="filter-box"><label>Durum</label><select id="serviceStatusFilter"><option value="">Tümü</option><option value="aktif">Aktif</option><option value="pasif">Pasif</option></select></div>
+</div>
+<div class="muted" id="serviceFilterCount" style="margin:-4px 0 12px 0;"></div>
 <table>
 <thead><tr><th>İlan ID</th><th>Panel</th><th>Servis ID</th><th>Panel Servis Adı</th><th>Adet</th><th>Platform</th><th>Durum</th><th>Kaynak</th><th>İşlem</th></tr></thead>
 <tbody>
 {% for advert_id, service in services.items() %}
-<tr>
+<tr class="service-row" data-panel="{{ service.panel_key|default(service.panel)|lower|e }}" data-platform="{{ service.platform|lower|e }}" data-status="{{ 'aktif' if service.active else 'pasif' }}">
 <td>{{ advert_id|e }}</td>
 <td>{{ service.panel|e }}</td>
 <td>{{ service.service_id|e }}</td>
@@ -5428,6 +5355,41 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 </tbody>
 </table>
 </div>
+
+<script>
+(function(){
+  function norm(v){ return (v || '').toString().toLowerCase().trim(); }
+  function filterServices(){
+    var q = norm(document.getElementById('serviceQuickFilter') && document.getElementById('serviceQuickFilter').value);
+    var panel = norm(document.getElementById('servicePanelFilter') && document.getElementById('servicePanelFilter').value);
+    var platform = norm(document.getElementById('servicePlatformFilter') && document.getElementById('servicePlatformFilter').value);
+    var status = norm(document.getElementById('serviceStatusFilter') && document.getElementById('serviceStatusFilter').value);
+    var rows = Array.from(document.querySelectorAll('tr.service-row'));
+    var visible = 0;
+    rows.forEach(function(row){
+      var body = norm(row.innerText);
+      var rowPanel = norm(row.getAttribute('data-panel'));
+      var rowPlatform = norm(row.getAttribute('data-platform'));
+      var rowStatus = norm(row.getAttribute('data-status'));
+      var ok = true;
+      if(q && body.indexOf(q) === -1) ok = false;
+      if(panel && rowPanel.indexOf(panel) === -1 && body.indexOf(panel) === -1) ok = false;
+      if(platform && rowPlatform !== platform) ok = false;
+      if(status && rowStatus !== status) ok = false;
+      row.style.display = ok ? '' : 'none';
+      if(ok) visible += 1;
+    });
+    var count = document.getElementById('serviceFilterCount');
+    if(count) count.textContent = rows.length ? ('Gösterilen servis: ' + visible + ' / ' + rows.length) : '';
+  }
+  ['serviceQuickFilter','servicePanelFilter','servicePlatformFilter','serviceStatusFilter'].forEach(function(id){
+    var el = document.getElementById(id);
+    if(el) el.addEventListener('input', filterServices);
+    if(el) el.addEventListener('change', filterServices);
+  });
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', filterServices); else filterServices();
+})();
+</script>
 
 <script>
 (function(){
@@ -7938,9 +7900,6 @@ def admin_manual_order_submit(
 
     platform = normalize_text(platform or "other") or "other"
     panel_link = normalize_panel_link(raw_link, platform)
-
-    if is_blacklisted(panel_link):
-        raise HTTPException(status_code=400, detail="Bu link blacklist içinde")
 
     fetched_service_name = fetch_panel_service_name_by_id(panel_key, service_id)
     final_product_name = str(product_name or "").strip() or fetched_service_name or f"{panel_conf['name']} Servis {service_id}"
@@ -12203,11 +12162,6 @@ def api_history(user: str = Depends(get_current_admin)):
     return {"orders": ORDER_HISTORY[-max(1, int(API_HISTORY_LIMIT)):]}
 
 
-@app.get("/api/blacklist")
-def api_blacklist(user: str = Depends(get_current_admin)):
-    return {"items": sorted(BLACKLIST)}
-
-
 @app.get("/api/balance-history")
 def api_balance_history(user: str = Depends(get_current_admin)):
     return {"history": BALANCE_HISTORY}
@@ -13378,10 +13332,8 @@ def build_system_check() -> dict:
         "ok": not bool(duplicate_routes),
         "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
         "webhook_security": {
-            "secret_configured": bool(WEBHOOK_SECRET_TOKEN),
-            "require_secret": bool(REQUIRE_WEBHOOK_SECRET),
             "ip_whitelist_count": len(WEBHOOK_IP_WHITELIST),
-            "warning": "" if WEBHOOK_SECRET_TOKEN else "WEBHOOK_SECRET_TOKEN boş. Üretimde token tanımlaman önerilir.",
+            "rate_limit": True,
         },
         "routes_count": len(app.routes),
         "duplicate_routes": duplicate_routes,
@@ -13451,17 +13403,24 @@ def api_export(user: str = Depends(get_current_admin)):
     )
 
 
-@app.get("/check-panel-health")
 @app.head("/check-panel-health")
+def check_panel_health_head():
+    return {"ok": True, "status": "alive", "endpoint": "check-panel-health"}
+
+
+@app.get("/check-panel-health")
 def check_panel_health():
     return check_all_panel_balances(force_alert=False)
 
 
-@app.get("/check-balances")
 @app.head("/check-balances")
+def check_balances_head():
+    return {"ok": True, "status": "alive", "endpoint": "check-balances"}
+
+
+@app.get("/check-balances")
 def check_balances_now(user: str = Depends(get_current_admin)):
-    """Admin manuel bakiye check-up. Düşük bakiyelerde tekrar uyarı aralığını bypass eder."""
-    return check_all_panel_balances(force_alert=True)
+    return check_all_panel_balances(force_alert=False)
 
 
 
@@ -15088,16 +15047,9 @@ def admin_link_audit(user: str = Depends(get_current_admin)):
 
 @app.get("/admin/failed-actions", response_class=HTMLResponse)
 def admin_failed_actions(user: str = Depends(get_current_admin)):
-    rows = "".join([f"<tr><td data-label='Ürün'>{o.get('product_name')}</td><td data-label='Sipariş'>{o.get('order_id')}</td><td data-label='SMM'>{o.get('smm_order_id','-')}</td><td data-label='Panel'>{o.get('panel','-')}</td><td data-label='Sebep'>{o.get('reason')}</td><td data-label='Link'>{o.get('link','')}</td><td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'><input type='hidden' name='smm_order_id' value='{o.get('smm_order_id','')}'><input type='hidden' name='order_id' value='{o.get('order_id','')}'><button class='green' type='submit'>Tamamlandı İşaretle</button></form><form method='post' action='/admin/failed/blacklist-link'><input type='hidden' name='link' value=\"{str(o.get('link','')).replace(chr(34),'&quot;')}\"><button class='red'>Linki Blacklist</button></form></td></tr>" for o in reversed(FAILED_ORDERS[-50:])])
+    rows = "".join([f"<tr><td data-label='Ürün'>{o.get('product_name')}</td><td data-label='Sipariş'>{o.get('order_id')}</td><td data-label='SMM'>{o.get('smm_order_id','-')}</td><td data-label='Panel'>{o.get('panel','-')}</td><td data-label='Sebep'>{o.get('reason')}</td><td data-label='Link'>{o.get('link','')}</td><td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'><input type='hidden' name='smm_order_id' value='{o.get('smm_order_id','')}'><input type='hidden' name='order_id' value='{o.get('order_id','')}'><button class='green' type='submit'>Tamamlandı İşaretle</button></form></td></tr>" for o in reversed(FAILED_ORDERS[-50:])])
     body = f"<div class='card'><div class='muted'>Başarısız siparişler için hızlı çözüm merkezi.</div><table class='table'><thead><tr><th>Ürün</th><th>Sipariş</th><th>SMM</th><th>Panel</th><th>Sebep</th><th>Link</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Başarısız sipariş yok.</td></tr>'}</tbody></table></div>"
     return simple_admin_page("Hatalı Sipariş Çözüm Merkezi", body)
-
-
-@app.post("/admin/failed/blacklist-link")
-def admin_failed_blacklist_link(link: str = Form(...), user: str = Depends(get_current_admin)):
-    if link:
-        blacklist_add(link)
-    return RedirectResponse("/admin/failed-actions", status_code=303)
 
 
 @app.post("/admin/failed/mark-completed")
@@ -15260,7 +15212,6 @@ def check_orders():
                 retryable=True,
             )
             update_panel_stats(item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""), "partial" if status == "partial" else "failed")
-            increment_link_fail_count(item.get("link", ""))
             send_telegram(
                 f"⚠️ SMM sipariş sorunlu duruma düştü.\n\n"
                 f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
@@ -15681,15 +15632,6 @@ def process_itemsatis_webhook_payload(data: dict):
             f"Ürün: {report_product_name}\nSipariş ID: {order_id}\nMüşteri: {buyer}\nTutar: {price:.2f} TL"
         )
 
-        if advert_id == CS2_ADVERT_ID:
-            order_key = make_order_key(order_id, advert_id, buyer)
-            if order_key in PROCESSED_ORDERS:
-                return {"ignored": True, "reason": "duplicate_cs2_order"}
-            PROCESSED_ORDERS.add(order_key)
-            save_state()
-            send_telegram(f"Yeni CS2 5 yıllık hesap siparişi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\n\n{get_lzt_links()}")
-            return {"ok": True, "type": "cs2", "order_id": order_id}
-
         all_packages = get_package_configs()
         if advert_id in all_packages:
             package = all_packages[advert_id]
@@ -15710,11 +15652,6 @@ def process_itemsatis_webhook_payload(data: dict):
             log("info", "package_customer_link_detected", advert_id=advert_id, platform=detected_link_platform, link=customer_link)
             record_link_audit(order_id, advert_id, package_name, detected_link_platform or package_platform, customer_link, "ok", "Paket linki yakalandı")
 
-
-            if is_blacklisted(customer_link) or is_blacklisted(buyer):
-                add_failed_order(order_id, advert_id, package_name, "Blacklist engeli", customer_link, link=customer_link)
-                send_telegram(f"Blacklisted paket sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}")
-                return {"ok": False, "error": "blacklisted"}
 
             normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
             duplicate_link_key = f"package:{advert_id}:{normalized_link}"
@@ -15846,13 +15783,6 @@ def process_itemsatis_webhook_payload(data: dict):
                 return {"ok": False, "error": "order_link_not_found"}
 
             record_link_audit(order_id, advert_id, service_name, platform, customer_link, "ok", "Servis linki yakalandı")
-
-            if is_blacklisted(customer_link) or is_blacklisted(buyer):
-                add_failed_order(order_id, advert_id, service_name, "Blacklist engeli", customer_link, link=customer_link, panel=service.get("panel", ""))
-                send_telegram(
-                    f"Blacklisted sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}"
-                )
-                return {"ok": False, "error": "blacklisted"}
 
             normalized_link = normalize_link_for_check(customer_link, platform)
             duplicate_link_key = f"{advert_id}:{normalized_link}"
@@ -16027,35 +15957,31 @@ async def telegram_webhook(request: Request):
     log("info", "telegram_command", command=text[:50])
 
     if command in ["/start", "/help"]:
-        send_telegram(
-            "Bot komutları:\n\n"
-            "/panels - Ekli panelleri göster\n"
-            "/balance - Tüm panel bakiyeleri\n"
-            "/balance paneladi - Seçili panel bakiyesi\n"
-            "/balance-all - Tüm panel bakiyeleri\n"
-            "/check-balances - Bakiye alarm check-up\n"
-            "/medyabalance - MedyaBayim bakiyesi\n"
-            "/status - Bot durumu\n"
-            "/health - Sistem durumu\n"
-            "/failed - Başarısız siparişler\n"
-            "/pending - Bekleyen siparişler\n"
-            "/services - Servis eşleştirmeleri\n"
-            "/admin - Web servis yönetim paneli\n"
-            "/cancel smm_id - Siparişi iptal et\n"
-            "/blacklist add değer - Kara listeye ekle\n"
-            "/blacklist remove değer - Kara listeden çıkar\n"
-            "/blacklist list - Kara listeyi göster\n"
-            "/panel-stats - Panel başarı oranları\n"
-            "/growth-report - Kâr ve satış fırsat raporu\n"
-            "/note smm_id not - Sipariş notu ekle\n"
-            "/report - Bugünkü özet\n"
-            "/week-report - Haftalık özet\n"
-            "/month-report - Aylık özet\n"
-            "/report-all - Tüm özetler\n"
-            "/reset-report - Bu ayın rapor/dashboard verilerini sıfırla\n"
-            "/reset-all-reports - Tüm raporları sıfırla\n"
-            "/help - Komutları gösterir"
-        )
+        send_telegram("""Bot komutları:
+
+/panels - Ekli panelleri göster
+/balance - Tüm panel bakiyeleri
+/balance paneladi - Seçili panel bakiyesi
+/balance-all - Tüm panel bakiyeleri
+/check-balances - Bakiye alarm check-up
+/medyabalance - MedyaBayim bakiyesi
+/status - Bot durumu
+/health - Sistem durumu
+/failed - Başarısız siparişler
+/pending - Bekleyen siparişler
+/services - Servis eşleştirmeleri
+/admin - Web servis yönetim paneli
+/cancel smm_id - Siparişi iptal et
+/panel-stats - Panel başarı oranları
+/growth-report - Kâr ve satış fırsat raporu
+/note smm_id not - Sipariş notu ekle
+/report - Bugünkü özet
+/week-report - Haftalık özet
+/month-report - Aylık özet
+/report-all - Tüm özetler
+/reset-report - Bu ayın rapor/dashboard verilerini sıfırla
+/reset-all-reports - Tüm raporları sıfırla
+/help - Komutları gösterir""")
         return {"ok": True}
 
     if command == "/status":
@@ -16086,7 +16012,7 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     if command in ["/check-balances", "/balance-check"]:
-        result = check_all_panel_balances(force_alert=True)
+        result = check_all_panel_balances(force_alert=False)
         lines = ["Bakiye check-up tamamlandı:\n"]
         for key, item in (result.get("panels") or {}).items():
             if item.get("ok"):
@@ -16153,30 +16079,6 @@ async def telegram_webhook(request: Request):
         handle_cancel_command(text)
         return {"ok": True}
 
-
-    if command == "/blacklist":
-        parts = text.split(maxsplit=2)
-        action = parts[1].lower() if len(parts) > 1 else "list"
-        if action == "list":
-            if not BLACKLIST:
-                send_telegram("Kara liste boş.")
-            else:
-                send_telegram("Kara Liste:\n" + "\n".join(f"- {item}" for item in sorted(BLACKLIST)))
-            return {"ok": True}
-        if len(parts) < 3:
-            send_telegram("Kullanım: /blacklist add değer veya /blacklist remove değer")
-            return {"ok": True}
-        value = parts[2].strip()
-        if action == "add":
-            blacklist_add(value)
-            send_telegram(f"Kara listeye eklendi: {value}")
-            return {"ok": True}
-        if action == "remove":
-            blacklist_remove(value)
-            send_telegram(f"Kara listeden çıkarıldı: {value}")
-            return {"ok": True}
-        send_telegram("Kullanım: /blacklist add/remove/list")
-        return {"ok": True}
 
 
     if command == "/panel-stats":
@@ -16252,87 +16154,3 @@ async def telegram_webhook(request: Request):
 
     send_telegram("Bilinmeyen komut. /help ile komutları gör.")
     return {"ok": True}
-
-
-@app.post("/admin/cleanup/old-state")
-def admin_cleanup_old_state(user: str = Depends(get_current_admin)):
-    """Deneme döneminden kalan ve artık kullanılmayan ağır/yan keyleri Redis'ten temizler."""
-    keys_to_delete = [
-        "recorded_sales",
-        "processed_orders",
-        "processed_links",
-        "daily_stats",
-        "last_daily_report_date",
-        "weekly_stats",
-        "monthly_stats",
-        "last_weekly_report_date",
-        "last_monthly_report_date",
-        "sales_history",
-        "balance_history",
-        "link_audit_history",
-        "log_history",
-        "balance_warn_last",
-        "panel_stats",
-        "service_completion_stats",
-        "order_notes",
-        "link_fail_count",
-        "blacklist",
-    ]
-    deleted = []
-    for key in keys_to_delete:
-        redis_delete_key(key)
-        deleted.append(key)
-    log("warning", "old_state_cleanup_done", deleted=len(deleted))
-    return {"ok": True, "deleted": deleted}
-
-@app.get("/admin/backup")
-def admin_backup_page(user: str = Depends(get_current_admin)):
-    rows = "".join(f"<li><code>{html.escape(k)}</code></li>" for k in BACKUP_KEYS)
-    body = f"""
-    <div class='card'>
-      <h2>Stabil Yedek</h2>
-      <p class='muted'>Bu yedek sadece canlı kullanım için önemli config/verileri içerir. Deneme logları, eski raporlar ve gereksiz state alınmaz.</p>
-      <form method='get' action='/admin/backup/download'>
-        <button class='green' type='submit'>JSON Yedek İndir</button>
-      </form>
-    </div>
-    <div class='card'>
-      <h2>Yedeklenen Keyler</h2>
-      <ul>{rows}</ul>
-    </div>
-    """
-    return simple_admin_page("Yedekleme", body)
-
-
-@app.get("/admin/backup/download")
-def admin_backup_download(user: str = Depends(get_current_admin)):
-    backup = {
-        "created_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
-        "version": "boostera-stable-config-backup-v1",
-        "keys": {},
-    }
-    for key in BACKUP_KEYS:
-        backup["keys"][key] = redis_get_json(key, None)
-    content = json.dumps(backup, ensure_ascii=False, indent=2)
-    filename = f"boostera_backup_{now_tr().strftime('%Y%m%d_%H%M%S')}.json"
-    return StreamingResponse(
-        io.BytesIO(content.encode("utf-8")),
-        media_type="application/json",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
-    )
-
-
-@app.post("/admin/backup/restore")
-async def admin_backup_restore(request: Request, user: str = Depends(get_current_admin)):
-    """JSON body ile BACKUP_KEYS kapsamındaki yedeği geri yükler. UI yükleme sonra eklenebilir."""
-    data = await request.json()
-    keys = data.get("keys", data if isinstance(data, dict) else {})
-    if not isinstance(keys, dict):
-        raise HTTPException(status_code=400, detail="Invalid backup format")
-    restored = 0
-    for key in BACKUP_KEYS:
-        if key in keys:
-            redis_set_json(key, keys[key])
-            restored += 1
-    load_state()
-    return {"ok": True, "restored": restored}
