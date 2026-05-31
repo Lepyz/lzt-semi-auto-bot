@@ -61,8 +61,6 @@ CHAT_ID_SALES = os.getenv("CHAT_ID_SALES", "") or CHAT_ID
 CHAT_ID_ALERTS = os.getenv("CHAT_ID_ALERTS", "") or CHAT_ID
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
-REQUIRE_WEBHOOK_SECRET = os.getenv("REQUIRE_WEBHOOK_SECRET", "false").lower() == "true"
 WEBHOOK_IP_WHITELIST = [ip.strip() for ip in os.getenv("WEBHOOK_IP_WHITELIST", "").split(",") if ip.strip()]
 STATE_LOCK = threading.RLock()
 TR_TIMEZONE = timezone(timedelta(hours=3))
@@ -94,9 +92,9 @@ ITEMSATIS_PROFILE_URL_OVERRIDE_KEY = os.getenv("ITEMSATIS_PROFILE_URL_OVERRIDE_K
 ITEMSATIS_ADVERT_CACHE_MAX_AGE_SEC = int(os.getenv("ITEMSATIS_ADVERT_CACHE_MAX_AGE_SEC", "21600"))
 ITEMSATIS_ADVERT_MAX_PAGES = int(os.getenv("ITEMSATIS_ADVERT_MAX_PAGES", "12"))
 ITEMSATIS_EXPECTED_ADVERT_COUNT = int(os.getenv("ITEMSATIS_EXPECTED_ADVERT_COUNT", "0"))
+ITEMSATIS_PROFILE_SCRAPER_ENABLED = os.getenv("ITEMSATIS_PROFILE_SCRAPER_ENABLED", "false").lower() == "true"
 CUSTOMER_NOTIFY_ENABLED = os.getenv("CUSTOMER_NOTIFY_ENABLED", "false").lower() == "true"
 
-CS2_ADVERT_ID = "5282114"
 
 PANEL_MAP = {
     "smmrush": {
@@ -186,7 +184,6 @@ PRODUCT_NAME_CACHE = {}
 PANEL_SERVICE_NAME_CACHE = {}
 SALES_HISTORY = {}
 ORDER_HISTORY = []
-BLACKLIST = set()
 FAVORITE_SERVICES = {}
 BALANCE_HISTORY = {}
 LINK_AUDIT_HISTORY = []
@@ -198,9 +195,11 @@ _RATE_LIMIT_STORE = defaultdict(list)
 MESSAGE_TEMPLATES = {}
 BALANCE_WARN_LAST = {}
 LOG_FLUSH_INTERVAL_SECONDS = int(os.getenv("LOG_FLUSH_INTERVAL_SECONDS", "30"))
+PERSIST_LOG_HISTORY = os.getenv("PERSIST_LOG_HISTORY", "false").lower() == "true"
 DASHBOARD_REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "45"))
-API_LOG_LIMIT = int(os.getenv("API_LOG_LIMIT", "40"))
-API_HISTORY_LIMIT = int(os.getenv("API_HISTORY_LIMIT", "50"))
+API_LOG_LIMIT = int(os.getenv("API_LOG_LIMIT", "25"))
+API_HISTORY_LIMIT = int(os.getenv("API_HISTORY_LIMIT", "30"))
+LINK_AUDIT_ENABLED = os.getenv("LINK_AUDIT_ENABLED", "false").lower() == "true"
 GROWTH_INSIGHTS_CACHE_SECONDS = int(os.getenv("GROWTH_INSIGHTS_CACHE_SECONDS", "60"))
 _GROWTH_INSIGHTS_CACHE = {"ts": 0, "data": None}
 
@@ -220,6 +219,8 @@ PANEL_RETRY_SLEEP_SECONDS = float(os.getenv("PANEL_RETRY_SLEEP_SECONDS", "1"))
 USD_TO_TRY_RATE = float(os.getenv("USD_TO_TRY_RATE", "46"))
 USD_TO_TRY_CACHE = {"rate": USD_TO_TRY_RATE, "updated_at": 0}
 USD_TO_TRY_REFRESH_SECONDS = int(os.getenv("USD_TO_TRY_REFRESH_SECONDS", "21600"))
+PANEL_SERVICES_CACHE_SECONDS = int(os.getenv("PANEL_SERVICES_CACHE_SECONDS", "300"))
+PANEL_SERVICES_CACHE = {}
 
 # Anti-loss ve toplu retry ayarları
 ANTI_LOSS_ENABLED = os.getenv("ANTI_LOSS_ENABLED", "true").lower() == "true"
@@ -242,22 +243,21 @@ LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL = {
     if ":" in part and part.split(":", 1)[0].strip() and part.split(":", 1)[1].strip().isdigit()
 }
 
-CHECK_BALANCE_INTERVAL_SECONDS = int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300"))
+CHECK_BALANCE_INTERVAL_SECONDS = int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "900"))
+CHECK_SERVICES_MIN_INTERVAL_SECONDS = int(os.getenv("CHECK_SERVICES_MIN_INTERVAL_SECONDS", "900"))
+_CHECK_SERVICES_LAST_RUN = 0
+_CHECK_SERVICES_LAST_RESULT = {"ok": True, "message": "not_run_yet"}
 VIP_ORDER_THRESHOLD = int(os.getenv("VIP_ORDER_THRESHOLD", "5"))
 PROFIT_TARGET_MARGIN_PERCENT = float(os.getenv("PROFIT_TARGET_MARGIN_PERCENT", "30"))
 PROFIT_MIN_TL = float(os.getenv("PROFIT_MIN_TL", "2"))
 HIGH_VALUE_ORDER_TL = float(os.getenv("HIGH_VALUE_ORDER_TL", "250"))
 PRODUCT_HEALTH_MIN_MARGIN_PERCENT = float(os.getenv("PRODUCT_HEALTH_MIN_MARGIN_PERCENT", "18"))
-BLACKLIST_ENABLED = os.getenv("BLACKLIST_ENABLED", "false").lower() == "true"
-BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "false").lower() == "false"
-BLACKLIST_AUTO_FAIL_COUNT = int(os.getenv("BLACKLIST_AUTO_FAIL_COUNT", "2"))
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
 PANEL_STATS = {}
 SERVICE_COMPLETION_STATS = {}
 BUYER_STATS = {}
 ORDER_NOTES = {}
-LINK_FAIL_COUNT = {}
 PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "3000"))
 PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "3000"))
 
@@ -279,6 +279,16 @@ QUEUE_STUCK_RECOVERY_SEC = int(os.getenv("QUEUE_STUCK_RECOVERY_SEC", "600"))
 # ─── STABIL BACKUP KAPSAMI ───────────────────────────────────────────────────
 # Sadece iş için kritik config/veriler yedeklenir. Eski deneme log/rapor/state yükleri backup'a girmez.
 BACKUP_KEYS = [
+    "recorded_sales",
+    "processed_orders",
+    "processed_links",
+    "daily_stats",
+    "weekly_stats",
+    "monthly_stats",
+    "last_daily_report_date",
+    "last_weekly_report_date",
+    "last_monthly_report_date",
+    "sales_history",
     "dynamic_services",
     "package_configs",
     "itemsatis_advert_manual_items",
@@ -290,7 +300,13 @@ BACKUP_KEYS = [
     "failed_orders",
     "order_history",
     "buyer_stats",
+    "balance_history",
+    "link_audit_history",
+    "panel_stats",
+    "service_completion_stats",
     "message_templates",
+    "order_notes",
+    "low_balance_disabled_panels",
 ]
 
 QUEUE_CONTEXT = threading.local()
@@ -308,18 +324,11 @@ def validate_environment():
         "ADMIN_PASSWORD": ADMIN_PASSWORD,
     }
     missing = [name for name, value in required.items() if not value or (name == "ADMIN_PASSWORD" and value == "changeme")]
-    if REQUIRE_WEBHOOK_SECRET and not WEBHOOK_SECRET_TOKEN and "WEBHOOK_SECRET_TOKEN" not in missing:
-        missing.append("WEBHOOK_SECRET_TOKEN")
     if missing:
         try:
             logger.warning("environment_missing_or_unsafe", missing=missing)
         except Exception:
             print("ENV WARNING:", missing, flush=True)
-    if not WEBHOOK_SECRET_TOKEN:
-        try:
-            logger.warning("webhook_secret_token_empty", message="Üretimde WEBHOOK_SECRET_TOKEN tanımlaman önerilir.")
-        except Exception:
-            pass
     return missing
 
 
@@ -331,12 +340,23 @@ def get_request_ip(request: Request) -> str:
 
 
 def check_rate_limit(ip: str, limit: int = 60, window: int = 60) -> bool:
-    """Basit bellek içi rate-limit. Render tek worker kullanımında yeterlidir."""
+    """Basit bellek içi rate-limit. Eski IP kayıtlarını da budar."""
     if not ip:
         return True
     now_ts = time.time()
     cutoff = now_ts - window
     with STATE_LOCK:
+        if len(_RATE_LIMIT_STORE) > 500:
+            stale_ips = []
+            for stored_ip, times in list(_RATE_LIMIT_STORE.items()):
+                alive = [t for t in times if t > cutoff]
+                if alive:
+                    _RATE_LIMIT_STORE[stored_ip] = alive
+                else:
+                    stale_ips.append(stored_ip)
+            for stale_ip in stale_ips[:300]:
+                _RATE_LIMIT_STORE.pop(stale_ip, None)
+
         recent = [t for t in _RATE_LIMIT_STORE[ip] if t > cutoff]
         _RATE_LIMIT_STORE[ip] = recent
         if len(recent) >= limit:
@@ -346,7 +366,7 @@ def check_rate_limit(ip: str, limit: int = 60, window: int = 60) -> bool:
 
 
 def is_webhook_authorized(request: Request) -> bool:
-    """Webhook güvenliği: opsiyonel IP whitelist + opsiyonel token + basit rate limit."""
+    """Webhook güvenliği: opsiyonel IP whitelist + basit rate limit."""
     client_ip = get_request_ip(request)
 
     if WEBHOOK_IP_WHITELIST and client_ip not in WEBHOOK_IP_WHITELIST:
@@ -357,19 +377,7 @@ def is_webhook_authorized(request: Request) -> bool:
         log("warning", "webhook_rate_limited", ip=client_ip)
         return False
 
-    if not WEBHOOK_SECRET_TOKEN:
-        if REQUIRE_WEBHOOK_SECRET:
-            log("warning", "webhook_secret_required_but_missing", ip=client_ip)
-            return False
-        return True
-
-    provided = (
-        request.headers.get("X-Webhook-Token")
-        or request.headers.get("X-Boostera-Token")
-        or request.query_params.get("token")
-        or ""
-    )
-    return secrets.compare_digest(str(provided), WEBHOOK_SECRET_TOKEN)
+    return True
 
 
 def now_tr():
@@ -378,8 +386,11 @@ def now_tr():
 
 # ─── YENİ: GELİŞMİŞ LOGLAMA ──────────────────────────────────────────────────
 def flush_logs(force: bool = False):
-    """Log geçmişini Redis'e kontrollü yazar; her logda Redis yazıp yavaşlatmaz."""
+    """Log geçmişini Redis'e kontrollü yazar. Varsayılan kapalıdır; dashboard logu RAM'den okur."""
     global _LOG_DIRTY, _LOG_LAST_FLUSH
+    if not PERSIST_LOG_HISTORY:
+        _LOG_DIRTY = False
+        return
     if not force and not _LOG_DIRTY:
         return
     now_ts = time.time()
@@ -808,12 +819,22 @@ def push_itemsatis_queue_item(item: dict, event: str = "itemsatis_queue_requeued
     return False
 
 
-def move_queue_item_to_dead(item: dict, reason: str):
+def move_queue_item_to_dead(item: dict, reason: str) -> bool:
     item = item if isinstance(item, dict) else {"payload": item}
     item["dead_at"] = int(time.time())
     item["dead_reason"] = str(reason)[:500]
-    redis_lpush_json(ITEMSATIS_WEBHOOK_DEAD_KEY, item)
-    log("error", "itemsatis_queue_dead", queue_id=item.get("id"), reason=reason)
+    result = redis_lpush_json(ITEMSATIS_WEBHOOK_DEAD_KEY, item)
+    if redis_lpush_succeeded(result):
+        log("error", "itemsatis_queue_dead", queue_id=item.get("id"), reason=reason)
+        return True
+    log("error", "itemsatis_queue_dead_write_failed", queue_id=item.get("id"), reason=reason, redis_result=str(result)[:300])
+    send_telegram_error(
+        f"Itemsatış dead queue yazma başarısız.\n\n"
+        f"Queue ID: {item.get('id', '-')}\n"
+        f"Sebep: {str(reason)[:300]}\n"
+        f"Redis sonucu: {str(result)[:300]}"
+    )
+    return False
 
 
 def recover_stuck_itemsatis_processing():
@@ -834,8 +855,8 @@ def recover_stuck_itemsatis_processing():
             item["not_before"] = now_ts + QUEUE_RETRY_DELAY_SEC
             item["last_error"] = "Recovered from stuck processing queue"
             if item["attempts"] >= QUEUE_ITEM_MAX_ATTEMPTS:
-                move_queue_item_to_dead(item, "Max attempts after stuck recovery")
-                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                if move_queue_item_to_dead(item, "Max attempts after stuck recovery"):
+                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
             else:
                 if push_itemsatis_queue_item(item, "itemsatis_stuck_job_requeued"):
                     redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
@@ -864,8 +885,8 @@ async def itemsatis_queue_worker():
             try:
                 item = json.loads(raw)
             except Exception as e:
-                redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
-                move_queue_item_to_dead({"raw": str(raw)[:1000]}, f"Queue JSON parse error: {e}")
+                if move_queue_item_to_dead({"raw": str(raw)[:1000]}, f"Queue JSON parse error: {e}"):
+                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                 continue
             now_ts = int(time.time())
             not_before = int(item.get("not_before", 0) or 0)
@@ -886,8 +907,8 @@ async def itemsatis_queue_worker():
                 item["not_before"] = int(time.time()) + int(e.retry_after)
                 item["last_error"] = str(e)
                 if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
-                    move_queue_item_to_dead(item, f"Circuit open max attempts: {e}")
-                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                    if move_queue_item_to_dead(item, f"Circuit open max attempts: {e}"):
+                        redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
                 else:
                     if push_itemsatis_queue_item(item, "itemsatis_requeued_circuit_open"):
                         redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
@@ -898,14 +919,14 @@ async def itemsatis_queue_worker():
                 item["not_before"] = int(time.time()) + QUEUE_RETRY_DELAY_SEC
                 item["last_error"] = str(e)
                 if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
-                    move_queue_item_to_dead(item, f"Max attempts: {e}")
-                    redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
-                    send_telegram_error(
-                        f"Itemsatış queue dead\'e düştü.\n\n"
-                        f"Queue ID: {item.get('id')}\n"
-                        f"Deneme: {attempts}\n"
-                        f"Hata: {str(e)[:500]}"
-                    )
+                    if move_queue_item_to_dead(item, f"Max attempts: {e}"):
+                        redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                        send_telegram_error(
+                            f"Itemsatış queue dead\'e düştü.\n\n"
+                            f"Queue ID: {item.get('id')}\n"
+                            f"Deneme: {attempts}\n"
+                            f"Hata: {str(e)[:500]}"
+                        )
                 else:
                     if push_itemsatis_queue_item(item, "itemsatis_requeued_error"):
                         redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
@@ -1085,40 +1106,38 @@ def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
+    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES
 
-    RECORDED_SALES = set()
-    PROCESSED_ORDERS = set()
-    PROCESSED_LINKS = set()
+    RECORDED_SALES = cap_set_size(set(redis_get_json("recorded_sales", [])), 5000)
+    PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
+    PROCESSED_LINKS = set(redis_get_json("processed_links", []))
     FAILED_ORDERS = redis_get_json("failed_orders", [])
     PENDING_ORDERS = redis_get_json("pending_orders", [])
     sanitize_pending_orders_for_storage()
-    DAILY_STATS = {}
-    LAST_DAILY_REPORT_DATE = ""
+    DAILY_STATS = redis_get_json("daily_stats", {})
+    LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
-    WEEKLY_STATS = {}
-    MONTHLY_STATS = {}
-    LAST_WEEKLY_REPORT_DATE = ""
-    LAST_MONTHLY_REPORT_DATE = ""
+    WEEKLY_STATS = redis_get_json("weekly_stats", {})
+    MONTHLY_STATS = redis_get_json("monthly_stats", {})
+    LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
+    LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
     LOG_HISTORY = deque(redis_get_json("log_history", [])[-MAX_LOG_HISTORY:], maxlen=MAX_LOG_HISTORY)
     PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
     PACKAGE_CONFIGS = redis_get_json("package_configs", {})
-    SALES_HISTORY = {}
+    SALES_HISTORY = redis_get_json("sales_history", {})
     ORDER_HISTORY = redis_get_json("order_history", [])
-    BLACKLIST = set()  # blacklist sistemi kapalı; eski kayıtlar yüklenmez
     FAVORITE_SERVICES = redis_get_json("favorite_services", {})
-    BALANCE_HISTORY = {}
-    LINK_AUDIT_HISTORY = []
+    BALANCE_HISTORY = redis_get_json("balance_history", {})
+    LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
-    BALANCE_WARN_LAST = {}
-    # LOW_BALANCE_DISABLED_PANELS env üzerinden yönetilir; Redis yüklenmez
-    PANEL_STATS = {}
-    SERVICE_COMPLETION_STATS = {}
+    BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
+    LOW_BALANCE_DISABLED_PANELS = set(LOW_BALANCE_DISABLED_PANELS) | set(redis_get_json("low_balance_disabled_panels", []))
+    PANEL_STATS = redis_get_json("panel_stats", {})
+    SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
     BUYER_STATS = redis_get_json("buyer_stats", {})
-    ORDER_NOTES = {}
-    LINK_FAIL_COUNT = {}  # otomatik blacklist kapalı
+    ORDER_NOTES = redis_get_json("order_notes", {})
     trim_processed_memory()
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
@@ -1133,18 +1152,35 @@ def save_state():
         trim_processed_memory()
 
         data_to_save = {
-                                                "failed_orders": FAILED_ORDERS,
+            "recorded_sales": list(RECORDED_SALES)[-5000:],
+            "processed_orders": list(PROCESSED_ORDERS)[-PROCESSED_ORDERS_MAX:],
+            "processed_links": list(PROCESSED_LINKS)[-PROCESSED_LINKS_MAX:],
+            "failed_orders": FAILED_ORDERS,
             "pending_orders": PENDING_ORDERS,
-                                    "service_price_cache": SERVICE_PRICE_CACHE,
-                                                            "product_name_cache": PRODUCT_NAME_CACHE,
+            "daily_stats": DAILY_STATS,
+            "weekly_stats": WEEKLY_STATS,
+            "monthly_stats": MONTHLY_STATS,
+            "last_daily_report_date": LAST_DAILY_REPORT_DATE,
+            "last_weekly_report_date": LAST_WEEKLY_REPORT_DATE,
+            "last_monthly_report_date": LAST_MONTHLY_REPORT_DATE,
+            "service_price_cache": SERVICE_PRICE_CACHE,
+            "product_name_cache": PRODUCT_NAME_CACHE,
             "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
             "dynamic_services": DYNAMIC_SERVICES,
             "package_configs": PACKAGE_CONFIGS,
-                        "order_history": ORDER_HISTORY[-500:],
-                        "favorite_services": FAVORITE_SERVICES,
-                                    "message_templates": MESSAGE_TEMPLATES,
-                                                            "buyer_stats": BUYER_STATS,
-                                }
+            "sales_history": SALES_HISTORY,
+            "order_history": ORDER_HISTORY[-500:],
+            "favorite_services": FAVORITE_SERVICES,
+            "balance_history": BALANCE_HISTORY,
+            "link_audit_history": LINK_AUDIT_HISTORY[-1000:] if isinstance(LINK_AUDIT_HISTORY, list) else [],
+            "message_templates": MESSAGE_TEMPLATES,
+            "balance_warn_last": BALANCE_WARN_LAST,
+            "low_balance_disabled_panels": sorted(LOW_BALANCE_DISABLED_PANELS),
+            "panel_stats": PANEL_STATS,
+            "service_completion_stats": SERVICE_COMPLETION_STATS,
+            "buyer_stats": BUYER_STATS,
+            "order_notes": ORDER_NOTES,
+        }
 
         result = redis_mset_json(data_to_save)
         if result is None:
@@ -1508,8 +1544,8 @@ def add_sales_history(price: float = 0):
     try:
         keep_from = (now_tr() - timedelta(days=90)).strftime("%Y-%m-%d")
         SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) >= keep_from}
-    except Exception:
-        pass
+    except Exception as e:
+        log("warning", "sales_history_trim_failed", error=str(e))
 
 
 def add_daily_stat(product_name: str, price: float = 0):
@@ -1527,40 +1563,6 @@ def add_daily_stat(product_name: str, price: float = 0):
         add_to(MONTHLY_STATS)
         add_sales_history(price)
         # save_state burada çağrılmaz; record_itemsatis_sale tek sefer yazdırır.
-
-
-def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price, link="") -> bool:
-    """Itemsatış satışını belleğe işler; kalıcı kayıt caller tarafından tek save_state ile yapılır."""
-    global RECORDED_SALES
-    sale_key = make_sale_key(data, order_id, advert_id, buyer, product_name, price, link)
-    with STATE_LOCK:
-        if sale_key in RECORDED_SALES:
-            return False
-        add_daily_stat(product_name, price)
-        RECORDED_SALES.add(sale_key)
-    return True
-
-
-def is_blacklisted(value: str) -> bool:
-    value = str(value or "").lower().strip()
-    if not value:
-        return False
-    return value in BLACKLIST or any(str(item).lower().strip() and str(item).lower().strip() in value for item in BLACKLIST)
-
-
-def blacklist_add(value: str):
-    value = str(value or "").lower().strip()
-    if value:
-        with STATE_LOCK:
-            BLACKLIST.add(value)
-            save_state()
-
-
-def blacklist_remove(value: str):
-    value = str(value or "").lower().strip()
-    with STATE_LOCK:
-        BLACKLIST.discard(value)
-        save_state()
 
 
 def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0, duration_minutes=None, estimated_completion_minutes=None):
@@ -1718,36 +1720,6 @@ def build_completion_estimate_text(panel_key: str = "", service_id: str = "", pa
     return f"Ortalama tamamlanma: {estimate['text']} ({source} ortalaması, tahmini {estimate['estimated_at']})"
 
 
-def get_delay_alert_threshold_seconds(item: dict) -> int:
-    """Gecikme alarmını sabit süre yerine geçmiş tamamlanma ortalamasına göre ayarlar."""
-    try:
-        avg_minutes = float((item or {}).get("avg_completion_minutes", 0) or 0)
-    except Exception:
-        avg_minutes = 0
-    if avg_minutes <= 0:
-        return 5400
-    return max(1800, int(avg_minutes * 1.75 * 60))
-
-
-def increment_link_fail_count(link: str):
-    """Aynı link tekrar tekrar hata üretirse otomatik blacklist'e alır."""
-    if not BLACKLIST_AUTO_LEARN:
-        return
-    global LINK_FAIL_COUNT
-    normalized = normalize_link_for_check(link or "")
-    if not normalized:
-        return
-    current = int((LINK_FAIL_COUNT or {}).get(normalized, 0) or 0) + 1
-    LINK_FAIL_COUNT[normalized] = current
-    if current >= BLACKLIST_AUTO_FAIL_COUNT and normalized not in BLACKLIST:
-        BLACKLIST.add(normalized)
-        send_telegram_alert(
-            f"Link otomatik blacklist'e alındı.\n\n"
-            f"Link: {normalized}\n"
-            f"Hata sayısı: {current}"
-        )
-
-
 def add_order_note(smm_order_id: str, note: str):
     smm_order_id = str(smm_order_id or "").strip()
     note = str(note or "").strip()
@@ -1861,8 +1833,6 @@ def classify_failed_reason(reason: str, detail: str = "") -> str:
         return "link"
     if "zarar" in text or "anti_loss" in text or "maliyet" in text or "cost" in text:
         return "profit"
-    if "blacklist" in text or "kara" in text:
-        return "blacklist"
     if "order id" in text or "belirsiz" in text:
         return "manual_check"
     if "panel" in text or "api" in text or "servis" in text:
@@ -2142,11 +2112,7 @@ LZT arama linkleri:
 1) 5 years medal:
 https://lzt.market/steam/?order_by=price_to_up&title=5%20years%20medal
 
-2) CS2 5 years:
-https://lzt.market/steam/?order_by=price_to_up&title=cs2%205%20years
 
-3) CS2 medal:
-https://lzt.market/steam/?order_by=price_to_up&title=cs2%20medal
 """
 
 
@@ -2220,6 +2186,19 @@ def get_event(data: dict) -> str:
     return ""
 
 
+def fold_turkish_text(value: str) -> str:
+    text = normalize_text(value)
+    replacements = {
+        "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
+        "ü": "u", "Ü": "u", "ö": "o", "Ö": "o", "ç": "c", "Ç": "c",
+        "Ä±": "i", "Ä°": "i", "ÅŸ": "s", "Åž": "s", "ÄŸ": "g", "Äž": "g",
+        "Ã¼": "u", "Ãœ": "u", "Ã¶": "o", "Ã–": "o", "Ã§": "c", "Ã‡": "c",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
 ITEMSATIS_PURCHASE_EVENT_KEYWORDS = {
     "order.created", "order_create", "order_created", "order.paid", "order_paid",
     "purchase.created", "purchase_create", "purchase_created", "purchase.paid", "purchase_paid",
@@ -2240,20 +2219,12 @@ def is_itemsatis_purchase_event(data: dict) -> bool:
     """Itemsatış'tan gelen mesaj/bildirim webhooklarını sipariş sanmayı engeller.
     Sadece gerçek satış/sipariş sinyali varsa True döner.
     """
-    event = normalize_text(get_event(data))
-    event_simple = (
-        event.replace("ı", "i")
-        .replace("ş", "s")
-        .replace("ğ", "g")
-        .replace("ü", "u")
-        .replace("ö", "o")
-        .replace("ç", "c")
-    )
+    event_simple = fold_turkish_text(get_event(data))
 
     if event_simple:
-        if any(key in event_simple for key in ITEMSATIS_NON_ORDER_EVENT_KEYWORDS):
+        if any(fold_turkish_text(key) in event_simple for key in ITEMSATIS_NON_ORDER_EVENT_KEYWORDS):
             return False
-        if any(key in event_simple for key in ITEMSATIS_PURCHASE_EVENT_KEYWORDS):
+        if any(fold_turkish_text(key) in event_simple for key in ITEMSATIS_PURCHASE_EVENT_KEYWORDS):
             return True
 
     # Event yoksa payload içeriğine bakılır ama sadece güçlü sipariş kanıtı varsa kabul edilir.
@@ -2412,9 +2383,6 @@ def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
     configured_name = str((service or {}).get("name") or "").strip()
     if configured_name and not is_generic_itemsatis_title(configured_name):
         return configured_name
-
-    if str(advert_id or "") == CS2_ADVERT_ID:
-        return "CS2 5 Yıllık Hesap"
 
     if advert_id:
         return f"Itemsatış İlanı {advert_id}"
@@ -2845,7 +2813,6 @@ def get_all_services(include_inactive: bool = False) -> dict:
 
 def save_dynamic_services():
     redis_set_json("dynamic_services", DYNAMIC_SERVICES)
-    redis_set_json("sales_history", SALES_HISTORY)
 
 
 def set_dynamic_service(advert_id: str, panel: str, service_id: str, quantity: int, platform: str, active: bool = True):
@@ -3433,7 +3400,9 @@ def record_balance_history(panel_key: str, balance_data: dict):
 
 
 def record_link_audit(order_id: str, advert_id: str, product_name: str, platform: str, link: str, status: str, note: str = ""):
-    """Webhook link yakalama geçmişi. Yanlış link olaylarını admin panelden izlemek için."""
+    """Link audit varsayılan kapalı. Debug gerekirse LINK_AUDIT_ENABLED=true yapılabilir."""
+    if not LINK_AUDIT_ENABLED:
+        return
     global LINK_AUDIT_HISTORY
     try:
         LINK_AUDIT_HISTORY.append({
@@ -3446,11 +3415,10 @@ def record_link_audit(order_id: str, advert_id: str, product_name: str, platform
             "status": str(status),
             "note": str(note or ""),
         })
-        if len(LINK_AUDIT_HISTORY) > 300:
-            del LINK_AUDIT_HISTORY[:-300]
+        if len(LINK_AUDIT_HISTORY) > 100:
+            del LINK_AUDIT_HISTORY[:-100]
     except Exception as e:
         log("warning", "link_audit_failed", error=str(e))
-
 
 
 def _strip_html_tags(value: str) -> str:
@@ -3895,6 +3863,20 @@ def fetch_itemsatis_public_adverts(force: bool = False, include_history: bool = 
     cached_items = (cache.get("items", []) if isinstance(cache, dict) else []) or []
     profile_url = get_itemsatis_profile_url()
 
+    if not ITEMSATIS_PROFILE_SCRAPER_ENABLED:
+        items = collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=include_history)
+        return {
+            "ok": True,
+            "cached": True,
+            "source": "local_only_scraper_disabled",
+            "items": items,
+            "scraped_count": len(cached_items),
+            "live_count": int(cache.get("scraped_count", len(cached_items)) or len(cached_items)) if isinstance(cache, dict) else len(cached_items),
+            "updated_at_text": cache.get("updated_at_text", "") if isinstance(cache, dict) else "",
+            "error": "",
+            "profile_url": profile_url,
+        }
+
     # Hız optimizasyonu: admin sayfası her açıldığında Itemsatış'a istek atma.
     # Itemsatış Render isteklerine sık sık 403 verdiği için canlı kontrol sadece buton/refresh ile yapılır.
     if not force:
@@ -4148,6 +4130,15 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
                     continue
                 if _queue_context_active() and action in {"balance", "services"}:
                     raise CircuitOpenForOrder(panel_id, last_error, retry_after=QUEUE_RETRY_DELAY_SEC)
+                if action == "add":
+                    return {
+                        "error": last_error,
+                        "duration": elapsed,
+                        "attempt": attempt,
+                        "retryable": False,
+                        "manual_check_required": True,
+                        "uncertain_add": True,
+                    }
             try:
                 result = r.json()
             except Exception:
@@ -4155,6 +4146,10 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
             if isinstance(result, dict):
                 result.setdefault("_duration", elapsed)
                 result.setdefault("_attempt", attempt)
+                if action == "add" and "error" in result:
+                    result.setdefault("retryable", False)
+                    result.setdefault("manual_check_required", True)
+                    result.setdefault("uncertain_add", True)
             if isinstance(result, dict) and "error" not in result:
                 record_panel_success(panel_id)
             return result
@@ -4170,7 +4165,7 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
                 continue
             if _queue_context_active() and action in {"balance", "services"}:
                 raise CircuitOpenForOrder(panel_id, last_error, retry_after=get_panel_circuit_retry_after(panel_id))
-            return {"error": last_error, "duration": elapsed, "attempt": attempt, "retryable": action != "add", "manual_check_required": action == "add"}
+            return {"error": last_error, "duration": elapsed, "attempt": attempt, "retryable": action != "add", "manual_check_required": action == "add", "uncertain_add": action == "add"}
         except requests.exceptions.RequestException as e:
             elapsed = time.perf_counter() - started
             last_error = f"RequestException: {e}"
@@ -4181,7 +4176,7 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
                 continue
             if _queue_context_active() and action in {"balance", "services"}:
                 raise CircuitOpenForOrder(panel_id, last_error, retry_after=get_panel_circuit_retry_after(panel_id))
-            return {"error": last_error, "duration": elapsed, "attempt": attempt, "retryable": action != "add", "manual_check_required": action == "add"}
+            return {"error": last_error, "duration": elapsed, "attempt": attempt, "retryable": action != "add", "manual_check_required": action == "add", "uncertain_add": action == "add"}
         except Exception as e:
             elapsed = time.perf_counter() - started
             last_error = str(e)
@@ -4189,8 +4184,8 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
             if action != "add" and attempt < max_attempts:
                 time.sleep(PANEL_RETRY_SLEEP_SECONDS)
                 continue
-            return {"error": str(e), "duration": elapsed, "attempt": attempt}
-    return {"error": last_error or "Panel API isteği başarısız"}
+            return {"error": str(e), "duration": elapsed, "attempt": attempt, "retryable": action != "add", "manual_check_required": action == "add", "uncertain_add": action == "add"}
+    return {"error": last_error or "Panel API isteği başarısız", "retryable": action != "add", "manual_check_required": action == "add", "uncertain_add": action == "add"}
 
 
 
@@ -4220,8 +4215,21 @@ def check_panel_order_status(api_url, api_key, order_id, panel_name=""):
     )
 
 
-def get_panel_services(api_url, api_key, panel_name=""):
-    return _panel_api_request(api_url, api_key, "services", panel_name=panel_name)
+def get_panel_services(api_url, api_key, panel_name="", force: bool = False):
+    """Panel services listesini kısa süreli RAM cache ile çeker.
+    Admin arama ve fiyat kontrolünde aynı panel listesi tekrar tekrar indirilmesin.
+    """
+    cache_raw = f"{api_url}|{api_key}|{normalize_panel_key(panel_name or api_url)}"
+    cache_key = hashlib.sha1(cache_raw.encode("utf-8", errors="ignore")).hexdigest()
+    now_ts = int(time.time())
+    if not force:
+        cached = PANEL_SERVICES_CACHE.get(cache_key)
+        if cached and (now_ts - int(cached.get("ts", 0) or 0)) < max(30, int(PANEL_SERVICES_CACHE_SECONDS)):
+            return cached.get("data")
+    data = _panel_api_request(api_url, api_key, "services", panel_name=panel_name)
+    if isinstance(data, list):
+        PANEL_SERVICES_CACHE[cache_key] = {"ts": now_ts, "data": data}
+    return data
 
 
 
@@ -4242,24 +4250,20 @@ def get_low_balance_repeat_minutes(panel_key: str = "", panel_name: str = "") ->
 
 def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = "", force_alert: bool = False):
     """Panel bakiyesi eşik altındaysa Telegram uyarısı gönderir.
-
-    Düzeltmeler:
-    - BALANCE_WARN_THRESHOLD_TL env değeri tanımlı.
-    - Aynı düşük bakiye uyarısını repeat_minutes aralığıyla tekrarlar.
-    - Bakiye eşik üstüne çıkınca alarm hafızasını temizler.
+    Panel bazlı bildirim kapatma/açma admin panelden yönetilebilir.
     """
     panel_key = normalize_panel_key(panel_key or panel_name or "")
-    if is_low_balance_warning_disabled(panel_key, panel_name):
-        log("info", "low_balance_warning_disabled", panel=panel_name or panel_key, balance_tl=balance_tl)
-        return False
-
-    repeat_minutes = get_low_balance_repeat_minutes(panel_key, panel_name)
     try:
         balance_tl = convert_balance_to_try(balance, currency)
         if balance_tl is None:
             log("warning", "balance_parse_failed", panel=panel_name, balance=balance, currency=currency)
             return False
 
+        if is_low_balance_warning_disabled(panel_key, panel_name):
+            log("info", "low_balance_warning_disabled", panel=panel_name or panel_key, balance_tl=round(balance_tl, 2))
+            return False
+
+        repeat_minutes = get_low_balance_repeat_minutes(panel_key, panel_name)
         key = normalize_panel_key(panel_key or panel_name)
         now_ts = int(time.time())
         threshold = float(BALANCE_WARN_THRESHOLD_TL)
@@ -4288,16 +4292,18 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
         save_state()
         log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency, balance_tl=round(balance_tl, 2), threshold=threshold)
         send_telegram_alert(
-            f"{panel_name} bakiyesi {format_tl_amount(threshold)} altına düştü.\n\n"
-            f"Kalan: {format_tl_amount(balance_tl)}\n"
-            f"Tekrar uyarı aralığı: {repeat_minutes} dk\n\n"
-            f"Lütfen panel bakiyesini kontrol et."
+            f"⚠️ Düşük panel bakiyesi\n\n"
+            f"Panel: {panel_name}\n"
+            f"Bakiye: {balance} {currency}\n"
+            f"Tahmini TL: {format_tl_amount(balance_tl)}\n"
+            f"Eşik: {format_tl_amount(threshold)}\n\n"
+            f"Bu panel için bildirimleri Admin > Panel Bakiye Bildirimleri bölümünden kapatabilirsin."
         )
         return True
-    except Exception as e:
-        log("error", "balance_check_error", panel=panel_name, error=str(e))
-        return False
 
+    except Exception as e:
+        log("error", "low_balance_check_error", panel=panel_name, error=str(e))
+        return False
 
 def check_all_panel_balances(force_alert: bool = False):
     """Tüm panelleri kontrol eder; düşük bakiye uyarısını periyodik çalıştırır.
@@ -4353,7 +4359,7 @@ async def startup_event():
 
     task_specs = {
         "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
-        "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
+        "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "1800")), check_services, 90),
         "background_check_balances": (CHECK_BALANCE_INTERVAL_SECONDS, check_all_panel_balances, 20),
     }
 
@@ -4396,8 +4402,6 @@ def get_current_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
 
-    correct_username = secrets.compare_digest(credentials.username or "", ADMIN_USERNAME)
-    correct_password = secrets.compare_digest(credentials.password or "", ADMIN_PASSWORD)
     if not (correct_username and correct_password):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
@@ -5371,6 +5375,30 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
   </form>
 </div>
 
+<div class="card" style="margin:18px 0;">
+  <h2>Panel Bakiye Bildirimleri</h2>
+  <p class="muted">Para atmayacağın panellerin düşük bakiye Telegram uyarısını buradan kapatabilirsin. Kapalı panelde bakiye kontrolü çalışır ama düşük bakiye mesajı göndermez.</p>
+  <div class="grid">
+    {% for panel in low_balance_panels %}
+      <form method="post" action="/admin/low-balance-toggle" class="card" style="padding:14px;">
+        <input type="hidden" name="panel" value="{{ panel.key|e }}">
+        {% if panel.disabled %}
+          <input type="hidden" name="disabled" value="false">
+        {% else %}
+          <input type="hidden" name="disabled" value="true">
+        {% endif %}
+        <strong>{{ panel.name|e }}</strong>
+        <div class="muted">Durum: <span class="badge {{ 'passive' if panel.disabled else 'active' }}">{{ panel.status|e }}</span></div>
+        <button class="{{ 'green' if panel.disabled else 'delete' }}" type="submit">
+          {{ 'Bildirimleri Aç' if panel.disabled else 'Bildirimleri Kapat' }}
+        </button>
+      </form>
+    {% else %}
+      <div class="notice">API bilgisi girilmiş panel bulunamadı.</div>
+    {% endfor %}
+  </div>
+</div>
+
 <form class="grid" method="post" action="/admin/add-service">
   <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir İlan ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
   <select name="panel" required>
@@ -5400,37 +5428,110 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 });
 </script>
 
-<table>
-<thead><tr><th>İlan ID</th><th>Panel</th><th>Servis ID</th><th>Panel Servis Adı</th><th>Adet</th><th>Platform</th><th>Durum</th><th>Kaynak</th><th>İşlem</th></tr></thead>
-<tbody>
-{% for advert_id, service in services.items() %}
-<tr>
-<td>{{ advert_id|e }}</td>
-<td>{{ service.panel|e }}</td>
-<td>{{ service.service_id|e }}</td>
-<td class="service-name {{ 'missing' if not service.panel_service_name else '' }}">{{ service.panel_service_name or 'Güncellenmedi' }}</td>
-<td>{{ service.quantity|e }}</td>
-<td>{{ service.platform|e }}</td>
-<td><span class="badge {{ 'active' if service.active else 'passive' }}">{{ 'Aktif' if service.active else 'Pasif' }}</span></td>
-<td>{{ service.source }}</td>
-<td class="actions">
-  {% if service.source == 'dynamic' %}
-  <form method="post" action="/admin/toggle-service"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
-  <form method="post" action="/admin/delete-service" onsubmit="return confirm('Silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="delete" type="submit">Sil</button></form>
+<div class="card" style="margin-top:18px;">
+  <h2>Servis Yönetim Merkezi</h2>
+  <div class="muted">Fiyatlar cache üzerinden gösterilir. Sayfa hızlı açılsın diye panel API'lerine burada canlı yük bindirilmez; fiyatları yenilemek için üstteki butonu kullan.</div>
+  <div class="filters" style="margin-top:14px;">
+    <div class="filter-box"><label>Arama</label><input id="serviceSearchInput" placeholder="İlan, servis adı, panel, ID ara"></div>
+    <div class="filter-box"><label>Kategori</label><select id="serviceCategoryFilter"><option value="">Tümü</option>{% for category in service_categories %}<option value="{{ category|e }}">{{ category|e }}</option>{% endfor %}</select></div>
+    <div class="filter-box"><label>Panel</label><select id="servicePanelFilter"><option value="">Tümü</option>{% for panel_key in service_panels %}<option value="{{ panel_key|e }}">{{ panel_key|e }}</option>{% endfor %}</select></div>
+    <div class="filter-box"><label>Kaynak</label><select id="serviceSourceFilter"><option value="">Tümü</option><option value="dynamic">Admin</option><option value="code">Kod</option><option value="package">Paket</option></select></div>
+    <div class="filter-box"><label>Durum</label><select id="serviceStatusFilter"><option value="">Tümü</option><option value="ok">Aktif</option><option value="low_profit">Düşük kar</option><option value="stale">Fiyat bekleniyor</option><option value="missing">Panelde yok</option><option value="passive">Pasif</option></select></div>
+    <div class="filter-box"><label>Sıralama</label><select id="serviceSortSelect"><option value="category">Kategori</option><option value="panel">Panel</option><option value="name">İlan adı</option><option value="profit_asc">Kar düşük</option><option value="profit_desc">Kar yüksek</option><option value="cost_desc">Maliyet yüksek</option><option value="cost_asc">Maliyet düşük</option><option value="rate_desc">Fiyat yüksek</option><option value="rate_asc">Fiyat düşük</option><option value="completion_asc">En hızlı</option></select></div>
+  </div>
+  <div class="notice" id="serviceTableCount">Servisler yükleniyor.</div>
+  <table id="serviceTable">
+  <thead><tr><th>İlan ID</th><th>İlan Adı</th><th>Kategori</th><th>Panel</th><th>Servis ID</th><th>Panel Servis Adı</th><th>Adet</th><th>Güncel Fiyat</th><th>Tahmini Maliyet</th><th>Ortalama Satış</th><th>Kar Tahmini</th><th>Ortalama Süre</th><th>Son Kontrol</th><th>Durum</th><th>Kaynak</th><th>İşlem</th></tr></thead>
+  <tbody id="serviceTableBody">
+  {% for service in services %}
+  <tr class="service-row"
+      data-category="{{ service.category|e }}"
+      data-panel="{{ service.panel_key|e }}"
+      data-platform="{{ service.platform|e }}"
+      data-source="{{ service.source|e }}"
+      data-status="{{ service.status_key|e }}"
+      data-search="{{ service.search_blob|e }}"
+      data-cost="{{ service.cost_value|e }}"
+      data-profit="{{ service.profit_value|e }}"
+      data-rate="{{ service.rate_tl_value|e }}"
+      data-completion="{{ service.avg_completion_value|e }}"
+      data-name="{{ service.advert_name|lower|e }}">
+  <td>{{ service.advert_id|e }}</td>
+  <td><strong>{{ service.advert_name|e }}</strong>{% if service.package_name %}<div class="muted">{{ service.package_name|e }}{% if service.component_name %} / {{ service.component_name|e }}{% endif %}</div>{% endif %}</td>
+  <td>{{ service.category|e }}</td>
+  <td>{{ service.panel|e }}</td>
+  <td><code>{{ service.service_id|e }}</code></td>
+  <td class="service-name {{ 'missing' if not service.panel_service_name else '' }}">{{ service.panel_service_name or 'Güncellenmedi' }}</td>
+  <td>{{ service.quantity|e }}</td>
+  <td>{{ service.rate_text|e }}</td>
+  <td>{{ service.cost_text|e }}</td>
+  <td>{{ service.avg_sale_text|e }}</td>
+  <td>{{ service.profit_text|e }}</td>
+  <td>{{ service.avg_completion_text|e }}{% if service.avg_completion_source %}<div class="muted">{{ service.avg_completion_source|e }}</div>{% endif %}</td>
+  <td>{{ service.checked_at|e }}</td>
+  <td><span class="badge {{ 'active' if service.status_key == 'ok' else 'passive' }}">{{ service.status_text|e }}</span></td>
+  <td>{{ service.source_text|e }}</td>
+  <td class="actions">
+    {% if service.source == 'dynamic' %}
+    <form method="post" action="/admin/toggle-service"><input type="hidden" name="advert_id" value="{{ service.advert_id|e }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
+    <form method="post" action="/admin/delete-service" onsubmit="return confirm('Silinsin mi?')"><input type="hidden" name="advert_id" value="{{ service.advert_id|e }}"><button class="delete" type="submit">Sil</button></form>
+    {% elif service.source == 'package' %}
+    <a class="btn" href="/admin/packages">Paketi Aç</a>
+    {% else %}
+    Kod içi servis
+    {% endif %}
+  </td>
+  </tr>
   {% else %}
-  Kod içi servis
-  {% endif %}
-</td>
-</tr>
-{% else %}
-<tr><td colspan="9" style="text-align:center;color:#8a8fa3;">Servis yok.</td></tr>
-{% endfor %}
-</tbody>
-</table>
+  <tr><td colspan="16" style="text-align:center;color:#8a8fa3;">Servis yok.</td></tr>
+  {% endfor %}
+  </tbody>
+  </table>
+</div>
 </div>
 
 <script>
 (function(){
+  function num(row, key){
+    var v = parseFloat(row.getAttribute(key) || '');
+    return isNaN(v) ? -1 : v;
+  }
+  function applyServiceFilters(){
+    var body = document.getElementById('serviceTableBody');
+    if(!body) return;
+    var rows = Array.from(body.querySelectorAll('.service-row'));
+    if(!rows.length) return;
+    var q = (document.getElementById('serviceSearchInput').value || '').toLowerCase().trim();
+    var category = document.getElementById('serviceCategoryFilter').value;
+    var panel = document.getElementById('servicePanelFilter').value;
+    var source = document.getElementById('serviceSourceFilter').value;
+    var status = document.getElementById('serviceStatusFilter').value;
+    var sort = document.getElementById('serviceSortSelect').value;
+    rows.forEach(function(row){
+      var ok = true;
+      if(q && (row.getAttribute('data-search') || '').toLowerCase().indexOf(q) === -1) ok = false;
+      if(category && row.getAttribute('data-category') !== category) ok = false;
+      if(panel && row.getAttribute('data-panel') !== panel) ok = false;
+      if(source && row.getAttribute('data-source') !== source) ok = false;
+      if(status && row.getAttribute('data-status') !== status) ok = false;
+      row.style.display = ok ? '' : 'none';
+    });
+    rows.sort(function(a,b){
+      if(sort === 'cost_desc') return num(b,'data-cost') - num(a,'data-cost');
+      if(sort === 'cost_asc') return num(a,'data-cost') - num(b,'data-cost');
+      if(sort === 'profit_desc') return num(b,'data-profit') - num(a,'data-profit');
+      if(sort === 'profit_asc') return num(a,'data-profit') - num(b,'data-profit');
+      if(sort === 'rate_desc') return num(b,'data-rate') - num(a,'data-rate');
+      if(sort === 'rate_asc') return num(a,'data-rate') - num(b,'data-rate');
+      if(sort === 'completion_asc') return num(a,'data-completion') - num(b,'data-completion');
+      if(sort === 'panel') return (a.getAttribute('data-panel')||'').localeCompare(b.getAttribute('data-panel')||'');
+      if(sort === 'name') return (a.getAttribute('data-name')||'').localeCompare(b.getAttribute('data-name')||'');
+      return (a.getAttribute('data-category')||'').localeCompare(b.getAttribute('data-category')||'') || (a.getAttribute('data-panel')||'').localeCompare(b.getAttribute('data-panel')||'');
+    }).forEach(function(row){ body.appendChild(row); });
+    var visible = rows.filter(function(row){ return row.style.display !== 'none'; }).length;
+    var count = document.getElementById('serviceTableCount');
+    if(count) count.textContent = visible + ' servis gösteriliyor. Toplam: ' + rows.length;
+  }
   function applyTableLabels(){
     document.querySelectorAll('table').forEach(function(table){
       var heads = Array.from(table.querySelectorAll('thead th')).map(function(th){return (th.textContent||'').trim();});
@@ -5440,6 +5541,12 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
         });
       });
     });
+    ['serviceSearchInput','serviceCategoryFilter','servicePanelFilter','serviceSourceFilter','serviceStatusFilter','serviceSortSelect'].forEach(function(id){
+      var el = document.getElementById(id);
+      if(el) el.addEventListener('input', applyServiceFilters);
+      if(el) el.addEventListener('change', applyServiceFilters);
+    });
+    applyServiceFilters();
   }
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyTableLabels); else applyTableLabels();
 })();
@@ -5451,6 +5558,28 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 """
 
 
+
+
+@app.get("/admin/panel-notifications", response_class=HTMLResponse)
+def admin_panel_notifications(user: str = Depends(get_current_admin)):
+    rows = []
+    for key, panel in PANEL_MAP.items():
+        if not (panel.get("api_url") and panel.get("api_key")):
+            continue
+        disabled = is_low_balance_warning_disabled(key, panel.get("name", key))
+        rows.append({"key": key, "name": panel.get("name", key), "disabled": disabled, "status": "Kapalı" if disabled else "Aktif"})
+    cards = "".join([
+        f"<form method='post' action='/admin/low-balance-toggle' class='card' style='padding:14px;'>"
+        f"<input type='hidden' name='panel' value='{html.escape(r['key'])}'>"
+        f"<input type='hidden' name='disabled' value='{str(not r['disabled']).lower()}'>"
+        f"<h3>{html.escape(r['name'])}</h3>"
+        f"<div class='muted'>Durum: <span class='badge {'passive' if r['disabled'] else 'active'}'>{r['status']}</span></div>"
+        f"<button class='{'green' if r['disabled'] else 'delete'}' type='submit'>{'Bildirimleri Aç' if r['disabled'] else 'Bildirimleri Kapat'}</button>"
+        f"</form>"
+        for r in rows
+    ])
+    body = f"<div class='card'><h2>Panel Bakiye Bildirimleri</h2><p class='muted'>Düşük bakiye Telegram uyarılarını panel bazlı aç/kapat.</p><div class='grid'>{cards or '<div class=\'notice\'>API bilgisi girilmiş panel bulunamadı.</div>'}</div></div>"
+    return simple_admin_page("Panel Bakiye Bildirimleri", body)
 
 @app.post("/admin/low-balance-toggle")
 def admin_low_balance_toggle(panel: str = Form(...), disabled: str = Form("true"), user: str = Depends(get_current_admin)):
@@ -5470,24 +5599,154 @@ def admin_low_balance_toggle(panel: str = Form(...), disabled: str = Form("true"
     return RedirectResponse("/admin", status_code=303)
 
 
+def classify_admin_service_category(platform: str = "", *texts) -> str:
+    blob = fold_turkish_text(" ".join(str(x or "") for x in (platform, *texts)))
+    platform = normalize_text(platform or "")
+    checks = [
+        ("instagram", "Instagram", ["instagram", "insta", "ig", "reels"]),
+        ("tiktok", "TikTok", ["tiktok", "tik tok"]),
+        ("youtube", "YouTube", ["youtube", "yt", "shorts", "abone"]),
+        ("telegram", "Telegram", ["telegram"]),
+        ("x", "X/Twitter", ["twitter", "x.com", "tweet"]),
+        ("twitch", "Twitch", ["twitch"]),
+        ("kick", "Kick", ["kick"]),
+        ("facebook", "Facebook", ["facebook"]),
+        ("spotify", "Spotify", ["spotify"]),
+        ("discord", "Discord", ["discord"]),
+    ]
+    for key, label, needles in checks:
+        if platform == key or any(needle in blob for needle in needles):
+            return label
+    return "Diğer"
+
+
+def admin_rate_checked_text(panel_key: str, service_id: str) -> str:
+    raw = SERVICE_PRICE_CACHE.get(f"rate_checked_at:{normalize_panel_key(panel_key)}:{str(service_id or '').strip()}")
+    try:
+        raw_int = int(raw or 0)
+        if raw_int > 0:
+            return datetime.fromtimestamp(raw_int, TR_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    return ""
+
+
+def build_admin_service_rows() -> list:
+    rows = []
+
+    def add_row(advert_id: str, raw_service: dict, source_label: str = "", package_name: str = "", component_name: str = ""):
+        service = get_service_config(raw_service)
+        panel_key = normalize_panel_key(service.get("panel_key") or raw_service.get("panel") or "")
+        service_id = str(service.get("service_id") or "").strip()
+        quantity = service.get("quantity") or raw_service.get("quantity") or 0
+        platform = normalize_text(service.get("platform") or raw_service.get("platform") or "other") or "other"
+        panel = get_panel_config(panel_key)
+        panel_name = service.get("panel") or panel.get("name") or panel_key or "Panel"
+        cache_key = f"{panel_key}:{service_id}"
+        rate_raw = SERVICE_PRICE_CACHE.get(cache_key, "")
+        missing = bool(SERVICE_PRICE_CACHE.get(f"missing:{cache_key}"))
+        rate_tl = panel_rate_to_tl(panel_key, rate_raw) if rate_raw else None
+        cost_tl = estimate_service_cost_tl(panel_key, rate_raw, quantity) if rate_raw else None
+        avg_minutes, avg_source = get_average_completion_minutes(panel_key, service_id, panel_name)
+
+        try:
+            advert = get_itemsatis_advert_record(str(advert_id))
+        except Exception:
+            advert = {}
+        advert_name = str(advert.get("name") or get_itemsatis_report_name(str(advert_id), "")).strip()
+        panel_service_name = get_cached_panel_service_name(panel_key, service_id)
+        category = classify_admin_service_category(platform, advert_name, panel_service_name, package_name, component_name)
+        sales_stat = get_advert_sales_stat(str(advert_id), "")
+        avg_sale_tl = float(sales_stat.get("avg_sale_tl", 0) or 0)
+        profit_text = "Satış verisi yok"
+        margin_value = ""
+        if cost_tl is not None and avg_sale_tl > 0:
+            profit = calculate_profit(avg_sale_tl, cost_tl)
+            margin_value = round(float(profit.get("margin_pct", 0) or 0), 2)
+            profit_text = f"{format_tl_amount(profit.get('profit', 0))} / %{margin_value:.1f}"
+        source = source_label or raw_service.get("source", "code")
+        source_text = {"dynamic": "Admin", "code": "Kod", "package": "Paket"}.get(source, source)
+        rate_text = f"{format_panel_rate_tl(panel_key, rate_raw)} / 1000" if rate_raw else "Fiyat bekleniyor"
+        cost_text = format_tl_amount(cost_tl) if cost_tl is not None else "Hesaplanamadı"
+        avg_text = format_duration_minutes(avg_minutes) if avg_minutes else "Veri yok"
+        checked_at = admin_rate_checked_text(panel_key, service_id)
+        low_profit = margin_value != "" and float(margin_value) < PRODUCT_HEALTH_MIN_MARGIN_PERCENT
+        status_key = "missing" if missing else ("stale" if not rate_raw else ("passive" if not raw_service.get("active", True) else ("low_profit" if low_profit else "ok")))
+        status_text = "Panelde yok" if missing else ("Fiyat bekleniyor" if not rate_raw else ("Pasif" if not raw_service.get("active", True) else ("Düşük kar" if low_profit else "Aktif")))
+        search_blob = " ".join([advert_id, advert_name, panel_name, service_id, panel_service_name, category, platform, source_text]).lower()
+
+        rows.append({
+            "advert_id": str(advert_id),
+            "advert_name": advert_name,
+            "panel": panel_name,
+            "panel_key": panel_key,
+            "service_id": service_id,
+            "panel_service_name": panel_service_name,
+            "quantity": quantity,
+            "platform": platform,
+            "category": category,
+            "rate_raw": rate_raw,
+            "rate_text": rate_text,
+            "rate_tl_value": "" if rate_tl is None else round(rate_tl, 6),
+            "cost_text": cost_text,
+            "cost_value": "" if cost_tl is None else round(cost_tl, 6),
+            "avg_sale_text": format_tl_amount(avg_sale_tl) if avg_sale_tl > 0 else "Satış verisi yok",
+            "profit_text": profit_text,
+            "profit_value": margin_value,
+            "avg_completion_text": avg_text,
+            "avg_completion_value": "" if not avg_minutes else round(float(avg_minutes), 2),
+            "avg_completion_source": avg_source,
+            "checked_at": checked_at or "Henüz yok",
+            "active": bool(raw_service.get("active", True)),
+            "source": source,
+            "source_text": source_text,
+            "status_key": status_key,
+            "status_text": status_text,
+            "search_blob": search_blob,
+            "can_edit": source == "dynamic",
+            "package_name": package_name,
+            "component_name": component_name,
+        })
+
+    for advert_id, raw_service in get_all_services(include_inactive=True).items():
+        add_row(str(advert_id), dict(raw_service or {}), raw_service.get("source", "code"))
+
+    for advert_id, package in get_package_configs(include_inactive=True).items():
+        package_name = get_package_display_name(str(advert_id), package, "")
+        for component in package.get("components", []) or []:
+            component = normalize_package_component(component)
+            component["source"] = "package"
+            component["active"] = bool(package.get("active", True)) and bool(component.get("active", True))
+            add_row(str(advert_id), component, "package", package_name, component.get("name", ""))
+
+    rows.sort(key=lambda r: (r["category"], r["panel_key"], r["advert_name"].lower(), r["service_id"]))
+    return rows
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel(user: str = Depends(get_current_admin)):
     template = Template(ADMIN_HTML)
-    services = {}
-    for advert_id, raw_service in get_all_services(include_inactive=True).items():
-        service = get_service_config(raw_service)
-        panel_key = service.get("panel_key") or raw_service.get("panel") or ""
-        service_id = str(service.get("service_id") or "")
-        services[advert_id] = {
-            "panel": service.get("panel"),
-            "service_id": service_id,
-            "panel_service_name": get_cached_panel_service_name(panel_key, service_id),
-            "quantity": service.get("quantity"),
-            "platform": service.get("platform"),
-            "active": bool(raw_service.get("active", True)),
-            "source": raw_service.get("source", "code"),
-        }
-    html = template.render(services=services, panels=PANEL_MAP)
+    services = build_admin_service_rows()
+    service_categories = sorted({row.get("category") for row in services if row.get("category")})
+    service_panels = sorted({row.get("panel_key") for row in services if row.get("panel_key")})
+    low_balance_panels = []
+    for key, panel in PANEL_MAP.items():
+        if not (panel.get("api_url") and panel.get("api_key")):
+            continue
+        disabled = is_low_balance_warning_disabled(key, panel.get("name", key))
+        low_balance_panels.append({
+            "key": key,
+            "name": panel.get("name", key),
+            "disabled": disabled,
+            "status": "Kapalı" if disabled else "Aktif",
+        })
+    html = template.render(
+        services=services,
+        service_categories=service_categories,
+        service_panels=service_panels,
+        panels=PANEL_MAP,
+        low_balance_panels=low_balance_panels,
+    )
     return HTMLResponse(content=html)
 
 
@@ -5635,7 +5894,7 @@ def admin_toggle_service_get(advert_id: str = "", user: str = Depends(get_curren
 @app.post("/admin/update-services")
 def admin_update_services(user: str = Depends(get_current_admin)):
     """Admin panelden servis fiyat kontrolünü manuel başlatır."""
-    check_services()
+    check_services(force=True)
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -7939,9 +8198,7 @@ def admin_manual_order_submit(
     platform = normalize_text(platform or "other") or "other"
     panel_link = normalize_panel_link(raw_link, platform)
 
-    if is_blacklisted(panel_link):
-        raise HTTPException(status_code=400, detail="Bu link blacklist içinde")
-
+    
     fetched_service_name = fetch_panel_service_name_by_id(panel_key, service_id)
     final_product_name = str(product_name or "").strip() or fetched_service_name or f"{panel_conf['name']} Servis {service_id}"
     manual_service = {
@@ -12203,19 +12460,14 @@ def api_history(user: str = Depends(get_current_admin)):
     return {"orders": ORDER_HISTORY[-max(1, int(API_HISTORY_LIMIT)):]}
 
 
-@app.get("/api/blacklist")
-def api_blacklist(user: str = Depends(get_current_admin)):
-    return {"items": sorted(BLACKLIST)}
-
-
 @app.get("/api/balance-history")
 def api_balance_history(user: str = Depends(get_current_admin)):
-    return {"history": BALANCE_HISTORY}
+    return {"history": dict(list((BALANCE_HISTORY or {}).items())[-50:]) if isinstance(BALANCE_HISTORY, dict) else {}}
 
 
 @app.get("/api/link-audit")
 def api_link_audit(user: str = Depends(get_current_admin)):
-    return {"items": LINK_AUDIT_HISTORY[-300:]}
+    return {"items": LINK_AUDIT_HISTORY[-50:] if LINK_AUDIT_ENABLED else []}
 
 
 @app.get("/api/favorites")
@@ -12272,13 +12524,15 @@ def api_service_completion_stats(user: str = Depends(get_current_admin)):
 
 @app.get("/api/growth-insights")
 def api_growth_insights(user: str = Depends(get_current_admin)):
+    """Satış/kâr insight hesapları cache'li döner; dashboard açıkken her istekte tekrar hesaplamaz."""
     now_ts = int(time.time())
     cached = _GROWTH_INSIGHTS_CACHE.get("data")
     if cached is not None and (now_ts - int(_GROWTH_INSIGHTS_CACHE.get("ts", 0) or 0)) < max(5, int(GROWTH_INSIGHTS_CACHE_SECONDS)):
         return cached
-
-    """Satış, kâr ve kayıp sipariş fırsatlarını hafif state verilerinden hesaplar."""
-    return build_product_growth_insights()
+    data = build_product_growth_insights()
+    _GROWTH_INSIGHTS_CACHE["ts"] = now_ts
+    _GROWTH_INSIGHTS_CACHE["data"] = data
+    return data
 
 
 @app.get("/api/buyer-stats")
@@ -13378,10 +13632,7 @@ def build_system_check() -> dict:
         "ok": not bool(duplicate_routes),
         "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
         "webhook_security": {
-            "secret_configured": bool(WEBHOOK_SECRET_TOKEN),
-            "require_secret": bool(REQUIRE_WEBHOOK_SECRET),
             "ip_whitelist_count": len(WEBHOOK_IP_WHITELIST),
-            "warning": "" if WEBHOOK_SECRET_TOKEN else "WEBHOOK_SECRET_TOKEN boş. Üretimde token tanımlaman önerilir.",
         },
         "routes_count": len(app.routes),
         "duplicate_routes": duplicate_routes,
@@ -13457,8 +13708,12 @@ def check_panel_health():
     return check_all_panel_balances(force_alert=False)
 
 
-@app.get("/check-balances")
 @app.head("/check-balances")
+def check_balances_head():
+    return {"ok": True, "status": "alive", "endpoint": "check-balances"}
+
+
+@app.get("/check-balances")
 def check_balances_now(user: str = Depends(get_current_admin)):
     """Admin manuel bakiye check-up. Düşük bakiyelerde tekrar uyarı aralığını bypass eder."""
     return check_all_panel_balances(force_alert=True)
@@ -15087,19 +15342,6 @@ def admin_link_audit(user: str = Depends(get_current_admin)):
 
 
 @app.get("/admin/failed-actions", response_class=HTMLResponse)
-def admin_failed_actions(user: str = Depends(get_current_admin)):
-    rows = "".join([f"<tr><td data-label='Ürün'>{o.get('product_name')}</td><td data-label='Sipariş'>{o.get('order_id')}</td><td data-label='SMM'>{o.get('smm_order_id','-')}</td><td data-label='Panel'>{o.get('panel','-')}</td><td data-label='Sebep'>{o.get('reason')}</td><td data-label='Link'>{o.get('link','')}</td><td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'><input type='hidden' name='smm_order_id' value='{o.get('smm_order_id','')}'><input type='hidden' name='order_id' value='{o.get('order_id','')}'><button class='green' type='submit'>Tamamlandı İşaretle</button></form><form method='post' action='/admin/failed/blacklist-link'><input type='hidden' name='link' value=\"{str(o.get('link','')).replace(chr(34),'&quot;')}\"><button class='red'>Linki Blacklist</button></form></td></tr>" for o in reversed(FAILED_ORDERS[-50:])])
-    body = f"<div class='card'><div class='muted'>Başarısız siparişler için hızlı çözüm merkezi.</div><table class='table'><thead><tr><th>Ürün</th><th>Sipariş</th><th>SMM</th><th>Panel</th><th>Sebep</th><th>Link</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Başarısız sipariş yok.</td></tr>'}</tbody></table></div>"
-    return simple_admin_page("Hatalı Sipariş Çözüm Merkezi", body)
-
-
-@app.post("/admin/failed/blacklist-link")
-def admin_failed_blacklist_link(link: str = Form(...), user: str = Depends(get_current_admin)):
-    if link:
-        blacklist_add(link)
-    return RedirectResponse("/admin/failed-actions", status_code=303)
-
-
 @app.post("/admin/failed/mark-completed")
 def admin_failed_mark_completed(
     smm_order_id: str = Form(""),
@@ -15129,8 +15371,8 @@ def admin_failed_mark_completed(
             )
             try:
                 FAILED_ORDERS.pop(index)
-            except Exception:
-                pass
+            except Exception as e:
+                log("warning", "failed_order_pop_after_mark_completed_failed", index=index, error=str(e))
             removed = True
             save_state()
             send_telegram(
@@ -15260,7 +15502,6 @@ def check_orders():
                 retryable=True,
             )
             update_panel_stats(item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""), "partial" if status == "partial" else "failed")
-            increment_link_fail_count(item.get("link", ""))
             send_telegram(
                 f"⚠️ SMM sipariş sorunlu duruma düştü.\n\n"
                 f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
@@ -15557,6 +15798,7 @@ def prime_service_price_cache(panel_key: str, service_id: str, context: str = ""
         )
 
     SERVICE_PRICE_CACHE[cache_key] = current_rate_raw
+    SERVICE_PRICE_CACHE[f"rate_checked_at:{cache_key}"] = int(time.time())
     SERVICE_PRICE_CACHE.pop(f"missing:{cache_key}", None)
     save_state()
     return {"ok": True, "rate": current_rate_raw, "service_name": service_name}
@@ -15568,17 +15810,27 @@ def check_services_head():
 
 
 @app.get("/check-services")
-def check_services():
-    global SERVICE_PRICE_CACHE
+def check_services(force: bool = False):
+    global SERVICE_PRICE_CACHE, _CHECK_SERVICES_LAST_RUN, _CHECK_SERVICES_LAST_RESULT
+    now_ts = int(time.time())
+    if (not force) and _CHECK_SERVICES_LAST_RUN and (now_ts - int(_CHECK_SERVICES_LAST_RUN)) < max(60, int(CHECK_SERVICES_MIN_INTERVAL_SECONDS)):
+        cached = dict(_CHECK_SERVICES_LAST_RESULT or {"ok": True})
+        cached["cached"] = True
+        cached["next_allowed_seconds"] = max(0, int(CHECK_SERVICES_MIN_INTERVAL_SECONDS) - (now_ts - int(_CHECK_SERVICES_LAST_RUN)))
+        log("info", "check_services_skipped_cached", next_allowed_seconds=cached["next_allowed_seconds"])
+        return cached
+    _CHECK_SERVICES_LAST_RUN = now_ts
     changed_count = 0
     missing_count = 0
+    initialized_count = 0
+    checked_count = 0
 
     for service in get_price_check_targets(include_inactive=False):
         if not service.get("api_url") or not service.get("api_key"):
             log("warning", "service_panel_missing", advert_id=service.get("advert_id"), panel=service.get("panel_key"))
             continue
 
-        services_data = get_panel_services(service["api_url"], service["api_key"], service.get("panel", ""))
+        services_data = get_panel_services(service["api_url"], service["api_key"], service.get("panel", ""), force=force)
         if isinstance(services_data, dict) and "error" in services_data:
             continue
 
@@ -15615,10 +15867,13 @@ def check_services():
         old_rate = SERVICE_PRICE_CACHE.get(cache_key)
         current_rate_norm = normalize_panel_rate(current_rate)
         old_rate_norm = normalize_panel_rate(old_rate)
+        SERVICE_PRICE_CACHE[f"rate_checked_at:{cache_key}"] = now_ts
+        checked_count += 1
 
         if old_rate is None:
             SERVICE_PRICE_CACHE[cache_key] = current_rate
-            save_state()
+            SERVICE_PRICE_CACHE[f"rate_checked_at:{cache_key}"] = now_ts
+            initialized_count += 1
             continue
 
         if old_rate_norm != current_rate_norm:
@@ -15635,11 +15890,19 @@ def check_services():
                 f"Bu servis ID'sini kullanan Itemsatış ilanlarını veya paketleri kontrol et."
             )
             SERVICE_PRICE_CACHE[cache_key] = current_rate
+            SERVICE_PRICE_CACHE[f"rate_checked_at:{cache_key}"] = now_ts
             changed_count += 1
 
-    if changed_count or missing_count:
+    if changed_count or missing_count or initialized_count or checked_count:
         save_state()
-    return {"ok": True, "changed_count": changed_count, "missing_count": missing_count}
+    _CHECK_SERVICES_LAST_RESULT = {
+        "ok": True,
+        "changed_count": changed_count,
+        "missing_count": missing_count,
+        "initialized_count": initialized_count,
+        "checked_count": checked_count,
+    }
+    return _CHECK_SERVICES_LAST_RESULT
 
 
 def process_itemsatis_webhook_payload(data: dict):
@@ -15681,15 +15944,6 @@ def process_itemsatis_webhook_payload(data: dict):
             f"Ürün: {report_product_name}\nSipariş ID: {order_id}\nMüşteri: {buyer}\nTutar: {price:.2f} TL"
         )
 
-        if advert_id == CS2_ADVERT_ID:
-            order_key = make_order_key(order_id, advert_id, buyer)
-            if order_key in PROCESSED_ORDERS:
-                return {"ignored": True, "reason": "duplicate_cs2_order"}
-            PROCESSED_ORDERS.add(order_key)
-            save_state()
-            send_telegram(f"Yeni CS2 5 yıllık hesap siparişi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\n\n{get_lzt_links()}")
-            return {"ok": True, "type": "cs2", "order_id": order_id}
-
         all_packages = get_package_configs()
         if advert_id in all_packages:
             package = all_packages[advert_id]
@@ -15709,12 +15963,6 @@ def process_itemsatis_webhook_payload(data: dict):
 
             log("info", "package_customer_link_detected", advert_id=advert_id, platform=detected_link_platform, link=customer_link)
             record_link_audit(order_id, advert_id, package_name, detected_link_platform or package_platform, customer_link, "ok", "Paket linki yakalandı")
-
-
-            if is_blacklisted(customer_link) or is_blacklisted(buyer):
-                add_failed_order(order_id, advert_id, package_name, "Blacklist engeli", customer_link, link=customer_link)
-                send_telegram(f"Blacklisted paket sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}")
-                return {"ok": False, "error": "blacklisted"}
 
             normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
             duplicate_link_key = f"package:{advert_id}:{normalized_link}"
@@ -15846,13 +16094,6 @@ def process_itemsatis_webhook_payload(data: dict):
                 return {"ok": False, "error": "order_link_not_found"}
 
             record_link_audit(order_id, advert_id, service_name, platform, customer_link, "ok", "Servis linki yakalandı")
-
-            if is_blacklisted(customer_link) or is_blacklisted(buyer):
-                add_failed_order(order_id, advert_id, service_name, "Blacklist engeli", customer_link, link=customer_link, panel=service.get("panel", ""))
-                send_telegram(
-                    f"Blacklisted sipariş engellendi.\n\nSipariş ID: {order_id}\nMüşteri: {buyer}\nLink: {customer_link}"
-                )
-                return {"ok": False, "error": "blacklisted"}
 
             normalized_link = normalize_link_for_check(customer_link, platform)
             duplicate_link_key = f"{advert_id}:{normalized_link}"
@@ -16027,35 +16268,31 @@ async def telegram_webhook(request: Request):
     log("info", "telegram_command", command=text[:50])
 
     if command in ["/start", "/help"]:
-        send_telegram(
-            "Bot komutları:\n\n"
-            "/panels - Ekli panelleri göster\n"
-            "/balance - Tüm panel bakiyeleri\n"
-            "/balance paneladi - Seçili panel bakiyesi\n"
-            "/balance-all - Tüm panel bakiyeleri\n"
-            "/check-balances - Bakiye alarm check-up\n"
-            "/medyabalance - MedyaBayim bakiyesi\n"
-            "/status - Bot durumu\n"
-            "/health - Sistem durumu\n"
-            "/failed - Başarısız siparişler\n"
-            "/pending - Bekleyen siparişler\n"
-            "/services - Servis eşleştirmeleri\n"
-            "/admin - Web servis yönetim paneli\n"
-            "/cancel smm_id - Siparişi iptal et\n"
-            "/blacklist add değer - Kara listeye ekle\n"
-            "/blacklist remove değer - Kara listeden çıkar\n"
-            "/blacklist list - Kara listeyi göster\n"
-            "/panel-stats - Panel başarı oranları\n"
-            "/growth-report - Kâr ve satış fırsat raporu\n"
-            "/note smm_id not - Sipariş notu ekle\n"
-            "/report - Bugünkü özet\n"
-            "/week-report - Haftalık özet\n"
-            "/month-report - Aylık özet\n"
-            "/report-all - Tüm özetler\n"
-            "/reset-report - Bu ayın rapor/dashboard verilerini sıfırla\n"
-            "/reset-all-reports - Tüm raporları sıfırla\n"
-            "/help - Komutları gösterir"
-        )
+        send_telegram("""Bot komutları:
+
+/panels - Ekli panelleri göster
+/balance - Tüm panel bakiyeleri
+/balance paneladi - Seçili panel bakiyesi
+/balance-all - Tüm panel bakiyeleri
+/check-balances - Bakiye alarm check-up
+/medyabalance - MedyaBayim bakiyesi
+/status - Bot durumu
+/health - Sistem durumu
+/failed - Başarısız siparişler
+/pending - Bekleyen siparişler
+/services - Servis eşleştirmeleri
+/admin - Web servis yönetim paneli
+/cancel smm_id - Siparişi iptal et
+/panel-stats - Panel başarı oranları
+/growth-report - Kâr ve satış fırsat raporu
+/note smm_id not - Sipariş notu ekle
+/report - Bugünkü özet
+/week-report - Haftalık özet
+/month-report - Aylık özet
+/report-all - Tüm özetler
+/reset-report - Bu ayın rapor/dashboard verilerini sıfırla
+/reset-all-reports - Tüm raporları sıfırla
+/help - Komutları gösterir""")
         return {"ok": True}
 
     if command == "/status":
@@ -16154,30 +16391,6 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
 
-    if command == "/blacklist":
-        parts = text.split(maxsplit=2)
-        action = parts[1].lower() if len(parts) > 1 else "list"
-        if action == "list":
-            if not BLACKLIST:
-                send_telegram("Kara liste boş.")
-            else:
-                send_telegram("Kara Liste:\n" + "\n".join(f"- {item}" for item in sorted(BLACKLIST)))
-            return {"ok": True}
-        if len(parts) < 3:
-            send_telegram("Kullanım: /blacklist add değer veya /blacklist remove değer")
-            return {"ok": True}
-        value = parts[2].strip()
-        if action == "add":
-            blacklist_add(value)
-            send_telegram(f"Kara listeye eklendi: {value}")
-            return {"ok": True}
-        if action == "remove":
-            blacklist_remove(value)
-            send_telegram(f"Kara listeden çıkarıldı: {value}")
-            return {"ok": True}
-        send_telegram("Kullanım: /blacklist add/remove/list")
-        return {"ok": True}
-
 
     if command == "/panel-stats":
         if not PANEL_STATS:
@@ -16256,34 +16469,24 @@ async def telegram_webhook(request: Request):
 
 @app.post("/admin/cleanup/old-state")
 def admin_cleanup_old_state(user: str = Depends(get_current_admin)):
-    """Deneme döneminden kalan ve artık kullanılmayan ağır/yan keyleri Redis'ten temizler."""
+    """Deneme döneminden kalan gereksiz ağır/yan keyleri temizler.
+    Duplicate hafızası, panel/servis istatistikleri ve aktif sipariş verileri korunur.
+    """
     keys_to_delete = [
-        "recorded_sales",
-        "processed_orders",
-        "processed_links",
-        "daily_stats",
-        "last_daily_report_date",
-        "weekly_stats",
-        "monthly_stats",
-        "last_weekly_report_date",
-        "last_monthly_report_date",
-        "sales_history",
-        "balance_history",
-        "link_audit_history",
         "log_history",
-        "balance_warn_last",
-        "panel_stats",
-        "service_completion_stats",
-        "order_notes",
-        "link_fail_count",
-        "blacklist",
     ]
     deleted = []
     for key in keys_to_delete:
         redis_delete_key(key)
         deleted.append(key)
-    log("warning", "old_state_cleanup_done", deleted=len(deleted))
-    return {"ok": True, "deleted": deleted}
+
+    preserved = [
+        "recorded_sales", "processed_orders", "processed_links", "panel_stats", "service_completion_stats",
+        "pending_orders", "failed_orders", "order_history", "dynamic_services", "package_configs",
+    ]
+    log("warning", "old_state_cleanup_done", deleted=len(deleted), preserved=preserved)
+    return {"ok": True, "deleted": deleted, "preserved": preserved}
+
 
 @app.get("/admin/backup")
 def admin_backup_page(user: str = Depends(get_current_admin)):
@@ -16294,6 +16497,9 @@ def admin_backup_page(user: str = Depends(get_current_admin)):
       <p class='muted'>Bu yedek sadece canlı kullanım için önemli config/verileri içerir. Deneme logları, eski raporlar ve gereksiz state alınmaz.</p>
       <form method='get' action='/admin/backup/download'>
         <button class='green' type='submit'>JSON Yedek İndir</button>
+      </form>
+      <form method='post' action='/admin/cleanup/old-state' onsubmit="return confirm('Eski deneme/log/rapor state temizlensin mi? Önce yedek aldığından emin ol.');" style='margin-top:10px;'>
+        <button class='red' type='submit'>Eski Gereksiz State Temizle</button>
       </form>
     </div>
     <div class='card'>
