@@ -4402,6 +4402,9 @@ def get_current_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
 
+    correct_username = secrets.compare_digest(str(credentials.username or ""), str(ADMIN_USERNAME or ""))
+    correct_password = secrets.compare_digest(str(credentials.password or ""), str(ADMIN_PASSWORD or ""))
+
     if not (correct_username and correct_password):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
