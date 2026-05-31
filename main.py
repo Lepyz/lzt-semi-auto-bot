@@ -248,7 +248,8 @@ PROFIT_TARGET_MARGIN_PERCENT = float(os.getenv("PROFIT_TARGET_MARGIN_PERCENT", "
 PROFIT_MIN_TL = float(os.getenv("PROFIT_MIN_TL", "2"))
 HIGH_VALUE_ORDER_TL = float(os.getenv("HIGH_VALUE_ORDER_TL", "250"))
 PRODUCT_HEALTH_MIN_MARGIN_PERCENT = float(os.getenv("PRODUCT_HEALTH_MIN_MARGIN_PERCENT", "18"))
-BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "true").lower() == "true"
+BLACKLIST_ENABLED = os.getenv("BLACKLIST_ENABLED", "false").lower() == "true"
+BLACKLIST_AUTO_LEARN = os.getenv("BLACKLIST_AUTO_LEARN", "false").lower() == "false"
 BLACKLIST_AUTO_FAIL_COUNT = int(os.getenv("BLACKLIST_AUTO_FAIL_COUNT", "2"))
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
@@ -273,6 +274,24 @@ QUEUE_WORKER_SLEEP_SEC = float(os.getenv("QUEUE_WORKER_SLEEP_SEC", "2"))
 QUEUE_RETRY_DELAY_SEC = int(os.getenv("QUEUE_RETRY_DELAY_SEC", "120"))
 QUEUE_CIRCUIT_RETRY_DELAY_SEC = int(os.getenv("QUEUE_CIRCUIT_RETRY_DELAY_SEC", "600"))
 QUEUE_STUCK_RECOVERY_SEC = int(os.getenv("QUEUE_STUCK_RECOVERY_SEC", "600"))
+
+
+# ─── STABIL BACKUP KAPSAMI ───────────────────────────────────────────────────
+# Sadece iş için kritik config/veriler yedeklenir. Eski deneme log/rapor/state yükleri backup'a girmez.
+BACKUP_KEYS = [
+    "dynamic_services",
+    "package_configs",
+    "itemsatis_advert_manual_items",
+    "itemsatis_advert_cache",
+    "favorite_services",
+    "panel_service_name_cache",
+    "service_price_cache",
+    "pending_orders",
+    "failed_orders",
+    "order_history",
+    "buyer_stats",
+    "message_templates",
+]
 
 QUEUE_CONTEXT = threading.local()
 
@@ -1068,38 +1087,38 @@ def load_state():
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
     global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, BLACKLIST, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES, LINK_FAIL_COUNT
 
-    RECORDED_SALES = set(redis_get_json("recorded_sales", []))
-    PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
-    PROCESSED_LINKS = set(redis_get_json("processed_links", []))
+    RECORDED_SALES = set()
+    PROCESSED_ORDERS = set()
+    PROCESSED_LINKS = set()
     FAILED_ORDERS = redis_get_json("failed_orders", [])
     PENDING_ORDERS = redis_get_json("pending_orders", [])
     sanitize_pending_orders_for_storage()
-    DAILY_STATS = redis_get_json("daily_stats", {})
-    LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
+    DAILY_STATS = {}
+    LAST_DAILY_REPORT_DATE = ""
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
-    WEEKLY_STATS = redis_get_json("weekly_stats", {})
-    MONTHLY_STATS = redis_get_json("monthly_stats", {})
-    LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
-    LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
+    WEEKLY_STATS = {}
+    MONTHLY_STATS = {}
+    LAST_WEEKLY_REPORT_DATE = ""
+    LAST_MONTHLY_REPORT_DATE = ""
     LOG_HISTORY = deque(redis_get_json("log_history", [])[-MAX_LOG_HISTORY:], maxlen=MAX_LOG_HISTORY)
     PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
     PACKAGE_CONFIGS = redis_get_json("package_configs", {})
-    SALES_HISTORY = redis_get_json("sales_history", {})
+    SALES_HISTORY = {}
     ORDER_HISTORY = redis_get_json("order_history", [])
-    BLACKLIST = set(redis_get_json("blacklist", []))
+    BLACKLIST = set()  # blacklist sistemi kapalı; eski kayıtlar yüklenmez
     FAVORITE_SERVICES = redis_get_json("favorite_services", {})
-    BALANCE_HISTORY = redis_get_json("balance_history", {})
-    LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
+    BALANCE_HISTORY = {}
+    LINK_AUDIT_HISTORY = []
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
-    BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
-    LOW_BALANCE_DISABLED_PANELS = set(redis_get_json("low_balance_disabled_panels", list(LOW_BALANCE_DISABLED_PANELS)))
-    PANEL_STATS = redis_get_json("panel_stats", {})
-    SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
+    BALANCE_WARN_LAST = {}
+    # LOW_BALANCE_DISABLED_PANELS env üzerinden yönetilir; Redis yüklenmez
+    PANEL_STATS = {}
+    SERVICE_COMPLETION_STATS = {}
     BUYER_STATS = redis_get_json("buyer_stats", {})
-    ORDER_NOTES = redis_get_json("order_notes", {})
-    LINK_FAIL_COUNT = redis_get_json("link_fail_count", {})
+    ORDER_NOTES = {}
+    LINK_FAIL_COUNT = {}  # otomatik blacklist kapalı
     trim_processed_memory()
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
@@ -1114,37 +1133,18 @@ def save_state():
         trim_processed_memory()
 
         data_to_save = {
-            "recorded_sales": list(RECORDED_SALES),
-            "processed_orders": list(PROCESSED_ORDERS),
-            "processed_links": list(PROCESSED_LINKS),
-            "failed_orders": FAILED_ORDERS,
+                                                "failed_orders": FAILED_ORDERS,
             "pending_orders": PENDING_ORDERS,
-            "daily_stats": DAILY_STATS,
-            "last_daily_report_date": LAST_DAILY_REPORT_DATE,
-            "service_price_cache": SERVICE_PRICE_CACHE,
-            "weekly_stats": WEEKLY_STATS,
-            "monthly_stats": MONTHLY_STATS,
-            "last_weekly_report_date": LAST_WEEKLY_REPORT_DATE,
-            "last_monthly_report_date": LAST_MONTHLY_REPORT_DATE,
-            "product_name_cache": PRODUCT_NAME_CACHE,
+                                    "service_price_cache": SERVICE_PRICE_CACHE,
+                                                            "product_name_cache": PRODUCT_NAME_CACHE,
             "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
             "dynamic_services": DYNAMIC_SERVICES,
             "package_configs": PACKAGE_CONFIGS,
-            "sales_history": SALES_HISTORY,
-            "order_history": ORDER_HISTORY[-500:],
-            "blacklist": list(BLACKLIST),
-            "favorite_services": FAVORITE_SERVICES,
-            "balance_history": BALANCE_HISTORY,
-            "link_audit_history": LINK_AUDIT_HISTORY[-300:],
-            "message_templates": MESSAGE_TEMPLATES,
-            "balance_warn_last": BALANCE_WARN_LAST,
-            "low_balance_disabled_panels": sorted(LOW_BALANCE_DISABLED_PANELS),
-            "panel_stats": PANEL_STATS,
-            "service_completion_stats": SERVICE_COMPLETION_STATS,
-            "buyer_stats": BUYER_STATS,
-            "order_notes": ORDER_NOTES,
-            "link_fail_count": LINK_FAIL_COUNT,
-        }
+                        "order_history": ORDER_HISTORY[-500:],
+                        "favorite_services": FAVORITE_SERVICES,
+                                    "message_templates": MESSAGE_TEMPLATES,
+                                                            "buyer_stats": BUYER_STATS,
+                                }
 
         result = redis_mset_json(data_to_save)
         if result is None:
@@ -16252,3 +16252,87 @@ async def telegram_webhook(request: Request):
 
     send_telegram("Bilinmeyen komut. /help ile komutları gör.")
     return {"ok": True}
+
+
+@app.post("/admin/cleanup/old-state")
+def admin_cleanup_old_state(user: str = Depends(get_current_admin)):
+    """Deneme döneminden kalan ve artık kullanılmayan ağır/yan keyleri Redis'ten temizler."""
+    keys_to_delete = [
+        "recorded_sales",
+        "processed_orders",
+        "processed_links",
+        "daily_stats",
+        "last_daily_report_date",
+        "weekly_stats",
+        "monthly_stats",
+        "last_weekly_report_date",
+        "last_monthly_report_date",
+        "sales_history",
+        "balance_history",
+        "link_audit_history",
+        "log_history",
+        "balance_warn_last",
+        "panel_stats",
+        "service_completion_stats",
+        "order_notes",
+        "link_fail_count",
+        "blacklist",
+    ]
+    deleted = []
+    for key in keys_to_delete:
+        redis_delete_key(key)
+        deleted.append(key)
+    log("warning", "old_state_cleanup_done", deleted=len(deleted))
+    return {"ok": True, "deleted": deleted}
+
+@app.get("/admin/backup")
+def admin_backup_page(user: str = Depends(get_current_admin)):
+    rows = "".join(f"<li><code>{html.escape(k)}</code></li>" for k in BACKUP_KEYS)
+    body = f"""
+    <div class='card'>
+      <h2>Stabil Yedek</h2>
+      <p class='muted'>Bu yedek sadece canlı kullanım için önemli config/verileri içerir. Deneme logları, eski raporlar ve gereksiz state alınmaz.</p>
+      <form method='get' action='/admin/backup/download'>
+        <button class='green' type='submit'>JSON Yedek İndir</button>
+      </form>
+    </div>
+    <div class='card'>
+      <h2>Yedeklenen Keyler</h2>
+      <ul>{rows}</ul>
+    </div>
+    """
+    return simple_admin_page("Yedekleme", body)
+
+
+@app.get("/admin/backup/download")
+def admin_backup_download(user: str = Depends(get_current_admin)):
+    backup = {
+        "created_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": "boostera-stable-config-backup-v1",
+        "keys": {},
+    }
+    for key in BACKUP_KEYS:
+        backup["keys"][key] = redis_get_json(key, None)
+    content = json.dumps(backup, ensure_ascii=False, indent=2)
+    filename = f"boostera_backup_{now_tr().strftime('%Y%m%d_%H%M%S')}.json"
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.post("/admin/backup/restore")
+async def admin_backup_restore(request: Request, user: str = Depends(get_current_admin)):
+    """JSON body ile BACKUP_KEYS kapsamındaki yedeği geri yükler. UI yükleme sonra eklenebilir."""
+    data = await request.json()
+    keys = data.get("keys", data if isinstance(data, dict) else {})
+    if not isinstance(keys, dict):
+        raise HTTPException(status_code=400, detail="Invalid backup format")
+    restored = 0
+    for key in BACKUP_KEYS:
+        if key in keys:
+            redis_set_json(key, keys[key])
+            restored += 1
+    load_state()
+    return {"ok": True, "restored": restored}
