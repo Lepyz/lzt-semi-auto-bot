@@ -246,6 +246,8 @@ HIGH_VALUE_ORDER_TL = float(os.getenv("HIGH_VALUE_ORDER_TL", "250"))
 PRODUCT_HEALTH_MIN_MARGIN_PERCENT = float(os.getenv("PRODUCT_HEALTH_MIN_MARGIN_PERCENT", "18"))
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
+_ADMIN_BACKGROUND_JOBS = {}
+_ADMIN_BACKGROUND_LOCK = threading.Lock()
 PANEL_STATS = {}
 SERVICE_COMPLETION_STATS = {}
 BUYER_STATS = {}
@@ -272,6 +274,50 @@ QUEUE_CONTEXT = threading.local()
 # V39 safe-current-patch: ağır periyodik kontroller varsayılan kapalı.
 # Queue worker ayrı tutulur ve açık kalır; manuel endpoint/butonlar çalışmaya devam eder.
 ENABLE_BACKGROUND_CHECKS = os.getenv("ENABLE_BACKGROUND_CHECKS", "false").lower() == "true"
+PENDING_AGE_ALERT_SECONDS = int(os.getenv("PENDING_AGE_ALERT_SECONDS", "7200"))
+PENDING_AGE_ALERT_REPEAT_SECONDS = int(os.getenv("PENDING_AGE_ALERT_REPEAT_SECONDS", "21600"))
+
+
+def run_admin_background_job(job_key: str, target, *args, **kwargs) -> dict:
+    """Admin butonlarındaki ağır işleri HTTP isteğini bekletmeden arka planda çalıştırır."""
+    job_key = str(job_key or "admin_background_job")
+    with _ADMIN_BACKGROUND_LOCK:
+        item = _ADMIN_BACKGROUND_JOBS.get(job_key, {})
+        thread = item.get("thread") if isinstance(item, dict) else None
+        if thread and getattr(thread, "is_alive", lambda: False)():
+            return {"ok": True, "started": False, "already_running": True, "job": job_key}
+        _ADMIN_BACKGROUND_JOBS[job_key] = {
+            "status": "running",
+            "started_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": "",
+            "error": "",
+            "result": None,
+        }
+
+    def _runner():
+        try:
+            result = target(*args, **kwargs)
+            with _ADMIN_BACKGROUND_LOCK:
+                _ADMIN_BACKGROUND_JOBS[job_key].update({
+                    "status": "done",
+                    "finished_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+                    "result": result,
+                })
+            log("info", "admin_background_job_done", job=job_key, result=str(result)[:300])
+        except Exception as e:
+            with _ADMIN_BACKGROUND_LOCK:
+                _ADMIN_BACKGROUND_JOBS[job_key].update({
+                    "status": "error",
+                    "finished_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": str(e)[:500],
+                })
+            log("error", "admin_background_job_error", job=job_key, error=str(e))
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    with _ADMIN_BACKGROUND_LOCK:
+        _ADMIN_BACKGROUND_JOBS[job_key]["thread"] = thread
+    thread.start()
+    return {"ok": True, "started": True, "already_running": False, "job": job_key}
 
 
 def validate_environment():
@@ -835,6 +881,9 @@ async def itemsatis_queue_worker():
                 continue
             item["processing_started_at"] = now_ts
             payload = item.get("payload") if isinstance(item.get("payload"), dict) else item
+            if isinstance(payload, dict) and item.get("id"):
+                payload = dict(payload)
+                payload["_queue_id"] = item.get("id")
             try:
                 result = await asyncio.to_thread(process_itemsatis_webhook_payload, payload)
                 redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
@@ -1003,11 +1052,31 @@ def retry_dead_queue_item(queue_id: str = "", retry_all: bool = False) -> int:
 
 
 def sanitize_pending_order(item: dict) -> dict:
-    """API cevaplarında ve Redis kayıtlarında panel API key sızmasını engeller."""
+    """API cevaplarında ve Redis kayıtlarında panel API key sızmasını engeller; eski kayıtları güvenli defaultlarla tamamlar."""
     if not isinstance(item, dict):
         return {}
     clean = dict(item)
     clean.pop("api_key", None)
+    clean["itemsatis_order_id"] = str(clean.get("itemsatis_order_id") or clean.get("order_id") or "Bilinmiyor")
+    clean["advert_id"] = str(clean.get("advert_id") or "")
+    clean["product_name"] = str(clean.get("product_name") or "Bilinmeyen Ürün")
+    clean["panel"] = str(clean.get("panel") or "")
+    clean["panel_key"] = normalize_panel_key(clean.get("panel_key") or clean.get("panel") or "")
+    clean["service_id"] = str(clean.get("service_id") or "")
+    clean["platform"] = str(clean.get("platform") or "other")
+    clean["smm_order_id"] = str(clean.get("smm_order_id") or "")
+    clean["link"] = str(clean.get("link") or "")
+    try:
+        clean["created_at"] = int(clean.get("created_at", 0) or 0)
+    except Exception:
+        clean["created_at"] = 0
+    clean["submitted_at"] = str(clean.get("submitted_at") or "")
+    try:
+        clean["price"] = float(clean.get("price", 0) or 0)
+    except Exception:
+        clean["price"] = 0.0
+    clean["delay_alert_sent"] = bool(clean.get("delay_alert_sent", False))
+    clean["cancelled"] = bool(clean.get("cancelled", False))
     return clean
 
 
@@ -1049,7 +1118,7 @@ def load_state():
     RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
-    FAILED_ORDERS = redis_get_json("failed_orders", [])
+    FAILED_ORDERS = [normalize_failed_order(item) for item in redis_get_json("failed_orders", []) if isinstance(item, dict)]
     PENDING_ORDERS = redis_get_json("pending_orders", [])
     sanitize_pending_orders_for_storage()
     DAILY_STATS = redis_get_json("daily_stats", {})
@@ -1184,6 +1253,40 @@ def make_order_key(order_id, advert_id, buyer, link="", platform=""):
     return f"fallback:{advert_id}:{buyer}:{normalize_link_for_check(link, platform)}"
 
 
+def build_order_idempotency_keys(order_id, advert_id, buyer, link="", platform="", queue_id="") -> list[str]:
+    """Aynı webhook'un tekrar gelmesi durumunda çift panel siparişini engelleyen uyumlu anahtarlar."""
+    keys = []
+    base_key = make_order_key(order_id, advert_id, buyer, link, platform)
+    if base_key:
+        keys.append(base_key)
+    order_text = str(order_id or "").strip()
+    advert_text = str(advert_id or "").strip()
+    if order_text and order_text != "Bilinmiyor":
+        keys.append(f"itemsatis_order:{order_text}")
+        if advert_text:
+            keys.append(f"itemsatis_advert_order:{advert_text}:{order_text}")
+    else:
+        normalized_link = normalize_link_for_check(link, platform)
+        buyer_text = str(buyer or "").strip()
+        if advert_text and buyer_text and normalized_link:
+            keys.append(f"itemsatis_fallback:{advert_text}:{buyer_text}:{normalized_link}")
+    queue_text = str(queue_id or "").strip()
+    if queue_text:
+        keys.append(f"queue:{queue_text}")
+    return list(dict.fromkeys([k for k in keys if k]))
+
+
+def has_processed_order(keys: list[str]) -> bool:
+    return any(key in PROCESSED_ORDERS for key in (keys or []))
+
+
+def mark_processed_order(keys: list[str]):
+    for key in keys or []:
+        if key:
+            PROCESSED_ORDERS.add(key)
+    trim_processed_memory()
+
+
 def make_sale_key(data, order_id, advert_id, buyer, product_name, price, link=""):
     if order_id and str(order_id) != "Bilinmiyor":
         return f"sale_order:{order_id}"
@@ -1287,6 +1390,9 @@ def estimate_order_cost_from_service(service: dict, quantity=None) -> float | No
         return None
     rate = SERVICE_PRICE_CACHE.get(f"{panel_key}:{service_id}")
     if not rate:
+        if _queue_context_active():
+            log("warning", "service_cost_cache_missing_in_queue", panel=panel_key, service_id=service_id)
+            return None
         try:
             fetched = fetch_panel_service_rate(service)
             if fetched.get("ok"):
@@ -1316,13 +1422,17 @@ def estimate_package_cost_tl(components: list) -> float | None:
 
 def add_failed_order(order_id, advert_id, product_name, reason, detail="", **extra):
     """Başarısız siparişi kaydeder. Retry için güvenli alanlar extra ile eklenebilir."""
+    category = classify_failed_reason(reason, detail)
+    retry_policy = classify_failed_retry_policy(category, reason, detail)
     entry = {
         "order_id": str(order_id),
         "advert_id": str(advert_id),
         "product_name": str(product_name),
         "reason": str(reason),
         "detail": str(detail),
-        "category": classify_failed_reason(reason, detail),
+        "category": category,
+        "retryable": retry_policy.get("retryable", False),
+        "retry_note": retry_policy.get("retry_note", ""),
         "created_at": int(time.time()),
     }
 
@@ -1345,6 +1455,541 @@ def add_failed_order(order_id, advert_id, product_name, reason, detail="", **ext
             panel=extra.get("panel", ""),
         )
         save_state()
+
+
+def normalize_failed_order(item: dict) -> dict:
+    """Eski/bozuk failed kayıtları admin ve retry akışını bozmasın diye hafifçe tamamlar."""
+    item = dict(item or {})
+    reason = str(item.get("reason") or "Bilinmeyen hata")
+    detail = str(item.get("detail") or "")
+    category = item.get("category") or classify_failed_reason(reason, detail)
+    retry_policy = classify_failed_retry_policy(category, reason, detail)
+    item["order_id"] = str(item.get("order_id") or item.get("itemsatis_order_id") or "Bilinmiyor")
+    item["advert_id"] = str(item.get("advert_id") or "")
+    item["product_name"] = str(item.get("product_name") or "Bilinmeyen Ürün")
+    item["reason"] = reason
+    item["detail"] = detail
+    item["category"] = category
+    if "retryable" not in item:
+        item["retryable"] = retry_policy.get("retryable", False)
+    if not item.get("retry_note"):
+        item["retry_note"] = retry_policy.get("retry_note", "")
+    try:
+        item["created_at"] = int(item.get("created_at", 0) or int(time.time()))
+    except Exception:
+        item["created_at"] = int(time.time())
+    return item
+
+
+def sanitize_panel_response(value, limit: int = 700) -> str:
+    """Panel cevabını failed_orders içine kısa ve güvenli şekilde yazar."""
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(value)
+    text = re.sub(r"(?i)(key|api_key|token|secret|password)['\"]?\s*[:=]\s*['\"]?[^,'\"}\\s]+", r"\1=***", text)
+    return text[:max(120, int(limit or 700))]
+
+
+def is_blocked_customer_asset_link(link: str) -> bool:
+    """Itemsatış görsel/CDN linklerinin panele müşteri linki diye gitmesini engeller."""
+    value = str(link or "").strip().lower()
+    if not value:
+        return True
+    blocked_markers = [
+        "cdn.itemsatis.com",
+        "itemsatis.com/uploads",
+        "/uploads/",
+        "post_images",
+        "product_images",
+        "listing_images",
+        "avatar",
+    ]
+    if any(marker in value for marker in blocked_markers):
+        return True
+    return bool(re.search(r"\.(?:jpg|jpeg|png|gif|webp|svg)(?:$|[?#])", value))
+
+
+def link_matches_platform(link: str, platform: str = "") -> bool:
+    """Canlı API çağrısı yapmadan link/platform uyumunu kontrol eder."""
+    link_text = str(link or "").strip().lower()
+    platform = normalize_text(platform or "")
+    if not link_text or platform in ["", "other", "general"]:
+        return True
+    domains = {
+        "instagram": ["instagram.com", "instagr.am"],
+        "tiktok": ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"],
+        "youtube": ["youtube.com", "youtu.be"],
+        "x": ["x.com", "twitter.com"],
+        "twitter": ["x.com", "twitter.com"],
+        "twitch": ["twitch.tv"],
+        "kick": ["kick.com"],
+    }.get(platform, [])
+    if not domains:
+        return True
+    return any(domain in link_text for domain in domains)
+
+
+def validate_service_order_preflight(service: dict, link: str, context: str = "") -> dict:
+    """Panel siparişi açılmadan önce sadece lokal veriyle güvenli ön kontrol yapar."""
+    service = dict(service or {})
+    context = str(context or "Sipariş")
+    panel_key = normalize_panel_key(service.get("panel_key") or service.get("panel") or "")
+    service_id = str(service.get("service_id") or "").strip()
+    platform = normalize_text(service.get("platform") or "other") or "other"
+    try:
+        quantity = int(service.get("quantity") or 0)
+    except Exception:
+        quantity = 0
+    normalized_link = normalize_panel_link(link, platform)
+
+    checks = [
+        (bool(panel_key), "panel_missing", "Panel eşleşmesi boş."),
+        (panel_key in PANEL_MAP, "panel_unknown", f"Panel bulunamadı: {panel_key or '-'}"),
+        (bool(service.get("api_url") and service.get("api_key")), "panel_config_missing", "Panel API bilgileri eksik."),
+        (bool(service_id), "service_id_missing", "Panel servis ID boş."),
+        (service_id.isdigit(), "service_id_invalid", f"Panel servis ID sadece rakam olmalı: {service_id or '-'}"),
+        (quantity > 0, "quantity_invalid", f"Adet 0'dan büyük olmalı: {quantity}"),
+        (quantity <= 1000000, "quantity_too_high", f"Adet çok yüksek: {quantity}"),
+        (bool(normalized_link), "link_missing", "Müşteri linki boş veya normalize edilemedi."),
+        (not is_blocked_customer_asset_link(normalized_link), "asset_link_blocked", "Itemsatış görsel/CDN linki müşteri linki olarak engellendi."),
+        (link_matches_platform(normalized_link, platform), "platform_link_mismatch", f"Link platform ile uyumlu değil. Platform: {platform}, Link: {normalized_link}"),
+    ]
+    for ok, code, detail in checks:
+        if not ok:
+            return {"ok": False, "code": code, "reason": "Sipariş ön kontrol hatası", "detail": f"{context}: {detail}"}
+    return {"ok": True, "link": normalized_link, "quantity": quantity, "panel_key": panel_key, "service_id": service_id}
+
+
+def add_preflight_failed_order(order_id, advert_id, product_name, service: dict, check: dict, link: str = ""):
+    service = dict(service or {})
+    detail = str((check or {}).get("detail") or (check or {}).get("code") or "Ön kontrol başarısız")
+    add_failed_order(
+        order_id,
+        advert_id,
+        product_name,
+        "Sipariş ön kontrol hatası",
+        detail,
+        link=link,
+        panel=service.get("panel", ""),
+        panel_key=service.get("panel_key", ""),
+        service_id=service.get("service_id", ""),
+        quantity=service.get("quantity", ""),
+        platform=service.get("platform", ""),
+        retryable=False,
+        reason_code=(check or {}).get("code", "preflight_failed"),
+    )
+
+
+def validate_config_service_binding(service: dict, context: str, advert_id: str = "") -> list:
+    """dynamic_services/package_configs kayıtlarını canlı API çağrısı yapmadan kontrol eder."""
+    issues = []
+    service = get_service_config(service or {})
+    panel_key = normalize_panel_key(service.get("panel_key") or service.get("panel") or "")
+    service_id = str(service.get("service_id") or "").strip()
+    try:
+        quantity = int(service.get("quantity") or 0)
+    except Exception:
+        quantity = 0
+
+    def add_issue(code: str, detail: str):
+        issues.append({
+            "code": code,
+            "detail": detail,
+            "context": str(context or ""),
+            "advert_id": str(advert_id or ""),
+            "panel": service.get("panel", panel_key),
+            "panel_key": panel_key,
+            "service_id": service_id,
+        })
+
+    if not panel_key:
+        add_issue("panel_missing", "Panel boş.")
+    elif panel_key not in PANEL_MAP:
+        add_issue("panel_unknown", f"Panel bulunamadı: {panel_key}")
+    elif not is_panel_configured(panel_key):
+        add_issue("panel_config_missing", "Panel API URL/API KEY eksik.")
+    if not service_id:
+        add_issue("service_id_missing", "Servis ID boş.")
+    elif not service_id.isdigit():
+        add_issue("service_id_invalid", f"Servis ID rakam değil: {service_id}")
+    if quantity <= 0:
+        add_issue("quantity_invalid", f"Adet geçersiz: {quantity}")
+    elif quantity > 1000000:
+        add_issue("quantity_too_high", f"Adet çok yüksek: {quantity}")
+    return issues
+
+
+def build_service_binding_safety_report() -> dict:
+    """dynamic_services ve package_configs eşleşmelerini canlı panel çağrısı yapmadan tarar."""
+    issues = []
+    checked_dynamic = 0
+    checked_package_components = 0
+
+    for advert_id, raw_service in get_dynamic_services().items():
+        checked_dynamic += 1
+        issues.extend(validate_config_service_binding(raw_service, f"dynamic_service:{advert_id}", advert_id))
+
+    for advert_id, package in get_package_configs(include_inactive=True).items():
+        package_name = str((package or {}).get("name") or f"Paket {advert_id}")
+        active_components = 0
+        for component in (package or {}).get("components", []) or []:
+            component = normalize_package_component(component)
+            if not component.get("active", True):
+                continue
+            active_components += 1
+            checked_package_components += 1
+            issues.extend(validate_config_service_binding(component, f"package:{package_name}/{component.get('name')}", advert_id))
+        if bool((package or {}).get("active", True)) and active_components == 0:
+            issues.append({
+                "code": "package_empty",
+                "detail": "Aktif pakette aktif bileşen yok.",
+                "context": f"package:{package_name}",
+                "advert_id": str(advert_id),
+                "panel": "",
+                "panel_key": "",
+                "service_id": "",
+            })
+
+    return {
+        "ok": not bool(issues),
+        "checked_dynamic": checked_dynamic,
+        "checked_package_components": checked_package_components,
+        "issue_count": len(issues),
+        "issues": issues[:30],
+    }
+
+
+def format_service_binding_safety_summary(report: dict) -> str:
+    report = report or {}
+    if not report.get("issue_count"):
+        return (
+            "Servis eşleşme güvenlik kontrolü: temiz\n"
+            f"Dynamic servis: {report.get('checked_dynamic', 0)} | Paket bileşeni: {report.get('checked_package_components', 0)}"
+        )
+    lines = [
+        "Servis eşleşme güvenlik kontrolü: sorun bulundu",
+        f"Dynamic servis: {report.get('checked_dynamic', 0)} | Paket bileşeni: {report.get('checked_package_components', 0)}",
+        f"Sorun: {report.get('issue_count', 0)}",
+    ]
+    for issue in (report.get("issues") or [])[:8]:
+        lines.append(f"- {issue.get('context', '-')}: {issue.get('detail', '-')}")
+    if int(report.get("issue_count", 0) or 0) > 8:
+        lines.append("- Devamı log/admin kaydında.")
+    return "\n".join(lines)
+
+
+def _safe_int_value(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _service_cache_key(panel_key: str, service_id: str) -> str:
+    return f"{normalize_panel_key(panel_key)}:{str(service_id or '').strip()}"
+
+
+def _service_price_cache_exists(panel_key: str, service_id: str) -> bool:
+    key = _service_cache_key(panel_key, service_id)
+    return key in (SERVICE_PRICE_CACHE or {}) and (SERVICE_PRICE_CACHE or {}).get(key) not in [None, ""]
+
+
+def _active_config_service_rows() -> list[dict]:
+    """Active service configs from local state only; no panel API call."""
+    rows = []
+    for advert_id, service in (SMM_SERVICE_MAP or {}).items():
+        item = dict(service or {})
+        item.setdefault("active", True)
+        if not item.get("active", True):
+            continue
+        item["advert_id"] = str(advert_id)
+        item["config_type"] = "code_service"
+        rows.append(item)
+
+    for advert_id, service in (DYNAMIC_SERVICES or {}).items():
+        item = normalize_dynamic_service(str(advert_id), service or {})
+        if not item.get("active", True):
+            continue
+        item["config_type"] = "dynamic_service"
+        rows.append(item)
+
+    for advert_id, package in (PACKAGE_CONFIGS or {}).items():
+        package = dict(package or {})
+        if not package.get("active", True):
+            continue
+        package_name = str(package.get("name") or f"Package {advert_id}")
+        for component in package.get("components", []) or []:
+            comp = normalize_package_component(component)
+            if not comp.get("active", True):
+                continue
+            comp["advert_id"] = str(advert_id)
+            comp["product_name"] = f"{package_name} / {comp.get('name', 'Component')}"
+            comp["config_type"] = "package_component"
+            rows.append(comp)
+    return rows
+
+
+def build_config_health_report() -> dict:
+    """Local config check for system-check; it does not call live panel APIs."""
+    issues = []
+    price_cache_missing = []
+    name_cache_missing = []
+    checked_services = 0
+    checked_packages = 0
+    checked_components = 0
+
+    for row in _active_config_service_rows():
+        checked_services += 1
+        if row.get("config_type") == "package_component":
+            checked_components += 1
+        panel_key = normalize_panel_key(row.get("panel_key") or row.get("panel") or "")
+        service_id = str(row.get("service_id") or "").strip()
+        quantity = _safe_int_value(row.get("quantity"), 0)
+        context = f"{row.get('config_type', 'service')}:{row.get('advert_id', '-')}"
+
+        for issue in validate_config_service_binding(row, context, row.get("advert_id", "")):
+            issues.append(issue)
+
+        if panel_key and service_id:
+            if not get_cached_panel_service_name(panel_key, service_id):
+                name_cache_missing.append({
+                    "advert_id": str(row.get("advert_id", "")),
+                    "panel_key": panel_key,
+                    "service_id": service_id,
+                    "context": context,
+                })
+            if not _service_price_cache_exists(panel_key, service_id):
+                price_cache_missing.append({
+                    "advert_id": str(row.get("advert_id", "")),
+                    "panel_key": panel_key,
+                    "service_id": service_id,
+                    "context": context,
+                })
+        if quantity <= 0 or quantity > 1000000:
+            issues.append({
+                "code": "quantity_out_of_range",
+                "detail": f"Quantity out of safe range: {quantity}",
+                "context": context,
+                "advert_id": str(row.get("advert_id", "")),
+                "panel": row.get("panel", ""),
+                "panel_key": panel_key,
+                "service_id": service_id,
+            })
+
+    for advert_id, package in (PACKAGE_CONFIGS or {}).items():
+        package = dict(package or {})
+        if not package.get("active", True):
+            continue
+        checked_packages += 1
+        active_components = 0
+        for component in package.get("components", []) or []:
+            comp = normalize_package_component(component)
+            if comp.get("active", True):
+                active_components += 1
+        if active_components == 0:
+            issues.append({
+                "code": "package_without_active_component",
+                "detail": "Active package has no active component.",
+                "context": f"package:{package.get('name') or advert_id}",
+                "advert_id": str(advert_id),
+                "panel": "",
+                "panel_key": "",
+                "service_id": "",
+            })
+
+    return {
+        "ok": not bool(issues),
+        "checked_services": checked_services,
+        "checked_packages": checked_packages,
+        "checked_package_components": checked_components,
+        "issue_count": len(issues),
+        "issues": issues[:50],
+        "panel_service_name_cache_missing_count": len(name_cache_missing),
+        "panel_service_name_cache_missing": name_cache_missing[:30],
+        "price_cache_missing_count": len(price_cache_missing),
+        "price_cache_missing": price_cache_missing[:30],
+    }
+
+
+def calculate_service_health_score(panel_key: str, service_id: str, service: dict | None = None) -> dict:
+    """Small local-only service score for admin decisions."""
+    panel_key = normalize_panel_key(panel_key or (service or {}).get("panel_key") or (service or {}).get("panel") or "")
+    service_id = str(service_id or (service or {}).get("service_id") or "").strip()
+    score = 100
+    notes = []
+
+    if not panel_key or panel_key not in PANEL_MAP:
+        score -= 30
+        notes.append("panel_missing_or_unknown")
+    elif not is_panel_configured(panel_key):
+        score -= 25
+        notes.append("panel_api_config_missing")
+
+    if not service_id or not service_id.isdigit():
+        score -= 30
+        notes.append("service_id_invalid")
+
+    if service is not None:
+        quantity = _safe_int_value((service or {}).get("quantity"), 0)
+        if quantity <= 0 or quantity > 1000000:
+            score -= 20
+            notes.append("quantity_out_of_range")
+
+    if panel_key and service_id and not _service_price_cache_exists(panel_key, service_id):
+        score -= 10
+        notes.append("price_cache_missing")
+
+    completion = (SERVICE_COMPLETION_STATS or {}).get(make_service_completion_key(panel_key, service_id), {})
+    avg_minutes = float(completion.get("avg_completion_minutes", 0) or 0)
+    completed_count = int(completion.get("completed_count", 0) or 0)
+    if completed_count == 0:
+        score -= 5
+        notes.append("no_completion_data")
+    elif avg_minutes >= 1440:
+        score -= 15
+        notes.append("slow_completion")
+    elif avg_minutes >= 360:
+        score -= 8
+        notes.append("completion_getting_slow")
+
+    recent_failed = 0
+    now_ts = int(time.time())
+    for failed in (FAILED_ORDERS or [])[-250:]:
+        if normalize_panel_key(failed.get("panel_key") or failed.get("panel") or "") != panel_key:
+            continue
+        if str(failed.get("service_id") or "").strip() != service_id:
+            continue
+        created_at = _safe_int_value(failed.get("created_at"), 0)
+        if created_at and now_ts - created_at <= 7 * 86400:
+            recent_failed += 1
+    if recent_failed >= 5:
+        score -= 25
+        notes.append("many_recent_failed_orders")
+    elif recent_failed >= 2:
+        score -= 10
+        notes.append("recent_failed_orders")
+
+    score = max(0, min(100, int(score)))
+    return {
+        "panel_key": panel_key,
+        "service_id": service_id,
+        "score": score,
+        "level": "good" if score >= 80 else ("watch" if score >= 55 else "risk"),
+        "notes": notes[:8],
+        "avg_completion_minutes": avg_minutes,
+        "completed_count": completed_count,
+        "recent_failed_7d": recent_failed,
+    }
+
+
+def build_service_health_summary(limit: int = 20) -> dict:
+    rows = []
+    seen = set()
+    for service in _active_config_service_rows():
+        panel_key = normalize_panel_key(service.get("panel_key") or service.get("panel") or "")
+        service_id = str(service.get("service_id") or "").strip()
+        key = (panel_key, service_id, str(service.get("advert_id", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        score = calculate_service_health_score(panel_key, service_id, service)
+        score.update({
+            "advert_id": str(service.get("advert_id", "")),
+            "config_type": service.get("config_type", "service"),
+            "product_name": str(service.get("product_name") or service.get("name") or ""),
+        })
+        rows.append(score)
+    rows.sort(key=lambda item: (int(item.get("score", 0)), item.get("advert_id", "")))
+    return {
+        "checked": len(rows),
+        "risk_count": sum(1 for item in rows if item.get("level") == "risk"),
+        "watch_count": sum(1 for item in rows if item.get("level") == "watch"),
+        "lowest": rows[:max(1, int(limit or 20))],
+    }
+
+
+def build_pending_age_report(now_ts: int | None = None) -> dict:
+    now_ts = int(now_ts or time.time())
+    threshold = max(300, int(PENDING_AGE_ALERT_SECONDS))
+    rows = []
+    for item in PENDING_ORDERS or []:
+        if not isinstance(item, dict) or item.get("cancelled"):
+            continue
+        created_at = _safe_int_value(item.get("created_at"), 0)
+        if not created_at:
+            continue
+        age_seconds = max(0, now_ts - created_at)
+        if age_seconds >= threshold:
+            rows.append({
+                "itemsatis_order_id": str(item.get("itemsatis_order_id", "")),
+                "smm_order_id": str(item.get("smm_order_id", "")),
+                "product_name": str(item.get("product_name", "")),
+                "panel": str(item.get("panel", "")),
+                "age_minutes": int(age_seconds / 60),
+                "alert_sent": bool(item.get("delay_alert_sent") or item.get("pending_age_alert_sent_at")),
+            })
+    rows.sort(key=lambda item: item.get("age_minutes", 0), reverse=True)
+    return {"threshold_seconds": threshold, "old_count": len(rows), "oldest": rows[:20]}
+
+
+def build_failed_24h_report() -> dict:
+    now_ts = int(time.time())
+    rows = []
+    categories = defaultdict(int)
+    for item in FAILED_ORDERS or []:
+        if not isinstance(item, dict):
+            continue
+        created_at = _safe_int_value(item.get("created_at"), 0)
+        if created_at and now_ts - created_at <= 86400:
+            rows.append(item)
+            categories[str(item.get("category") or classify_failed_reason(item.get("reason", ""), item.get("detail", "")))] += 1
+    return {
+        "count": len(rows),
+        "high": len(rows) >= 10,
+        "categories": dict(sorted(categories.items(), key=lambda pair: pair[1], reverse=True)[:10]),
+    }
+
+
+def build_recommended_actions(config_report: dict | None = None, health_report: dict | None = None, pending_report: dict | None = None, failed_report: dict | None = None) -> list[dict]:
+    """Short local-only recommendations; no automatic action."""
+    actions = []
+    config_report = config_report or {}
+    health_report = health_report or {}
+    pending_report = pending_report or {}
+    failed_report = failed_report or {}
+
+    def add(priority: str, code: str, message: str, target: str = ""):
+        actions.append({"priority": priority, "code": code, "message": message, "target": target})
+
+    if int(config_report.get("issue_count", 0) or 0):
+        add("high", "config_issues", f"{config_report.get('issue_count')} config issue found. Check service/package bindings.")
+    if int(config_report.get("price_cache_missing_count", 0) or 0):
+        add("medium", "price_cache_missing", f"{config_report.get('price_cache_missing_count')} active service has no price cache. Run service price update when traffic is calm.")
+    if int(config_report.get("panel_service_name_cache_missing_count", 0) or 0):
+        add("low", "service_name_cache_missing", f"{config_report.get('panel_service_name_cache_missing_count')} active service has no cached panel service name.")
+    if int(pending_report.get("old_count", 0) or 0):
+        add("medium", "old_pending_orders", f"{pending_report.get('old_count')} pending order is older than alert threshold. Manual panel check is recommended.")
+    if failed_report.get("high"):
+        add("high", "failed_spike_24h", f"{failed_report.get('count')} failed order in last 24h. Check recent panel/service problems.")
+
+    for item in (health_report.get("lowest") or [])[:5]:
+        if item.get("level") == "risk":
+            add(
+                "high",
+                "service_health_risk",
+                f"Service health risk: panel={item.get('panel_key')} service={item.get('service_id')} score={item.get('score')}.",
+                str(item.get("advert_id", "")),
+            )
+        elif item.get("level") == "watch":
+            add(
+                "medium",
+                "service_health_watch",
+                f"Watch service: panel={item.get('panel_key')} service={item.get('service_id')} score={item.get('score')}.",
+                str(item.get("advert_id", "")),
+            )
+
+    return actions[:25]
 
 
 def parse_price_value(value) -> float:
@@ -1515,7 +2160,7 @@ def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price,
     return True
 
 
-def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0, duration_minutes=None, estimated_completion_minutes=None):
+def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0, duration_minutes=None, estimated_completion_minutes=None, submitted_at=""):
     entry = {
         "order_id": str(order_id),
         "advert_id": str(advert_id),
@@ -1526,6 +2171,7 @@ def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, li
         "price": float(price or 0),
         "duration_minutes": int(duration_minutes or 0) if duration_minutes is not None else "",
         "estimated_completion_minutes": float(estimated_completion_minutes or 0) if estimated_completion_minutes else "",
+        "submitted_at": str(submitted_at or ""),
         "completed_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
     }
     with STATE_LOCK:
@@ -1788,17 +2434,46 @@ def build_order_growth_tip(platform: str = "", product_name: str = "") -> str:
 
 def classify_failed_reason(reason: str, detail: str = "") -> str:
     text = normalize_text(f"{reason} {detail}")
-    if "bakiye" in text or "balance" in text:
+    if "ön kontrol" in text or "on kontrol" in text or "preflight" in text:
+        return "preflight"
+    if "bakiye" in text or "balance" in text or "insufficient" in text:
         return "balance"
-    if "link" in text:
+    if "link" in text or "url" in text or "cdn" in text or "görsel" in text or "gorsel" in text:
         return "link"
     if "zarar" in text or "anti_loss" in text or "maliyet" in text or "cost" in text:
         return "profit"
-    if "order id" in text or "belirsiz" in text:
+    if "timeout" in text or "connection" in text or "circuit" in text or "http 5" in text:
+        return "panel_timeout"
+    if "api key" in text or "env" in text or "config" in text or "panel bilgileri" in text:
+        return "config"
+    if "servis" in text or "service" in text or "panelde bulunamadı" in text or "bulunamadı" in text:
+        return "service"
+    if "order id" in text or "id eksik" in text or "belirsiz" in text:
         return "manual_check"
-    if "panel" in text or "api" in text or "servis" in text:
+    if "panel" in text or "api" in text:
         return "panel"
     return "other"
+
+
+def classify_failed_retry_policy(category: str, reason: str = "", detail: str = "") -> dict:
+    """Failed kayıtlarında otomatik işlem başlatmadan retry uygunluğunu daha doğru etiketler."""
+    category = str(category or "other")
+    text = normalize_text(f"{reason} {detail}")
+    if category in {"link", "preflight", "config", "manual_check"}:
+        return {"retryable": False, "retry_note": "Manuel düzeltme gerekli"}
+    if category == "balance":
+        return {"retryable": True, "retry_note": "Bakiye doldurulduktan sonra retry uygun"}
+    if category == "panel_timeout":
+        return {"retryable": True, "retry_note": "Panel timeout/5xx sonrası retry uygun"}
+    if category == "service":
+        return {"retryable": False, "retry_note": "Servis ID/panel eşleşmesi kontrol edilmeli"}
+    if category == "profit":
+        return {"retryable": False, "retry_note": "Fiyat/maliyet kontrolü gerekli"}
+    if category == "panel":
+        if any(marker in text for marker in ["timeout", "http 5", "connection", "temporar", "geçici", "gecici"]):
+            return {"retryable": True, "retry_note": "Geçici panel hatası sonrası retry uygun"}
+        return {"retryable": False, "retry_note": "Panel cevabı manuel kontrol edilmeli"}
+    return {"retryable": False, "retry_note": "Manuel kontrol gerekli"}
 
 
 def build_lost_order_summary(limit: int = 50) -> dict:
@@ -2055,6 +2730,7 @@ def add_pending_order(
             "smm_order_id": str(smm_order_id),
             "link": str(link),
             "created_at": int(time.time()),
+            "submitted_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
             "delay_alert_sent": False,
             "cancelled": False,
             "price": float(price or 0),
@@ -2066,6 +2742,49 @@ def add_pending_order(
         save_state()
 
 
+
+
+def check_pending_order_age_alerts(now_ts: int | None = None) -> dict:
+    """Bekleyen sipariş yaşını kontrol eder; silmez, retry yapmaz, sadece spam korumalı Telegram uyarısı atar."""
+    now_ts = int(now_ts or time.time())
+    threshold = max(300, int(PENDING_AGE_ALERT_SECONDS))
+    repeat_seconds = max(threshold, int(PENDING_AGE_ALERT_REPEAT_SECONDS))
+    alerted = 0
+    checked = 0
+    changed = False
+
+    for item in PENDING_ORDERS:
+        if not isinstance(item, dict) or item.get("cancelled"):
+            continue
+        created_at = int(item.get("created_at", 0) or 0)
+        if not created_at:
+            continue
+        checked += 1
+        age_seconds = max(0, now_ts - created_at)
+        if age_seconds < threshold:
+            continue
+        last_alert = int(item.get("pending_age_alert_sent_at", 0) or 0)
+        if last_alert and (now_ts - last_alert) < repeat_seconds:
+            continue
+
+        send_telegram(
+            f"Bekleyen sipariş yaş uyarısı.\n\n"
+            f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
+            f"Panel: {item.get('panel', '-')}\n"
+            f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\n"
+            f"SMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
+            f"Bekleme: {format_duration_minutes(age_seconds / 60)}\n"
+            f"Link: {item.get('link', '')}\n\n"
+            f"Bot siparişi silmedi, retry yapmadı. Sadece kontrol uyarısıdır."
+        )
+        item["pending_age_alert_sent_at"] = now_ts
+        item["delay_alert_sent"] = True
+        alerted += 1
+        changed = True
+
+    if changed:
+        save_state()
+    return {"checked": checked, "alerted": alerted, "threshold_seconds": threshold, "repeat_seconds": repeat_seconds}
 
 
 def get_nested(data: dict, *paths):
@@ -5687,9 +6406,25 @@ def admin_toggle_service_get(advert_id: str = "", user: str = Depends(get_curren
 
 @app.post("/admin/update-services")
 def admin_update_services(user: str = Depends(get_current_admin)):
-    """Admin panelden servis fiyat kontrolünü manuel başlatır."""
-    check_services()
-    return RedirectResponse("/admin", status_code=303)
+    """Admin panelden servis fiyat kontrolünü arka planda başlatır."""
+    def _job():
+        safety = build_service_binding_safety_report()
+        log("info", "service_binding_safety_report", issue_count=safety.get("issue_count", 0), checked_dynamic=safety.get("checked_dynamic", 0), checked_package_components=safety.get("checked_package_components", 0), issues=safety.get("issues", [])[:8])
+        result = check_services()
+        pending_age = check_pending_order_age_alerts()
+        send_telegram(
+            f"Servis fiyat kontrolü tamamlandı.\n\n"
+            f"Kontrol sonucu:\n"
+            f"Fiyat değişen: {result.get('changed_count', 0)}\n"
+            f"Yeni cachelenen: {result.get('initialized_count', 0)}\n"
+            f"Panelde bulunamayan: {result.get('missing_count', 0)}\n\n"
+            f"{format_service_binding_safety_summary(safety)}\n\n"
+            f"Pending yaş uyarısı: {pending_age.get('alerted', 0)}"
+        )
+        return {"price_check": result, "service_binding_safety": safety, "pending_age": pending_age}
+
+    run_admin_background_job("check_services_manual", _job)
+    return RedirectResponse("/admin?bg=check_services_started", status_code=303)
 
 
 def refresh_panel_service_names() -> dict:
@@ -5749,15 +6484,22 @@ def refresh_panel_service_names() -> dict:
 
 @app.post("/admin/update-service-names")
 def admin_update_service_names(user: str = Depends(get_current_admin)):
-    result = refresh_panel_service_names()
-    log("info", "admin_service_names_updated", **result)
-    send_telegram(
-        "Servis isimleri güncellendi.\n\n"
-        f"Kontrol edilen: {result.get('checked', 0)}\n"
-        f"Güncellenen: {result.get('updated', 0)}\n"
-        f"Bulunamayan: {result.get('missing', 0)}"
-    )
-    return RedirectResponse("/admin", status_code=303)
+    def _job():
+        result = refresh_panel_service_names()
+        log("info", "admin_service_names_updated", **result)
+        try:
+            send_telegram(
+                "Servis isimleri güncellendi.\n\n"
+                f"Kontrol edilen: {result.get('checked', 0)}\n"
+                f"Güncellenen: {result.get('updated', 0)}\n"
+                f"Bulunamayan: {result.get('missing', 0)}"
+            )
+        except Exception as e:
+            log("warning", "service_name_update_telegram_failed", error=str(e))
+        return result
+
+    run_admin_background_job("refresh_panel_service_names", _job)
+    return RedirectResponse("/admin?bg=service_names_started", status_code=303)
 
 
 @app.post("/admin/reset-dashboard")
@@ -13392,6 +14134,12 @@ def build_redis_health() -> dict:
 def build_system_check() -> dict:
     """Genel bot check-up: deploy kıran ve operasyonel riskleri tek yerde özetler."""
     missing_env = validate_environment()
+    config_health = build_config_health_report()
+    service_health = build_service_health_summary()
+    pending_age = build_pending_age_report()
+    failed_24h = build_failed_24h_report()
+    service_binding_safety = build_service_binding_safety_report()
+    recommended_actions = build_recommended_actions(config_health, service_health, pending_age, failed_24h)
     configured_panels = []
     missing_panels = []
     for key in PANEL_MAP.keys():
@@ -13420,7 +14168,7 @@ def build_system_check() -> dict:
         seen_routes.add(key)
 
     return {
-        "ok": not bool(duplicate_routes),
+        "ok": not bool(duplicate_routes) and bool(config_health.get("ok", True)),
         "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
         "webhook_security": {
             "ip_whitelist_count": len(WEBHOOK_IP_WHITELIST),
@@ -13433,8 +14181,14 @@ def build_system_check() -> dict:
         "missing_panels": missing_panels,
         "pending_count": len(PENDING_ORDERS),
         "failed_count": len(FAILED_ORDERS),
+        "pending_age": pending_age,
+        "failed_24h": failed_24h,
         "packages_count": len(PACKAGE_CONFIGS or {}),
         "dynamic_services_count": len(DYNAMIC_SERVICES or {}),
+        "config_health": config_health,
+        "service_binding_safety": service_binding_safety,
+        "service_health": service_health,
+        "recommended_actions": recommended_actions,
         "balance_alerts": {
             "threshold_tl": BALANCE_WARN_THRESHOLD_TL,
             "repeat_minutes": BALANCE_WARN_REPEAT_MINUTES,
@@ -13479,7 +14233,7 @@ def api_export(user: str = Depends(get_current_admin)):
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=["order_id", "advert_id", "product_name", "panel", "smm_order_id", "link", "price", "duration_minutes", "estimated_completion_minutes", "completed_at"],
+        fieldnames=["order_id", "advert_id", "product_name", "panel", "smm_order_id", "link", "price", "duration_minutes", "estimated_completion_minutes", "submitted_at", "completed_at"],
         extrasaction="ignore",
     )
     writer.writeheader()
@@ -14672,7 +15426,7 @@ def admin_service_search(panel: str = "medyabayim", q: str = "", user: str = Dep
     ])
     body = f"""
     <div class='card'><div class='muted'>Panel servislerini isim, ID veya kategoriyle ara. Fiyat ve adet bazlı tahmini maliyet TL olarak gösterilir.</div>
-    <form class='grid' method='get'><select name='panel'>{options}</select><input name='q' value='{html.escape(str(q))}' placeholder='Örn: tiktok views, takipçi, 123'><button>Ara</button></form></div>
+    <form class='grid' method='get' action='/admin/service-search'><select name='panel'>{options}</select><input name='q' value='{html.escape(str(q))}' placeholder='Örn: tiktok views, takipçi, 123'><button>Ara</button></form></div>
     {error}
     <div class='card'><table class='table'><thead><tr><th>Panel</th><th>ID</th><th>Servis</th><th>Kategori</th><th>Fiyat TL</th><th>Adet Maliyeti</th><th>Min/Max</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Arama yap veya sonuç yok.</td></tr>'}</tbody></table></div>
     <script>
@@ -14898,7 +15652,7 @@ def admin_adverts_bind(status: str = "missing", q: str = "", user: str = Depends
     body = f"""
     <div class='card'><div class='muted'>İlanları servis veya paketle hızlı bağlamak için bu sihirbazı kullan. İlan adından platform/adet/arama önerisi otomatik tahmin edilir; yanlışsa formda düzeltebilirsin.</div>
       <div class='toolbar'>{filters}</div>
-      <form class='grid' method='get'><input type='hidden' name='status' value='{html.escape(status)}'><input name='q' value='{html.escape(q)}' placeholder='İlan adı veya ID ara'><button>Filtrele</button></form>
+      <form class='grid' method='get' action='/admin/adverts-bind'><input type='hidden' name='status' value='{html.escape(status)}'><input name='q' value='{html.escape(q)}' placeholder='İlan adı veya ID ara'><button>Filtrele</button></form>
     </div>
     <div class='card'><table class='table'><thead><tr><th>ID</th><th>İlan</th><th>Durum</th><th>Tahmin</th><th>İşlem</th></tr></thead><tbody>{''.join(rows) or '<tr><td>Bu filtrede ilan yok. Önce Itemsatış İlanları sayfasından içe aktar.</td></tr>'}</tbody></table></div>
     """
@@ -14930,7 +15684,7 @@ def admin_bind_service_page(advert_id: str, panel: str = "", q: str = "", quanti
       <select name='platform'>{build_platform_options(platform)}</select>
       <button class='green'>Kaydet</button>
     </form></div>
-    <div class='card'><h2>Servis Ara ve Tek Tıkla Bağla</h2><form class='grid' method='get'>
+    <div class='card'><h2>Servis Ara ve Tek Tıkla Bağla</h2><form class='grid' method='get' action='/admin/bind-service'>
       <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
       <select name='panel'>{build_panel_select_options(panel_key)}</select>
       <input name='q' value='{html.escape(q)}' placeholder='Örn: instagram türk takipçi'>
@@ -15019,7 +15773,7 @@ def admin_bind_package_page(advert_id: str, panel: str = "", q: str = "", quanti
       <select name='platform'>{build_platform_options(platform)}</select>
       <button class='green'>Bileşen Ekle</button>
     </form></div>
-    <div class='card'><h2>Servis Ara ve Bileşen Olarak Ekle</h2><form class='grid' method='get'>
+    <div class='card'><h2>Servis Ara ve Bileşen Olarak Ekle</h2><form class='grid' method='get' action='/admin/bind-package'>
       <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
       <select name='panel'>{build_panel_select_options(panel_key)}</select>
       <input name='q' value='{html.escape(q)}' placeholder='Örn: tiktok izlenme'>
@@ -15104,7 +15858,7 @@ def admin_package_test(advert_id: str = "", link: str = "", user: str = Depends(
             rows.append(f"<tr><td data-label='Bileşen'>{comp.get('name')}</td><td data-label='Panel'>{service.get('panel')}</td><td data-label='Servis ID'>{service.get('service_id')}</td><td data-label='Adet'>{service.get('quantity')}</td><td data-label='Link'>{comp_link or 'Link yok/geçersiz'}</td><td data-label='Durum'><span class='pill'>{status}</span></td></tr>")
         result_html = f"<div class='card'><h2>Test Sonucu</h2><div class='muted'>Paket panele gönderilmedi. Sadece simülasyon yapıldı.</div><p>Yakalanan link: <b>{detected_link or 'Bulunamadı'}</b> · Platform: {detected_platform or '-'}</p><table class='table'><thead><tr><th>Bileşen</th><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Link</th><th>Durum</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
     body = f"""
-    <div class='card'><div class='muted'>Gerçek sipariş açmadan paket bileşenlerini ve link yakalamayı test eder.</div><form class='grid' method='get'><select name='advert_id'>{options}</select><input name='link' value='{link}' placeholder='Test linki'><button>Paketi Test Et</button></form></div>{result_html}
+    <div class='card'><div class='muted'>Gerçek sipariş açmadan paket bileşenlerini ve link yakalamayı test eder.</div><form class='grid' method='get' action='/admin/package-test'><select name='advert_id'>{options}</select><input name='link' value='{link}' placeholder='Test linki'><button>Paketi Test Et</button></form></div>{result_html}
     """
     return simple_admin_page("Paket Test", body)
 
@@ -15113,7 +15867,7 @@ def admin_package_test(advert_id: str = "", link: str = "", user: str = Depends(
 def admin_profit_calculator(sale: float = 0, cost: float = 0, user: str = Depends(get_current_admin)):
     result = calculate_profit(sale, cost)
     body = f"""
-    <div class='card'><form class='grid' method='get'><input type='number' step='0.01' name='sale' value='{sale}' placeholder='Satış TL'><input type='number' step='0.01' name='cost' value='{cost}' placeholder='Panel maliyeti TL'><button>Hesapla</button></form></div>
+    <div class='card'><form class='grid' method='get' action='/admin/profit-calculator'><input type='number' step='0.01' name='sale' value='{sale}' placeholder='Satış TL'><input type='number' step='0.01' name='cost' value='{cost}' placeholder='Panel maliyeti TL'><button>Hesapla</button></form></div>
     <div class='card'><h2>Sonuç</h2><p>Brüt satış: <b>{format_tl_amount(result['sale_price'])}</b></p><p>Itemsatış komisyonu: <b>{format_tl_amount(result['commission'])}</b></p><p>Panel maliyeti: <b>{format_tl_amount(result['panel_cost'])}</b></p><p>Net kâr: <b>{format_tl_amount(result['profit'])}</b> · Marj: <b>%{result['margin_pct']}</b></p></div>
     """
     return simple_admin_page("Kâr Hesaplayıcı", body)
@@ -15138,7 +15892,26 @@ def admin_link_audit(user: str = Depends(get_current_admin)):
 
 @app.get("/admin/failed-actions", response_class=HTMLResponse)
 def admin_failed_actions(user: str = Depends(get_current_admin)):
-    rows = "".join([f"<tr><td data-label='Ürün'>{o.get('product_name')}</td><td data-label='Sipariş'>{o.get('order_id')}</td><td data-label='SMM'>{o.get('smm_order_id','-')}</td><td data-label='Panel'>{o.get('panel','-')}</td><td data-label='Sebep'>{o.get('reason')}</td><td data-label='Link'>{o.get('link','')}</td><td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'><input type='hidden' name='smm_order_id' value='{o.get('smm_order_id','')}'><input type='hidden' name='order_id' value='{o.get('order_id','')}'><button class='green' type='submit'>Tamamlandı İşaretle</button></form></td></tr>" for o in reversed(FAILED_ORDERS[-50:])])
+    row_parts = []
+    for o in reversed(FAILED_ORDERS[-50:]):
+        if not isinstance(o, dict):
+            continue
+        product_name = html.escape(str(o.get("product_name", "")))
+        order_id = html.escape(str(o.get("order_id", "")))
+        smm_order_id = html.escape(str(o.get("smm_order_id", "-")))
+        panel = html.escape(str(o.get("panel", "-")))
+        reason = html.escape(str(o.get("reason", "")))
+        link = html.escape(str(o.get("link", "")))
+        row_parts.append(
+            f"<tr><td data-label='Ürün'>{product_name}</td><td data-label='Sipariş'>{order_id}</td>"
+            f"<td data-label='SMM'>{smm_order_id}</td><td data-label='Panel'>{panel}</td>"
+            f"<td data-label='Sebep'>{reason}</td><td data-label='Link'>{link}</td>"
+            f"<td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'>"
+            f"<input type='hidden' name='smm_order_id' value='{smm_order_id}'>"
+            f"<input type='hidden' name='order_id' value='{order_id}'>"
+            f"<button class='green' type='submit'>Tamamlandı İşaretle</button></form></td></tr>"
+        )
+    rows = "".join(row_parts)
     body = f"<div class='card'><div class='muted'>Başarısız siparişler için hızlı çözüm merkezi.</div><table class='table'><thead><tr><th>Ürün</th><th>Sipariş</th><th>SMM</th><th>Panel</th><th>Sebep</th><th>Link</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Başarısız sipariş yok.</td></tr>'}</tbody></table></div>"
     return simple_admin_page("Hatalı Sipariş Çözüm Merkezi", body)
 
@@ -15248,6 +16021,7 @@ def check_orders():
     completed_indexes = []
     changed = False
     failed_count = 0
+    pending_age = check_pending_order_age_alerts()
 
     for index, item in enumerate(PENDING_ORDERS):
         if item.get("cancelled"):
@@ -15359,6 +16133,7 @@ def check_orders():
                 item.get("price", 0),
                 duration_minutes,
                 item.get("avg_completion_minutes", ""),
+                item.get("submitted_at", ""),
             )
             completed_indexes.append(index)
             changed = True
@@ -15369,7 +16144,7 @@ def check_orders():
     if changed:
         save_state()
 
-    return {"ok": True, "pending_count": len(PENDING_ORDERS), "completed_count": len(completed_indexes), "failed_count": failed_count}
+    return {"ok": True, "pending_count": len(PENDING_ORDERS), "completed_count": len(completed_indexes), "failed_count": failed_count, "pending_age": pending_age}
 
 
 # ─── YENİ: /cancel KOMUTU (Telegram'dan SMM siparişini iptal et) ──────────────
@@ -15614,13 +16389,18 @@ def check_services():
     global SERVICE_PRICE_CACHE
     changed_count = 0
     missing_count = 0
+    initialized_count = 0
+    services_data_by_panel = {}
 
     for service in get_price_check_targets(include_inactive=False):
         if not service.get("api_url") or not service.get("api_key"):
             log("warning", "service_panel_missing", advert_id=service.get("advert_id"), panel=service.get("panel_key"))
             continue
 
-        services_data = get_panel_services(service["api_url"], service["api_key"], service.get("panel", ""))
+        panel_cache_key = service.get("panel_key") or service.get("panel") or f'{service["api_url"]}|{service["api_key"]}'
+        if panel_cache_key not in services_data_by_panel:
+            services_data_by_panel[panel_cache_key] = get_panel_services(service["api_url"], service["api_key"], service.get("panel", ""))
+        services_data = services_data_by_panel[panel_cache_key]
         if isinstance(services_data, dict) and "error" in services_data:
             continue
 
@@ -15660,7 +16440,7 @@ def check_services():
 
         if old_rate is None:
             SERVICE_PRICE_CACHE[cache_key] = current_rate
-            save_state()
+            initialized_count += 1
             continue
 
         if old_rate_norm != current_rate_norm:
@@ -15679,9 +16459,9 @@ def check_services():
             SERVICE_PRICE_CACHE[cache_key] = current_rate
             changed_count += 1
 
-    if changed_count or missing_count:
+    if changed_count or missing_count or initialized_count:
         save_state()
-    return {"ok": True, "changed_count": changed_count, "missing_count": missing_count}
+    return {"ok": True, "changed_count": changed_count, "missing_count": missing_count, "initialized_count": initialized_count}
 
 
 def process_itemsatis_webhook_payload(data: dict):
@@ -15701,6 +16481,7 @@ def process_itemsatis_webhook_payload(data: dict):
         product_name = get_product_name(data)
         buyer = get_buyer(data)
         price = get_order_price(data)
+        queue_id = str((data or {}).get("_queue_id", "") or "")
 
         ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
         if event in ignored_events:
@@ -15746,9 +16527,9 @@ def process_itemsatis_webhook_payload(data: dict):
 
             normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
             duplicate_link_key = f"package:{advert_id}:{normalized_link}"
-            order_key = make_order_key(order_id, advert_id, buyer, customer_link, detected_link_platform or package_platform)
+            order_keys = build_order_idempotency_keys(order_id, advert_id, buyer, customer_link, detected_link_platform or package_platform, queue_id)
 
-            if order_key in PROCESSED_ORDERS:
+            if has_processed_order(order_keys):
                 return {"ignored": True, "reason": "duplicate_package_order"}
             if duplicate_link_key in PROCESSED_LINKS:
                 return {"ignored": True, "reason": "duplicate_package_link"}
@@ -15775,13 +16556,14 @@ def process_itemsatis_webhook_payload(data: dict):
                 component_name = component.get("name") or "Paket Bileşeni"
                 service = get_service_config(component)
                 component_label = f"{package_name} - {component_name}"
+                component_link = normalize_panel_link(customer_link, service.get("platform", detected_link_platform or package_platform))
 
-                if not service.get("api_url") or not service.get("api_key"):
-                    failed_rows.append((component_name, service.get("panel", "Panel"), "Panel bilgileri eksik"))
-                    add_failed_order(order_id, advert_id, component_label, "Panel bilgileri eksik", service.get("panel_key", ""), link=customer_link, panel=service.get("panel", ""))
+                preflight = validate_service_order_preflight(service, component_link, component_label)
+                if not preflight.get("ok"):
+                    failed_rows.append((component_name, service.get("panel", "Panel"), preflight.get("detail", "Ön kontrol hatası")))
+                    add_preflight_failed_order(order_id, advert_id, component_label, service, preflight, component_link or customer_link)
                     continue
 
-                component_link = normalize_panel_link(customer_link, service.get("platform", detected_link_platform or package_platform))
                 balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
                 if "error" in balance_data:
                     error_text = f"Bakiye alınamadı: {balance_data.get('error')}"
@@ -15817,7 +16599,20 @@ def process_itemsatis_webhook_payload(data: dict):
                 if not smm_order_id:
                     error_text = f"Panel order ID dönmedi. Cevap: {str(smm_result)[:300]}"
                     failed_rows.append((component_name, service.get("panel", "Panel"), error_text))
-                    add_failed_order(order_id, advert_id, component_label, "Panel order ID eksik", error_text, link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""), retryable=False)
+                    add_failed_order(
+                        order_id,
+                        advert_id,
+                        component_label,
+                        "Panel order ID eksik",
+                        error_text,
+                        link=customer_link,
+                        panel=service.get("panel", ""),
+                        service_id=service.get("service_id", ""),
+                        retryable=False,
+                        manual_check_required=True,
+                        uncertain_panel_response=True,
+                        panel_response=sanitize_panel_response(smm_result),
+                    )
                     continue
 
                 add_pending_order(
@@ -15840,7 +16635,7 @@ def process_itemsatis_webhook_payload(data: dict):
 
             if success_rows:
                 PROCESSED_LINKS.add(duplicate_link_key)
-                PROCESSED_ORDERS.add(order_key)
+                mark_processed_order(order_keys)
                 save_state()
                 notify_customer_order_started(order_id, package_name, customer_link)
 
@@ -15877,13 +16672,27 @@ def process_itemsatis_webhook_payload(data: dict):
 
             normalized_link = normalize_link_for_check(customer_link, platform)
             duplicate_link_key = f"{advert_id}:{normalized_link}"
-            order_key = make_order_key(order_id, advert_id, buyer, customer_link, platform)
+            order_keys = build_order_idempotency_keys(order_id, advert_id, buyer, customer_link, platform, queue_id)
 
-            if order_key in PROCESSED_ORDERS:
+            if has_processed_order(order_keys):
                 return {"ignored": True, "reason": "duplicate_order"}
 
             if duplicate_link_key in PROCESSED_LINKS:
                 return {"ignored": True, "reason": "duplicate_link"}
+
+            preflight = validate_service_order_preflight(service, customer_link, service_name)
+            if not preflight.get("ok"):
+                add_preflight_failed_order(order_id, advert_id, service_name, service, preflight, customer_link)
+                notify_customer_order_failed(order_id, service_name)
+                send_telegram(
+                    f"Sipariş ön kontrol hatası.\n\n"
+                    f"Sipariş ID: {order_id}\n"
+                    f"Ürün: {service_name}\n"
+                    f"Panel: {service.get('panel', '-')}\n"
+                    f"Sebep: {preflight.get('detail', preflight.get('code', '-'))}\n\n"
+                    f"Panel siparişi açılmadı."
+                )
+                return {"ok": False, "error": "preflight_failed", "reason_code": preflight.get("code")}
 
             if not service.get("api_url") or not service.get("api_key"):
                 add_failed_order(order_id, advert_id, service_name, "Panel bilgileri eksik", service.get("panel_key", ""))
@@ -15930,7 +16739,20 @@ def process_itemsatis_webhook_payload(data: dict):
 
             smm_order_id = get_smm_order_id_from_result(smm_result)
             if not smm_order_id:
-                add_failed_order(order_id, advert_id, service_name, "Panel order ID eksik", str(smm_result)[:500], link=customer_link, panel=service.get("panel", ""), service_id=service.get("service_id", ""), retryable=False)
+                add_failed_order(
+                    order_id,
+                    advert_id,
+                    service_name,
+                    "Panel order ID eksik",
+                    str(smm_result)[:500],
+                    link=customer_link,
+                    panel=service.get("panel", ""),
+                    service_id=service.get("service_id", ""),
+                    retryable=False,
+                    manual_check_required=True,
+                    uncertain_panel_response=True,
+                    panel_response=sanitize_panel_response(smm_result),
+                )
                 notify_customer_order_failed(order_id, service_name)
                 send_telegram(
                     f"Panel siparişi belirsiz cevap verdi.\n\n"
@@ -15940,7 +16762,7 @@ def process_itemsatis_webhook_payload(data: dict):
                 return {"ok": False, "error": "panel_order_id_missing", "manual_check_required": True}
 
             PROCESSED_LINKS.add(duplicate_link_key)
-            PROCESSED_ORDERS.add(order_key)
+            mark_processed_order(order_keys)
             add_pending_order(
                 order_id,
                 advert_id,
