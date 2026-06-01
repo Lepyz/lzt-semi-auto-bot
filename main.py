@@ -269,6 +269,10 @@ QUEUE_STUCK_RECOVERY_SEC = int(os.getenv("QUEUE_STUCK_RECOVERY_SEC", "600"))
 
 QUEUE_CONTEXT = threading.local()
 
+# V39 safe-current-patch: ağır periyodik kontroller varsayılan kapalı.
+# Queue worker ayrı tutulur ve açık kalır; manuel endpoint/butonlar çalışmaya devam eder.
+ENABLE_BACKGROUND_CHECKS = os.getenv("ENABLE_BACKGROUND_CHECKS", "false").lower() == "true"
+
 
 def validate_environment():
     """Başlangıçta kritik ayarları kontrol eder; eksik olanları loglar.
@@ -2062,15 +2066,6 @@ def add_pending_order(
         save_state()
 
 
-def get_lzt_links() -> str:
-    return """
-LZT arama linkleri:
-
-1) 5 years medal:
-https://lzt.market/steam/?order_by=price_to_up&title=5%20years%20medal
-
-
-"""
 
 
 def get_nested(data: dict, *paths):
@@ -2157,6 +2152,20 @@ ITEMSATIS_NON_ORDER_EVENT_KEYWORDS = {
     "notification", "comment", "review", "question", "support",
     "ticket", "delivery_message", "order.message", "order_message",
 }
+
+
+def extract_customer_link(data: dict) -> str:
+    """Webhook event filtresinde link kanıtı aramak için güvenli alias.
+
+    Eski patch hattında is_itemsatis_purchase_event bu helper'ı çağırıyordu ama
+    fonksiyon tanımlı değildi. Event bilgisi olmayan webhooklarda NameError üretip
+    sipariş filtresini bozmasın diye find_order_link üzerinden tek noktaya bağlandı.
+    """
+    try:
+        return find_order_link(data)
+    except Exception as e:
+        log("warning", "extract_customer_link_failed", error=str(e)[:240])
+        return ""
 
 
 def is_itemsatis_purchase_event(data: dict) -> bool:
@@ -3352,6 +3361,42 @@ def record_balance_history(panel_key: str, balance_data: dict):
         log("warning", "balance_history_record_failed", error=str(e))
 
 
+def build_admin_balance_rows() -> list:
+    """Admin panel için canlı API çağrısı yapmadan son bilinen panel bakiyelerini hazırlar."""
+    rows = []
+    latest_by_panel = {}
+    try:
+        for day in sorted((BALANCE_HISTORY or {}).keys(), reverse=True):
+            day_items = BALANCE_HISTORY.get(day, {}) if isinstance(BALANCE_HISTORY, dict) else {}
+            if not isinstance(day_items, dict):
+                continue
+            for panel_key, item in day_items.items():
+                normalized = normalize_panel_key(panel_key)
+                if normalized and normalized not in latest_by_panel and isinstance(item, dict):
+                    latest_by_panel[normalized] = item
+    except Exception as e:
+        log("warning", "admin_balance_rows_build_failed", error=str(e))
+
+    for key, panel in PANEL_MAP.items():
+        panel_key = normalize_panel_key(key)
+        latest = latest_by_panel.get(panel_key, {})
+        has_env = bool(panel.get("api_url") and panel.get("api_key"))
+        balance_value = latest.get("balance_tl", "") if isinstance(latest, dict) else ""
+        if balance_value not in [None, ""]:
+            balance_text = format_tl_amount(balance_value)
+        else:
+            balance_text = "Henüz kontrol edilmedi"
+        rows.append({
+            "panel_key": panel_key,
+            "panel_name": panel.get("name", key),
+            "has_env": has_env,
+            "balance_text": balance_text,
+            "updated_at": latest.get("updated_at", "-") if isinstance(latest, dict) else "-",
+            "alert_disabled": is_low_balance_warning_disabled(panel_key, panel.get("name", key)),
+        })
+    return rows
+
+
 def record_link_audit(order_id: str, advert_id: str, product_name: str, platform: str, link: str, status: str, note: str = ""):
     """Webhook link yakalama geçmişi. Yanlış link olaylarını admin panelden izlemek için."""
     global LINK_AUDIT_HISTORY
@@ -4167,17 +4212,18 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
     - BALANCE_WARN_THRESHOLD_TL env değeri tanımlı.
     - Aynı düşük bakiye uyarısını repeat_minutes aralığıyla tekrarlar.
     - Bakiye eşik üstüne çıkınca alarm hafızasını temizler.
+    - Panel bildirimi kapalıysa hata üretmeden sessizce geçer.
     """
     panel_key = normalize_panel_key(panel_key or panel_name or "")
-    if is_low_balance_warning_disabled(panel_key, panel_name):
-        log("info", "low_balance_warning_disabled", panel=panel_name or panel_key, balance_tl=balance_tl)
-        return False
-
     repeat_minutes = get_low_balance_repeat_minutes(panel_key, panel_name)
     try:
         balance_tl = convert_balance_to_try(balance, currency)
         if balance_tl is None:
             log("warning", "balance_parse_failed", panel=panel_name, balance=balance, currency=currency)
+            return False
+
+        if is_low_balance_warning_disabled(panel_key, panel_name):
+            log("info", "low_balance_warning_disabled", panel=panel_name or panel_key, balance_tl=round(balance_tl, 2))
             return False
 
         key = normalize_panel_key(panel_key or panel_name)
@@ -4271,19 +4317,21 @@ async def periodic_runner(name: str, interval_seconds: int, func, initial_delay:
 async def startup_event():
     validate_environment()
 
-    task_specs = {
-        "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
-        "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
-        "background_check_balances": (CHECK_BALANCE_INTERVAL_SECONDS, check_all_panel_balances, 20),
-    }
+    if ENABLE_BACKGROUND_CHECKS:
+        task_specs = {
+            "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
+            "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
+            "background_check_balances": (CHECK_BALANCE_INTERVAL_SECONDS, check_all_panel_balances, 20),
+        }
 
-    for name, (interval, func, delay) in task_specs.items():
-        existing = _BACKGROUND_TASKS.get(name)
-        if existing and not existing.done():
-            log("info", "background_task_already_running", task=name)
-            continue
-        _BACKGROUND_TASKS[name] = asyncio.create_task(periodic_runner(name, interval, func, delay))
-
+        for name, (interval, func, delay) in task_specs.items():
+            existing = _BACKGROUND_TASKS.get(name)
+            if existing and not existing.done():
+                log("info", "background_task_already_running", task=name)
+                continue
+            _BACKGROUND_TASKS[name] = asyncio.create_task(periodic_runner(name, interval, func, delay))
+    else:
+        log("info", "background_periodic_checks_disabled", mode="v39_safe_current_patch")
 
     existing_queue_worker = _BACKGROUND_TASKS.get("itemsatis_queue_worker")
     if existing_queue_worker and not existing_queue_worker.done():
@@ -5291,6 +5339,42 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
   </form>
 </div>
 
+<div class="notice">
+  Panel bakiyeleri admin sayfası açılırken canlı API ile çekilmez; burada son bilinen değer gösterilir. Güncel değer için manuel olarak <b>Bakiyeleri Güncelle</b> butonuna bas.
+</div>
+<div class="toolbar" style="margin-top:12px;">
+  <form method="post" action="/admin/refresh-balances" style="display:inline;">
+    <button class="green" type="submit">Bakiyeleri Güncelle</button>
+  </form>
+  <a href="/check-balances"><button type="button">JSON Bakiye Kontrol</button></a>
+</div>
+<div class="table-wrap" style="margin:14px 0 18px;">
+<table>
+<thead><tr><th>Panel</th><th>Son Bilinen Bakiye</th><th>Son Kontrol</th><th>Env Durumu</th><th>Düşük Bakiye Bildirimi</th><th>İşlem</th></tr></thead>
+<tbody>
+{% for row in balance_rows %}
+<tr>
+<td>{{ row.panel_name|e }} <span class="muted">({{ row.panel_key|e }})</span></td>
+<td>{{ row.balance_text|e }}</td>
+<td>{{ row.updated_at|e }}</td>
+<td><span class="badge {{ 'active' if row.has_env else 'passive' }}">{{ 'Hazır' if row.has_env else 'Eksik env' }}</span></td>
+<td><span class="badge {{ 'passive' if row.alert_disabled else 'active' }}">{{ 'Kapalı' if row.alert_disabled else 'Açık' }}</span></td>
+<td class="actions">
+  <form method="post" action="/admin/low-balance-toggle">
+    <input type="hidden" name="panel" value="{{ row.panel_key|e }}">
+    {% if row.alert_disabled %}
+      <input type="hidden" name="disabled" value="false"><button class="green" type="submit">Bildirimi Aç</button>
+    {% else %}
+      <input type="hidden" name="disabled" value="true"><button class="toggle" type="submit">Bildirimi Kapat</button>
+    {% endif %}
+  </form>
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
 <form class="grid" method="post" action="/admin/add-service">
   <input name="advert_id" placeholder="Itemsatış İlan ID" pattern="^\\d+$" title="Sadece rakam giriniz" required maxlength="20" oninvalid="this.setCustomValidity('Lütfen geçerli bir İlan ID giriniz. Sadece rakam olmalı.')" oninput="setCustomValidity('')">
   <select name="panel" required>
@@ -5414,6 +5498,13 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 
 
 
+@app.post("/admin/refresh-balances")
+def admin_refresh_balances(user: str = Depends(get_current_admin)):
+    """Admin manuel bakiye yenileme. Sayfa açılışında değil, sadece butonla canlı API çağırır."""
+    check_all_panel_balances(force_alert=False)
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/low-balance-toggle")
 def admin_low_balance_toggle(panel: str = Form(...), disabled: str = Form("true"), user: str = Depends(get_current_admin)):
     """Panel bazlı düşük bakiye uyarısını aç/kapatır."""
@@ -5449,7 +5540,7 @@ def admin_panel(user: str = Depends(get_current_admin)):
             "active": bool(raw_service.get("active", True)),
             "source": raw_service.get("source", "code"),
         }
-    html = template.render(services=services, panels=PANEL_MAP)
+    html = template.render(services=services, panels=PANEL_MAP, balance_rows=build_admin_balance_rows())
     return HTMLResponse(content=html)
 
 
