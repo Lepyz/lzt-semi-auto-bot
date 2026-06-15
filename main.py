@@ -193,7 +193,10 @@ HEADERS = {
 }
 
 FAILED_PANEL_STATUSES = {"cancelled", "canceled", "partial", "fail", "failed", "refunded"}
-COMPLETED_PANEL_STATUSES = {"completed", "complete", "tamamlandı"}
+COMPLETED_PANEL_STATUSES = {
+    "completed", "complete", "completed successfully", "success", "successful",
+    "finished", "done", "tamamlandı", "tamamlandi", "başarılı", "basarili",
+}
 SLOW_API_THRESHOLD_SECONDS = float(os.getenv("SLOW_API_THRESHOLD_SECONDS", "8"))
 PANEL_SAFE_RETRY_COUNT = int(os.getenv("PANEL_SAFE_RETRY_COUNT", "2"))
 PANEL_RETRY_SLEEP_SECONDS = float(os.getenv("PANEL_RETRY_SLEEP_SECONDS", "1"))
@@ -231,6 +234,13 @@ _ADMIN_BACKGROUND_JOBS = {}
 _ADMIN_BACKGROUND_LOCK = threading.Lock()
 PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "1000"))
 PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "1000"))
+STATE_LAST_HASH = ""
+STATE_LAST_SAVE_FAIL_LOG = 0
+CACHE_STATE_LAST_HASH = ""
+CACHE_STATE_LAST_SAVE_FAIL_LOG = 0
+CACHE_STATE_DIRTY = False
+DASHBOARD_OPS_CACHE_SECONDS = int(os.getenv("DASHBOARD_OPS_CACHE_SECONDS", "10"))
+_DASHBOARD_OPS_CACHE = {"ts": 0.0, "data": None}
 REDIS_ERROR_BACKOFF_SECONDS = int(os.getenv("REDIS_ERROR_BACKOFF_SECONDS", "60"))
 _REDIS_BACKOFF_UNTIL = 0
 _REDIS_BACKOFF_REASON = ""
@@ -255,6 +265,9 @@ QUEUE_CONTEXT = threading.local()
 # V39 safe-current-patch: ağır periyodik kontroller varsayılan kapalı.
 # Queue worker ayrı tutulur ve açık kalır; manuel endpoint/butonlar çalışmaya devam eder.
 ENABLE_BACKGROUND_CHECKS = os.getenv("ENABLE_BACKGROUND_CHECKS", "false").lower() == "true"
+# Pending siparişlerin tamamlanmasını yakalamak için sadece status polling açık kalır.
+# Ağır servis/bakiye kontrolleri ENABLE_BACKGROUND_CHECKS arkasında kalmaya devam eder.
+ORDER_STATUS_CHECKS_ENABLED = os.getenv("ORDER_STATUS_CHECKS_ENABLED", "true").lower() == "true"
 PENDING_AGE_ALERT_SECONDS = int(os.getenv("PENDING_AGE_ALERT_SECONDS", "7200"))
 PENDING_AGE_ALERT_REPEAT_SECONDS = int(os.getenv("PENDING_AGE_ALERT_REPEAT_SECONDS", "21600"))
 
@@ -360,6 +373,15 @@ def is_webhook_authorized(request: Request) -> bool:
 
 def now_tr():
     return datetime.now(TR_TIMEZONE)
+
+
+def invalidate_dashboard_ops_cache():
+    """Dashboard operasyon cache'ini temizler; pending/failed değişince admin panel hızlı güncellenir."""
+    global _DASHBOARD_OPS_CACHE
+    try:
+        _DASHBOARD_OPS_CACHE = {"ts": 0.0, "data": None}
+    except Exception:
+        pass
 
 
 # ─── YENİ: GELİŞMİŞ LOGLAMA ──────────────────────────────────────────────────
@@ -1125,9 +1147,58 @@ def get_runtime_service_for_pending(item: dict) -> dict:
         service["api_url"] = (item or {}).get("api_url", "")
     return service
 
+def build_cache_state_payload() -> dict:
+    return {
+        "service_price_cache": SERVICE_PRICE_CACHE,
+        "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
+    }
+
+
+def _cache_state_hash() -> str:
+    try:
+        payload = json.dumps(build_cache_state_payload(), ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+    except Exception:
+        return ""
+
+
+def mark_cache_state_dirty():
+    global CACHE_STATE_DIRTY
+    CACHE_STATE_DIRTY = True
+
+
+def save_cache_state(force: bool = False):
+    """Fiyat/servis adı cache'lerini kritik state'ten ayrı ve seyrek kaydeder.
+    Botun çalışması için kritik olmayan bu cache'ler normal save_state MSET'ini
+    büyütmez; sadece gerçekten değiştiğinde aynı Redis key'lerine yazılır.
+    """
+    global CACHE_STATE_LAST_HASH, CACHE_STATE_LAST_SAVE_FAIL_LOG, CACHE_STATE_DIRTY
+    with STATE_LOCK:
+        current_hash = _cache_state_hash()
+        if not force and not CACHE_STATE_DIRTY and current_hash == CACHE_STATE_LAST_HASH:
+            return
+        if current_hash and current_hash == CACHE_STATE_LAST_HASH:
+            CACHE_STATE_DIRTY = False
+            return
+
+        result = redis_mset_json(build_cache_state_payload())
+        if result is None:
+            now_ts = int(time.time())
+            if now_ts - int(CACHE_STATE_LAST_SAVE_FAIL_LOG or 0) >= 60:
+                CACHE_STATE_LAST_SAVE_FAIL_LOG = now_ts
+                log("warning", "redis_cache_mset_skipped_or_failed")
+            return
+
+        if current_hash:
+            CACHE_STATE_LAST_HASH = current_hash
+        CACHE_STATE_DIRTY = False
+        invalidate_dashboard_ops_cache()
+
+
 def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global SERVICE_PRICE_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, MESSAGE_TEMPLATES, LOW_BALANCE_DISABLED_PANELS
+    global CACHE_STATE_LAST_HASH, CACHE_STATE_DIRTY
 
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
@@ -1140,15 +1211,18 @@ def load_state():
     PACKAGE_CONFIGS = redis_get_json("package_configs", {})
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
     LOW_BALANCE_DISABLED_PANELS = set(redis_get_json("low_balance_disabled_panels", list(LOW_BALANCE_DISABLED_PANELS)))
+    CACHE_STATE_LAST_HASH = _cache_state_hash()
+    CACHE_STATE_DIRTY = False
     trim_processed_memory()
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
 
 
 def save_state():
-    """State verilerini tek Redis MSET isteğiyle kaydeder.
-    Eski tek tek SET sistemine göre daha hızlıdır ve yarım kayıt riskini azaltır.
+    """Kritik state'i sadece değiştiğinde Redis'e yazar.
+    Aynı veri tekrar gelirse MSET atılmaz; bu Upstash request tüketimini azaltır.
     """
+    global STATE_LAST_HASH, STATE_LAST_SAVE_FAIL_LOG
     with STATE_LOCK:
         sanitize_pending_orders_for_storage()
         trim_processed_memory()
@@ -1158,17 +1232,32 @@ def save_state():
             "processed_links": list(PROCESSED_LINKS),
             "failed_orders": FAILED_ORDERS,
             "pending_orders": PENDING_ORDERS,
-            "service_price_cache": SERVICE_PRICE_CACHE,
-            "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
             "dynamic_services": DYNAMIC_SERVICES,
             "package_configs": PACKAGE_CONFIGS,
             "message_templates": MESSAGE_TEMPLATES,
             "low_balance_disabled_panels": sorted(LOW_BALANCE_DISABLED_PANELS),
         }
 
+        try:
+            payload = json.dumps(data_to_save, ensure_ascii=False, sort_keys=True, default=str)
+            current_hash = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            current_hash = ""
+
+        if current_hash and current_hash == STATE_LAST_HASH:
+            return
+
         result = redis_mset_json(data_to_save)
         if result is None:
-            log("warning", "redis_mset_skipped_or_failed")
+            now_ts = int(time.time())
+            if now_ts - int(STATE_LAST_SAVE_FAIL_LOG or 0) >= 60:
+                STATE_LAST_SAVE_FAIL_LOG = now_ts
+                log("warning", "redis_mset_skipped_or_failed")
+            return
+
+        if current_hash:
+            STATE_LAST_HASH = current_hash
+        invalidate_dashboard_ops_cache()
 
 
 
@@ -1325,6 +1414,99 @@ def get_smm_order_id_from_result(result: dict) -> str:
         if is_valid_smm_order_id(value):
             return str(value).strip()
     return ""
+
+
+def is_manual_itemsatis_order_id(order_id: str = "") -> bool:
+    return str(order_id or "").strip().lower().startswith("manual-")
+
+
+def normalize_panel_status_text(value) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    tr_map = str.maketrans({
+        "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
+        "ü": "u", "Ü": "u", "ö": "o", "Ö": "o", "ç": "c", "Ç": "c",
+    })
+    text = text.translate(tr_map)
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return text
+
+
+def extract_panel_status(status_data: dict) -> str:
+    """Panel status cevabını toleranslı okur.
+    Farklı paneller status değerini root/result/data/order/response veya
+    orders[0] gibi farklı seviyelerde döndürebiliyor. Tamamlandı/failed
+    kararını sadece güvenilir status/state/order_status alanlarından verir.
+    """
+    status_keys = (
+        "status", "Status",
+        "state", "State",
+        "order_status", "OrderStatus",
+        "orderStatus", "order_state", "orderState",
+    )
+
+    def _read_direct(obj):
+        if not isinstance(obj, dict):
+            return ""
+        for key in status_keys:
+            value = obj.get(key)
+            if value not in [None, ""]:
+                normalized = normalize_panel_status_text(value)
+                if normalized:
+                    return normalized
+        return ""
+
+    if not isinstance(status_data, dict):
+        return ""
+
+    # Önce root seviyesini kontrol et.
+    direct = _read_direct(status_data)
+    if direct:
+        return direct
+
+    # Sonra sık kullanılan nested cevap formatları.
+    for container_key in ("result", "data", "order", "response"):
+        nested = status_data.get(container_key)
+        if isinstance(nested, dict):
+            found = _read_direct(nested)
+            if found:
+                return found
+        elif isinstance(nested, list) and nested:
+            for item in nested[:3]:
+                found = _read_direct(item)
+                if found:
+                    return found
+
+    # Bazı paneller orders: [{status: ...}] döndürür.
+    orders = status_data.get("orders") or status_data.get("Orders")
+    if isinstance(orders, list) and orders:
+        for item in orders[:3]:
+            found = _read_direct(item)
+            if found:
+                return found
+    elif isinstance(orders, dict):
+        found = _read_direct(orders)
+        if found:
+            return found
+
+    return ""
+
+
+def is_completed_panel_status(status_data: dict) -> bool:
+    status = extract_panel_status(status_data)
+    if not status:
+        return False
+    normalized_completed = {normalize_panel_status_text(v) for v in COMPLETED_PANEL_STATUSES}
+    return status in normalized_completed or any(word in status for word in ["completed", "complete", "success", "successful", "finished", "done", "tamamlandi", "basarili"])
+
+
+def is_failed_panel_status(status_data: dict) -> bool:
+    status = extract_panel_status(status_data)
+    if not status:
+        return False
+    normalized_failed = {normalize_panel_status_text(v) for v in FAILED_PANEL_STATUSES}
+    return status in normalized_failed or any(word in status for word in ["cancelled", "canceled", "partial", "failed", "fail", "refunded", "refund", "iptal"])
 
 
 def build_finance_summary(price_tl: float, cost_tl: float | None = None) -> str:
@@ -1875,6 +2057,83 @@ def build_service_health_summary(limit: int = 20) -> dict:
     }
 
 
+def pending_age_seconds(item: dict, now_ts: int | None = None) -> int:
+    try:
+        now_ts = int(now_ts or time.time())
+        created_at = int((item or {}).get("created_at", 0) or 0)
+        if not created_at:
+            return 0
+        return max(0, now_ts - created_at)
+    except Exception:
+        return 0
+
+
+def is_stale_pending_order(item: dict, now_ts: int | None = None) -> bool:
+    if not isinstance(item, dict) or item.get("cancelled"):
+        return False
+    threshold = max(300, int(PENDING_AGE_ALERT_SECONDS))
+    return pending_age_seconds(item, now_ts) >= threshold
+
+
+def enrich_pending_order_for_display(item: dict, now_ts: int | None = None) -> dict:
+    clean = sanitize_pending_order(item)
+    now_ts = int(now_ts or time.time())
+    age_seconds = pending_age_seconds(clean, now_ts)
+    clean["age_seconds"] = age_seconds
+    clean["age_minutes"] = int(age_seconds / 60) if age_seconds else 0
+    clean["stale"] = is_stale_pending_order(clean, now_ts)
+    clean["stale_threshold_seconds"] = max(300, int(PENDING_AGE_ALERT_SECONDS))
+    return clean
+
+
+def build_pending_admin_rows(now_ts: int | None = None) -> list[dict]:
+    now_ts = int(now_ts or time.time())
+    rows = [enrich_pending_order_for_display(item, now_ts) for item in PENDING_ORDERS if isinstance(item, dict)]
+    rows.sort(key=lambda item: (bool(item.get("cancelled")), -int(item.get("age_seconds", 0) or 0)))
+    return rows
+
+
+def find_pending_order_index(smm_order_id: str = "", itemsatis_order_id: str = "") -> int:
+    target_smm = str(smm_order_id or "").strip()
+    target_itemsatis = str(itemsatis_order_id or "").strip()
+    for index, item in enumerate(PENDING_ORDERS):
+        if not isinstance(item, dict):
+            continue
+        if target_smm and str(item.get("smm_order_id", "")).strip() == target_smm:
+            return index
+        if target_itemsatis and str(item.get("itemsatis_order_id", "")).strip() == target_itemsatis:
+            return index
+    return -1
+
+
+def remove_pending_order_by_smm_id(smm_order_id: str, action: str, admin_note: str = "") -> tuple[bool, dict]:
+    """Admin onaylı pending temizleme. Panelde işlem yapmaz, yeni sipariş açmaz."""
+    target_smm = str(smm_order_id or "").strip()
+    if not target_smm:
+        return False, {}
+
+    with STATE_LOCK:
+        index = find_pending_order_index(smm_order_id=target_smm)
+        if index < 0 or index >= len(PENDING_ORDERS):
+            return False, {}
+        item = dict(PENDING_ORDERS.pop(index) or {})
+        item["admin_pending_action"] = str(action or "removed")
+        item["admin_pending_action_at"] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+        if admin_note:
+            item["admin_pending_note"] = str(admin_note)[:300]
+        save_state()
+
+    log(
+        "warning" if action != "manual_completed" else "success",
+        "pending_order_removed_by_admin",
+        action=action,
+        smm_order_id=target_smm,
+        itemsatis_order_id=item.get("itemsatis_order_id", ""),
+        product=item.get("product_name", ""),
+    )
+    return True, item
+
+
 def build_pending_age_report(now_ts: int | None = None) -> dict:
     now_ts = int(now_ts or time.time())
     threshold = max(300, int(PENDING_AGE_ALERT_SECONDS))
@@ -1892,12 +2151,21 @@ def build_pending_age_report(now_ts: int | None = None) -> dict:
                 "smm_order_id": str(item.get("smm_order_id", "")),
                 "product_name": str(item.get("product_name", "")),
                 "panel": str(item.get("panel", "")),
+                "link": str(item.get("link", "")),
+                "created_at": created_at,
+                "age_seconds": age_seconds,
                 "age_minutes": int(age_seconds / 60),
+                "stale": True,
                 "alert_sent": bool(item.get("delay_alert_sent") or item.get("pending_age_alert_sent_at")),
             })
     rows.sort(key=lambda item: item.get("age_minutes", 0), reverse=True)
-    return {"threshold_seconds": threshold, "old_count": len(rows), "oldest": rows[:20]}
-
+    return {
+        "threshold_seconds": threshold,
+        "old_count": len(rows),
+        "delayed_count": len(rows),
+        "stale_count": len(rows),
+        "oldest": rows[:20],
+    }
 
 def build_failed_24h_report() -> dict:
     now_ts = int(time.time())
@@ -2924,7 +3192,9 @@ def cache_panel_service_name(panel_key: str, service_id: str, service_name: str)
         return
 
     cache_key = make_panel_service_cache_key(panel_key, service_id)
-    PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
+    if PANEL_SERVICE_NAME_CACHE.get(cache_key) != service_name:
+        PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
+        mark_cache_state_dirty()
 
 
 def get_cached_panel_service_name(panel_key: str, service_id: str) -> str:
@@ -3497,9 +3767,16 @@ def fetch_panel_service_rate(service: dict) -> dict:
             service_name = get_panel_service_display_name(service, item)
             rate_raw = str(item.get("rate", ""))
             if rate_raw:
-                SERVICE_PRICE_CACHE[f"{panel_key}:{service_id}"] = rate_raw
+                rate_key = f"{panel_key}:{service_id}"
+                missing_key = f"missing:{panel_key}:{service_id}"
+                old_rate = SERVICE_PRICE_CACHE.get(rate_key)
+                had_missing = missing_key in SERVICE_PRICE_CACHE
+                SERVICE_PRICE_CACHE[rate_key] = rate_raw
                 SERVICE_PRICE_CACHE[f"rate_checked_at:{panel_key}:{service_id}"] = int(time.time())
-                SERVICE_PRICE_CACHE.pop(f"missing:{panel_key}:{service_id}", None)
+                SERVICE_PRICE_CACHE.pop(missing_key, None)
+                if old_rate != rate_raw or had_missing:
+                    mark_cache_state_dirty()
+                    save_cache_state()
             return {"ok": True, "rate": rate_raw, "service_name": service_name, "raw": item}
 
     return {"ok": False, "error": "service_not_found"}
@@ -4502,9 +4779,20 @@ async def periodic_runner(name: str, interval_seconds: int, func, initial_delay:
 async def startup_event():
     validate_environment()
 
+    if ORDER_STATUS_CHECKS_ENABLED:
+        existing = _BACKGROUND_TASKS.get("background_check_orders")
+        if existing and not existing.done():
+            log("info", "background_task_already_running", task="background_check_orders")
+        else:
+            _BACKGROUND_TASKS["background_check_orders"] = asyncio.create_task(
+                periodic_runner("background_check_orders", int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45)
+            )
+            log("info", "background_order_status_checker_started")
+    else:
+        log("warning", "background_order_status_checker_disabled")
+
     if ENABLE_BACKGROUND_CHECKS:
         task_specs = {
-            "background_check_orders": (int(os.getenv("CHECK_ORDERS_INTERVAL_SECONDS", "300")), check_orders, 45),
             "background_check_services": (int(os.getenv("CHECK_SERVICES_INTERVAL_SECONDS", "300")), check_services, 90),
             "background_check_balances": (CHECK_BALANCE_INTERVAL_SECONDS, check_all_panel_balances, 20),
         }
@@ -4516,7 +4804,7 @@ async def startup_event():
                 continue
             _BACKGROUND_TASKS[name] = asyncio.create_task(periodic_runner(name, interval, func, delay))
     else:
-        log("info", "background_periodic_checks_disabled", mode="v39_safe_current_patch")
+        log("info", "background_heavy_periodic_checks_disabled", mode="order_status_only")
 
     existing_queue_worker = _BACKGROUND_TASKS.get("itemsatis_queue_worker")
     if existing_queue_worker and not existing_queue_worker.done():
@@ -5941,7 +6229,8 @@ def refresh_panel_service_names() -> dict:
             else:
                 missing += 1
 
-    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+    if updated:
+        save_cache_state()
     return {"checked": checked, "updated": updated, "missing": missing}
 
 
@@ -8088,6 +8377,10 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
   <label class="full">Servis adı / not (opsiyonel)
     <input name="product_name" placeholder="Boş bırakırsan paneldeki servis adı çekilir" maxlength="180">
   </label>
+  <label>Satış fiyatı TL (opsiyonel)
+    <input id="manualSalePrice" name="sale_price" inputmode="decimal" placeholder="Örn: 49.90">
+    <small>Boş bırakılırsa sadece panel maliyeti ve bakiye gösterilir.</small>
+  </label>
   <div class="notice full" id="manualCostBox">Panel maliyeti: Panel + servis ID + adet girince otomatik hesaplanır.</div>
   <button class="full" type="submit" onclick="return confirm('Bu sipariş seçilen dış panele gönderilecek. Devam edilsin mi?')">Siparişi Panele Gönder</button>
 </form>
@@ -8106,10 +8399,20 @@ async function updateManualCost(){
     const r=await fetch(`/api/service-cost?panel=${encodeURIComponent(panel)}&service_id=${encodeURIComponent(service)}&quantity=${encodeURIComponent(quantity)}`);
     const d=await r.json();
     if(!d.ok){box.textContent='Panel maliyeti hesaplanamadı: '+(d.error||'bilinmeyen hata');return;}
-    box.innerHTML=`Panel fiyatı: <b>${d.rate_tl}</b> / 1000 · Adet: <b>${d.quantity}</b> · Tahmini maliyet: <b>${d.cost_tl_text}</b>`;
+    const saleRaw=document.getElementById('manualSalePrice')?.value||'0';
+    const sale=parseFloat(String(saleRaw).replace(',','.'))||0;
+    const cost=parseFloat(d.cost_tl||0)||0;
+    let extra='';
+    if(sale>0 && cost>0){
+      const commission=sale*0.07;
+      const net=sale-commission-cost;
+      const margin=sale>0?(net/sale*100):0;
+      extra=` · Komisyon: <b>${commission.toFixed(2)} TL</b> · Net kâr: <b>${net.toFixed(2)} TL</b> · Marj: <b>%${margin.toFixed(1)}</b>`;
+    }
+    box.innerHTML=`Panel fiyatı: <b>${d.rate_tl}</b> / 1000 · Adet: <b>${d.quantity}</b> · Tahmini maliyet: <b>${d.cost_tl_text}</b>${extra}`;
   }catch(e){box.textContent='Panel maliyeti hesaplanamadı.';}
 }
-['manualPanel','manualServiceId','manualQuantity'].forEach(id=>{document.addEventListener('input',e=>{if(e.target&&e.target.id===id) updateManualCost();});document.addEventListener('change',e=>{if(e.target&&e.target.id===id) updateManualCost();});});
+['manualPanel','manualServiceId','manualQuantity','manualSalePrice'].forEach(id=>{document.addEventListener('input',e=>{if(e.target&&e.target.id===id) updateManualCost();});document.addEventListener('change',e=>{if(e.target&&e.target.id===id) updateManualCost();});});
 </script>
 
 <script>
@@ -8144,6 +8447,16 @@ def admin_manual_order_page(
     return HTMLResponse(content=template.render(panels=PANEL_MAP, message=message, error=error, favorites={}))
 
 
+def manual_order_redirect(message: str = "", error: str = ""):
+    params = {}
+    if message:
+        params["message"] = str(message)[:500]
+    if error:
+        params["error"] = str(error)[:500]
+    query = urlencode(params)
+    return RedirectResponse(f"/admin/manual-order?{query}" if query else "/admin/manual-order", status_code=303)
+
+
 @app.post("/admin/manual-order")
 def admin_manual_order_submit(
     panel: str = Form(...),
@@ -8152,28 +8465,44 @@ def admin_manual_order_submit(
     platform: str = Form("other"),
     link: str = Form(...),
     product_name: str = Form(""),
+    sale_price: str = Form("0"),
     user: str = Depends(get_current_admin),
 ):
     panel_key = normalize_panel_key(panel)
     panel_conf = get_panel_config(panel_key)
 
     if panel_key not in PANEL_MAP:
-        raise HTTPException(status_code=400, detail="Panel bulunamadı")
+        return manual_order_redirect(error="Panel bulunamadı")
     if not panel_conf.get("api_url") or not panel_conf.get("api_key"):
-        raise HTTPException(status_code=400, detail="Panel API URL veya API KEY eksik")
+        return manual_order_redirect(error="Panel API URL veya API KEY eksik")
 
     service_id = str(service_id or "").strip()
     if not service_id.isdigit():
-        raise HTTPException(status_code=400, detail="Panel servis ID sadece rakam olmalı")
+        return manual_order_redirect(error="Panel servis ID sadece rakam olmalı")
     if quantity <= 0 or quantity > 1000000:
-        raise HTTPException(status_code=400, detail="Adet 1 ile 1.000.000 arasında olmalı")
+        return manual_order_redirect(error="Adet 1 ile 1.000.000 arasında olmalı")
 
     raw_link = str(link or "").strip()
     if not raw_link:
-        raise HTTPException(status_code=400, detail="Link boş olamaz")
+        return manual_order_redirect(error="Link boş olamaz")
 
     platform = normalize_text(platform or "other") or "other"
     panel_link = normalize_panel_link(raw_link, platform)
+
+    active_pending = find_active_pending_by_link(panel_link, platform)
+    if active_pending:
+        return manual_order_redirect(
+            error=(
+                "Bu link için hâlâ pending sipariş var. "
+                f"Mevcut SMM ID: {active_pending.get('smm_order_id', '-')}"
+            )
+        )
+
+    try:
+        manual_sale_price = parse_numeric_balance(str(sale_price or "0").replace(",", ".")) or 0.0
+        manual_sale_price = max(0.0, float(manual_sale_price))
+    except Exception:
+        manual_sale_price = 0.0
 
     fetched_service_name = fetch_panel_service_name_by_id(panel_key, service_id)
     final_product_name = str(product_name or "").strip() or fetched_service_name or f"{panel_conf['name']} Servis {service_id}"
@@ -8184,16 +8513,23 @@ def admin_manual_order_submit(
         "api_key": panel_conf.get("api_key", ""),
         "service_id": service_id,
         "quantity": quantity,
+        "platform": platform,
     }
+
+    preflight = validate_service_order_preflight(manual_service, panel_link, "Manuel sipariş")
+    if not preflight.get("ok"):
+        return manual_order_redirect(error=preflight.get("detail") or preflight.get("reason") or "Manuel sipariş ön kontrol hatası")
+    panel_link = preflight.get("link") or panel_link
+
     balance_data = panel_balance(panel_conf["api_url"], panel_conf["api_key"], panel_conf.get("name", panel_key))
     if "error" in balance_data:
-        raise HTTPException(status_code=400, detail=f"Panel bakiyesi alınamadı: {balance_data.get('error')}")
+        return manual_order_redirect(error=f"Panel bakiyesi alınamadı: {balance_data.get('error')}")
+
     manual_cost = estimate_order_cost_from_service(manual_service)
     current_balance_tl = convert_balance_to_try(balance_data.get("balance"), balance_data.get("currency", ""))
     if current_balance_tl is not None and manual_cost is not None and current_balance_tl < manual_cost:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Panel bakiyesi yetersiz. Bakiye: {format_tl_amount(current_balance_tl)}, tahmini maliyet: {format_tl_amount(manual_cost)}",
+        return manual_order_redirect(
+            error=f"Panel bakiyesi yetersiz. Bakiye: {format_tl_amount(current_balance_tl)}, tahmini maliyet: {format_tl_amount(manual_cost)}"
         )
 
     smm_result = create_panel_order(
@@ -8207,14 +8543,14 @@ def admin_manual_order_submit(
 
     if "error" in smm_result:
         log("error", "manual_order_failed", panel=panel_key, service_id=service_id, error=smm_result.get("error"))
-        raise HTTPException(status_code=400, detail=f"Panel sipariş hatası: {smm_result.get('error')}")
+        return manual_order_redirect(error=f"Panel sipariş hatası: {smm_result.get('error')}")
 
     smm_order_id = get_smm_order_id_from_result(smm_result)
     if not smm_order_id:
         log("error", "manual_order_missing_smm_id", panel=panel_key, service_id=service_id, response=str(smm_result)[:500])
-        raise HTTPException(status_code=400, detail="Panel siparişi oluştu gibi görünüyor ama SMM order ID dönmedi. Panelden manuel kontrol et; bot pending'e eklemedi.")
+        return manual_order_redirect(error="Panel siparişi oluştu gibi görünüyor ama SMM order ID dönmedi. Panelden manuel kontrol et; bot pending'e eklemedi.")
 
-    manual_order_id = f"manual-{now_tr().strftime('%Y%m%d%H%M%S')}"
+    manual_order_id = f"manual-{now_tr().strftime('%Y%m%d%H%M%S')}-{str(smm_order_id)[-6:]}"
     manual_advert_id = f"manual-{panel_key}-{service_id}"
 
     add_pending_order(
@@ -8230,11 +8566,15 @@ def admin_manual_order_submit(
         quantity=quantity,
         platform=platform,
         panel_key=panel_key,
-        price=0,
+        price=manual_sale_price,
     )
 
+    balance_text = format_order_balance_line(current_balance_tl, manual_cost)
+    finance_text = build_finance_summary(manual_sale_price, manual_cost)
+    if manual_sale_price <= 0:
+        finance_text += "\nNot: Manuel satış fiyatı girilmediği için net kâr hesaplanamadı."
+
     log("success", "manual_order_created", panel=panel_key, service_id=service_id, smm_order_id=smm_order_id)
-    manual_cost = estimate_order_cost_from_service(manual_service)
     send_telegram(
         f"Manuel SMM siparişi panele girildi.\n\n"
         f"Ürün: {final_product_name}\n"
@@ -8242,13 +8582,13 @@ def admin_manual_order_submit(
         f"Servis ID: {service_id}\n"
         f"SMM ID: {smm_order_id}\n"
         f"Adet: {quantity}\n"
-        f"Link: {panel_link}\n"
-        f"\n"
-        f"{build_finance_summary(0, manual_cost)}"
+        f"Link: {panel_link}\n\n"
+        f"{balance_text}\n\n"
+        f"{finance_text}"
     )
 
     msg = f"Sipariş panele girildi. SMM ID: {smm_order_id}"
-    return RedirectResponse(f"/admin/manual-order?message={msg}", status_code=303)
+    return manual_order_redirect(message=msg)
 
 
 ADMIN_PENDING_HTML = """
@@ -9191,7 +9531,7 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
 <body>
 <div class="container">
 <h1>Bekleyen Siparişler</h1>
-<div class="muted">Buradaki iptal işlemi panelde gerçek iptal yapmaz; sadece bot takip listesinde iptal işaretler.</div>
+<div class="muted">Bu ekran sadece bot takip listesini yönetir. Butonlar panelde gerçek iptal/tamamlandı işlemi yapmaz ve yeni sipariş açmaz.</div>
 <p><a href="/admin">← Admin Paneline Dön</a></p>
 <table>
 <thead>
@@ -9199,20 +9539,36 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
 </thead>
 <tbody>
 {% for order in pending_orders %}
-<tr>
-<td>{{ order.product_name|e }}</td>
+<tr {% if order.stale %}style="background:rgba(239,68,68,.08);"{% endif %}>
+<td>{{ order.product_name|e }}<br><span style="color:#8a8fa3;font-size:12px;">{{ order.itemsatis_order_id|e }}</span></td>
 <td>{{ order.smm_order_id|e }}</td>
 <td><a href="{{ order.link|e }}" target="_blank">Link</a></td>
 <td>{{ order.panel|e }}</td>
-<td>{{ ((now_ts - order.created_at) // 60) }} dk</td>
-<td>{% if order.cancelled %}<span class="badge cancelled">İptal İşaretli</span>{% else %}<span class="badge active">Aktif</span>{% endif %}</td>
+<td>{{ order.age_minutes }} dk</td>
 <td>
+  {% if order.cancelled %}
+    <span class="badge cancelled">İptal İşaretli</span>
+  {% elif order.stale %}
+    <span class="badge cancelled">Gecikmiş</span>
+  {% else %}
+    <span class="badge active">Aktif</span>
+  {% endif %}
+</td>
+<td style="min-width:220px;">
+<form method="post" action="/admin/pending-orders/mark-completed" onsubmit="return confirm('Bu sipariş panelde tamamlandı mı? Bot sadece pending listesinden kaldıracak. Devam edilsin mi?')">
+<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id|e }}">
+<button type="submit">Tamamlandı Say</button>
+</form>
+<form method="post" action="/admin/pending-orders/remove-cancelled" onsubmit="return confirm('Bu sipariş iptal/geri iade edildi olarak pending listesinden kaldırılacak. Panelde işlem yapılmaz. Devam edilsin mi?')">
+<input type="hidden" name="smm_order_id" value="{{ order.smm_order_id|e }}">
+<button class="delete" type="submit">İptal Olarak Kaldır</button>
+</form>
 {% if not order.cancelled %}
 <form method="post" action="/admin/cancel-order" onsubmit="return confirm('Bu sipariş sadece bot takip listesinde iptal işaretlenecek. Devam edilsin mi?')">
 <input type="hidden" name="smm_order_id" value="{{ order.smm_order_id|e }}">
-<button class="delete" type="submit">İptal İşaretle</button>
+<button class="delete" type="submit">Sadece İptal İşaretle</button>
 </form>
-{% else %}-{% endif %}
+{% endif %}
 </td>
 </tr>
 {% else %}
@@ -9247,8 +9603,43 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
 @app.get("/admin/pending-orders", response_class=HTMLResponse)
 def admin_pending_orders(user: str = Depends(get_current_admin)):
     template = Template(ADMIN_PENDING_HTML)
-    html = template.render(pending_orders=PENDING_ORDERS, now_ts=int(time.time()))
+    now_ts = int(time.time())
+    html = template.render(pending_orders=build_pending_admin_rows(now_ts), now_ts=now_ts)
     return HTMLResponse(content=html)
+
+
+@app.post("/admin/pending-orders/mark-completed")
+def admin_pending_mark_completed(smm_order_id: str = Form(...), user: str = Depends(get_current_admin)):
+    removed, item = remove_pending_order_by_smm_id(smm_order_id, "manual_completed", "Admin pending ekranından tamamlandı sayıldı")
+    if not removed:
+        raise HTTPException(status_code=404, detail="Pending sipariş bulunamadı")
+    send_telegram(
+        f"Pending sipariş admin tarafından tamamlandı sayıldı.\n\n"
+        f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
+        f"Panel: {item.get('panel', 'Bilinmiyor')}\n"
+        f"Itemsatış/Manuel ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\n"
+        f"SMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
+        f"Link: {item.get('link', '')}\n\n"
+        f"Not: Panelde işlem yapılmadı, yeni sipariş açılmadı. Sadece bot pending listesinden kaldırıldı."
+    )
+    return RedirectResponse("/admin/pending-orders", status_code=303)
+
+
+@app.post("/admin/pending-orders/remove-cancelled")
+def admin_pending_remove_cancelled(smm_order_id: str = Form(...), user: str = Depends(get_current_admin)):
+    removed, item = remove_pending_order_by_smm_id(smm_order_id, "cancelled_removed", "Admin pending ekranından iptal/geri iade olarak kaldırıldı")
+    if not removed:
+        raise HTTPException(status_code=404, detail="Pending sipariş bulunamadı")
+    send_telegram(
+        f"Pending sipariş admin tarafından iptal/geri iade olarak kaldırıldı.\n\n"
+        f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
+        f"Panel: {item.get('panel', 'Bilinmiyor')}\n"
+        f"Itemsatış/Manuel ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\n"
+        f"SMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
+        f"Link: {item.get('link', '')}\n\n"
+        f"Not: Panelde işlem yapılmadı, yeni sipariş açılmadı. Sadece bot pending listesinden kaldırıldı."
+    )
+    return RedirectResponse("/admin/pending-orders", status_code=303)
 
 
 @app.post("/admin/cancel-order")
@@ -10541,7 +10932,7 @@ async function loadLocalOps(){
     document.getElementById('linkRows').innerHTML=links.join('');
 
     const pending=(d.latest.pending||[]);
-    document.getElementById('pendingRows').innerHTML=pending.length?pending.map(o=>'<div class="row"><div><b>'+esc(o.product_name||'Sipariş')+'</b><div class="muted small">'+esc(o.link||'')+' · '+esc(o.panel||'')+' #'+esc(o.smm_order_id||'')+'</div></div><span class="pill info">'+minsAgo(o.created_at)+'</span></div>').join(''):'<div class="muted">Bekleyen sipariş yok.</div>';
+    document.getElementById('pendingRows').innerHTML=pending.length?pending.map(o=>'<div class="row"><div><b>'+esc(o.product_name||'Sipariş')+'</b><div class="muted small">'+esc(o.link||'')+' · '+esc(o.panel||'')+' #'+esc(o.smm_order_id||'')+'</div></div><span class="pill '+(o.stale?'bad':'info')+'">'+(o.stale?'gecikmiş · ':'')+minsAgo(o.created_at)+'</span></div>').join(''):'<div class="muted">Bekleyen sipariş yok.</div>';
     const failed=(d.latest.failed||[]);
     document.getElementById('failedRows').innerHTML=failed.length?failed.map(o=>'<div class="row"><div><b>'+esc(o.product_name||'Sipariş')+'</b><div class="muted small">'+esc(o.reason||'')+' · '+esc(o.detail||'')+'</div></div><span class="pill bad">failed</span></div>').join(''):'<div class="muted">Başarısız sipariş yok.</div>';
 
@@ -10591,9 +10982,8 @@ def admin_system_check_redirect(user: str = Depends(get_current_admin)):
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 
-@app.get("/api/dashboard-ops")
-def api_dashboard_ops(user: str = Depends(get_current_admin)):
-    """Dashboard için hafif, Redis'e yeni history/stat yazmayan operasyon özeti."""
+def build_dashboard_ops_payload():
+    """Dashboard için hafif, Redis'e yeni history/stat yazmayan operasyon özeti üretir."""
     services_all = get_all_services(include_inactive=True)
     services_active = get_all_services(include_inactive=False)
     packages_active = get_package_configs(include_inactive=False)
@@ -10681,11 +11071,35 @@ def api_dashboard_ops(user: str = Depends(get_current_admin)):
             "sample": link_samples,
         },
         "latest": {
-            "pending": [sanitize_pending_order(item) for item in PENDING_ORDERS[-8:]][::-1],
+            "pending": [enrich_pending_order_for_display(item) for item in PENDING_ORDERS[-8:]][::-1],
             "failed": [normalize_failed_order(item) for item in FAILED_ORDERS[-8:] if isinstance(item, dict)][::-1],
             "logs": list(LOG_HISTORY)[-max(1, int(API_LOG_LIMIT)):],
         },
     }
+
+
+@app.get("/api/dashboard-ops")
+def api_dashboard_ops(user: str = Depends(get_current_admin)):
+    """Dashboard verisini kısa süre RAM cache ile döndürür; admin panel açıkken Redis/panel yükünü azaltır."""
+    global _DASHBOARD_OPS_CACHE
+    now_ts = time.time()
+    try:
+        cached = _DASHBOARD_OPS_CACHE.get("data")
+        cached_ts = float(_DASHBOARD_OPS_CACHE.get("ts", 0) or 0)
+        if cached and (now_ts - cached_ts) < max(1, int(DASHBOARD_OPS_CACHE_SECONDS)):
+            data = dict(cached)
+            data["cached"] = True
+            data["cache_age_seconds"] = round(now_ts - cached_ts, 2)
+            return data
+    except Exception:
+        pass
+
+    data = build_dashboard_ops_payload()
+    try:
+        _DASHBOARD_OPS_CACHE = {"ts": now_ts, "data": data}
+    except Exception:
+        pass
+    return data
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -10700,7 +11114,7 @@ def api_stats(user: str = Depends(get_current_admin)):
 
 @app.get("/api/pending")
 def api_pending(user: str = Depends(get_current_admin)):
-    return {"orders": [sanitize_pending_order(item) for item in PENDING_ORDERS]}
+    return {"orders": [enrich_pending_order_for_display(item) for item in PENDING_ORDERS]}
 
 
 @app.get("/api/failed")
@@ -12712,14 +13126,23 @@ def check_orders_head():
 
 @app.get("/check-orders")
 def check_orders():
-    completed_indexes = []
+    """Pending siparişlerin panel durumunu kontrol eder.
+    Tamamlanan/iptal olan/hatalı siparişler pending listesinden çıkarılır.
+    Bu fonksiyon hafif status polling içindir; yeni sipariş/retry açmaz.
+    """
+    completed_indexes = set()
     changed = False
     failed_count = 0
     pending_age = check_pending_order_age_alerts()
 
-    for index, item in enumerate(PENDING_ORDERS):
+    for index, item in list(enumerate(PENDING_ORDERS)):
+        if not isinstance(item, dict):
+            completed_indexes.add(index)
+            changed = True
+            continue
+
         if item.get("cancelled"):
-            completed_indexes.append(index)
+            completed_indexes.add(index)
             changed = True
             continue
 
@@ -12741,11 +13164,11 @@ def check_orders():
             )
             continue
 
-        status = str(status_data.get("status", "")).lower().strip()
+        status = extract_panel_status(status_data)
         created_at = int(item.get("created_at", 0) or 0)
         delay_alert_sent = bool(item.get("delay_alert_sent", False))
 
-        if status in FAILED_PANEL_STATUSES:
+        if is_failed_panel_status(status_data):
             failed_count += 1
             log(
                 "warning",
@@ -12759,7 +13182,7 @@ def check_orders():
                 item.get("itemsatis_order_id", "Bilinmiyor"),
                 item.get("advert_id", ""),
                 item.get("product_name", "Bilinmeyen Ürün"),
-                f"Panel durumu: {status}",
+                f"Panel durumu: {status or status_data.get('status', '-')}",
                 detail=json.dumps(status_data, ensure_ascii=False)[:500],
                 smm_order_id=item.get("smm_order_id", ""),
                 link=item.get("link", ""),
@@ -12776,11 +13199,35 @@ def check_orders():
                 f"Panel: {item.get('panel', 'Bilinmiyor')}\n"
                 f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\n"
                 f"SMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
-                f"Durum: {status}\n"
+                f"Durum: {status or status_data.get('status', '-')}\n"
                 f"Link: {item.get('link', '')}\n\n"
                 f"Admin panelden kontrol et. Otomatik tekrar sipariş verilmedi."
             )
-            completed_indexes.append(index)
+            completed_indexes.add(index)
+            changed = True
+            continue
+
+        if is_completed_panel_status(status_data):
+            log("success", "order_completed", smm_order_id=item.get("smm_order_id"), product=item.get("product_name"), status=status)
+            duration_minutes = int((time.time() - int(item.get("created_at", time.time()) or time.time())) / 60)
+            manual_order = is_manual_itemsatis_order_id(item.get("itemsatis_order_id", ""))
+            completed_text = (
+                f"SMM siparişi tamamlandı.\n\n"
+                f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
+                f"Panel: {item.get('panel', 'Bilinmiyor')}\n"
+                f"{'Manuel ID' if manual_order else 'Itemsatış ID'}: {item.get('itemsatis_order_id', 'Bilinmiyor')}\n"
+                f"SMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
+                f"Durum: {status or status_data.get('status', '-')}\n"
+                f"Link: {item.get('link', '')}\n\n"
+                f"Tamamlanma süresi: {format_duration_minutes(duration_minutes)}"
+            )
+            if not manual_order:
+                notify_customer_order_completed(item.get("itemsatis_order_id", ""), item.get("product_name", ""), item.get("link", ""))
+                completed_text += "\nMüşteriye değerlendirme mesajı gönderildi."
+            else:
+                completed_text += "\nManuel sipariş olduğu için müşteriye Itemsatış mesajı gönderilmedi."
+            send_telegram(completed_text)
+            completed_indexes.add(index)
             changed = True
             continue
 
@@ -12792,29 +13239,17 @@ def check_orders():
                 send_telegram(
                     f"Sipariş gecikti.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
                     f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\n"
+                    f"Durum: {status or status_data.get('status', '-')}\n"
                     f"Link: {item.get('link', '')}\n\n"
                     f"Geçen süre: {format_duration_minutes(waited_seconds / 60)}\n"
-                    f"Beklenen ortalama: {format_duration_minutes(item.get('avg_completion_minutes', 0))}\n"
                     f"Paneli kontrol et."
                 )
                 item["delay_alert_sent"] = True
                 changed = True
 
-        if status in COMPLETED_PANEL_STATUSES:
-            log("success", "order_completed", smm_order_id=item.get("smm_order_id"), product=item.get("product_name"))
-            duration_minutes = int((time.time() - int(item.get("created_at", time.time()) or time.time())) / 60)
-            send_telegram(
-                f"SMM siparişi tamamlandı.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
-                f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\nLink: {item.get('link', '')}\n\n"
-                f"Tamamlanma süresi: {format_duration_minutes(duration_minutes)}\n"
-                f"Müşteriye değerlendirme mesajı gönderildi."
-            )
-            notify_customer_order_completed(item.get("itemsatis_order_id", ""), item.get("product_name", ""), item.get("link", ""))
-            completed_indexes.append(index)
-            changed = True
-
-    for index in reversed(completed_indexes):
-        PENDING_ORDERS.pop(index)
+    for index in sorted(completed_indexes, reverse=True):
+        if 0 <= index < len(PENDING_ORDERS):
+            PENDING_ORDERS.pop(index)
 
     if changed:
         save_state()
@@ -12961,7 +13396,8 @@ def prime_service_price_cache(panel_key: str, service_id: str, context: str = ""
                 f"Bu servis ID panelde silinmiş/pasif olabilir."
             )
             SERVICE_PRICE_CACHE[missing_key] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
-            save_state()
+            mark_cache_state_dirty()
+            save_cache_state()
         return {"ok": False, "error": "service_not_found"}
 
     service_name = get_panel_service_display_name({"panel_key": panel_key, "panel": panel.get("name"), "service_id": service_id}, target_service)
@@ -12983,9 +13419,11 @@ def prime_service_price_cache(panel_key: str, service_id: str, context: str = ""
             f"Bu servis ID'sini kullanan ilanı veya paketi kontrol et."
         )
 
-    SERVICE_PRICE_CACHE[cache_key] = current_rate_raw
-    SERVICE_PRICE_CACHE.pop(f"missing:{cache_key}", None)
-    save_state()
+    if SERVICE_PRICE_CACHE.get(cache_key) != current_rate_raw or f"missing:{cache_key}" in SERVICE_PRICE_CACHE:
+        SERVICE_PRICE_CACHE[cache_key] = current_rate_raw
+        SERVICE_PRICE_CACHE.pop(f"missing:{cache_key}", None)
+        mark_cache_state_dirty()
+        save_cache_state()
     return {"ok": True, "rate": current_rate_raw, "service_name": service_name}
 
 
@@ -13038,10 +13476,13 @@ def check_services():
                     f"Bu servis silinmiş/pasif olmuş olabilir. İlan veya paket bileşenini kontrol et."
                 )
                 SERVICE_PRICE_CACHE[missing_key] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
+                mark_cache_state_dirty()
                 missing_count += 1
             continue
 
-        SERVICE_PRICE_CACHE.pop(missing_key, None)
+        if missing_key in SERVICE_PRICE_CACHE:
+            SERVICE_PRICE_CACHE.pop(missing_key, None)
+            mark_cache_state_dirty()
         panel_service_name = get_panel_service_display_name(service, target_service)
         current_rate = str(target_service.get("rate", ""))
         old_rate = SERVICE_PRICE_CACHE.get(cache_key)
@@ -13050,6 +13491,7 @@ def check_services():
 
         if old_rate is None:
             SERVICE_PRICE_CACHE[cache_key] = current_rate
+            mark_cache_state_dirty()
             initialized_count += 1
             continue
 
@@ -13067,10 +13509,11 @@ def check_services():
                 f"Bu servis ID'sini kullanan Itemsatış ilanlarını veya paketleri kontrol et."
             )
             SERVICE_PRICE_CACHE[cache_key] = current_rate
+            mark_cache_state_dirty()
             changed_count += 1
 
     if changed_count or missing_count or initialized_count:
-        save_state()
+        save_cache_state()
     return {"ok": True, "changed_count": changed_count, "missing_count": missing_count, "initialized_count": initialized_count}
 
 
@@ -13168,6 +13611,8 @@ def process_itemsatis_webhook_payload(data: dict):
             if not anti_loss.get("ok"):
                 add_failed_order(order_id, advert_id, package_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel="package", retryable=False)
                 send_telegram(format_anti_loss_message("Dikkat: Zararına paket satış engellendi.", package_name, order_id, anti_loss))
+                mark_processed_order(order_keys)
+                save_state()
                 return {"ok": False, "error": "anti_loss_guardrail", "type": "package_order", "guard": anti_loss}
 
             for component in components:
@@ -13361,6 +13806,8 @@ def process_itemsatis_webhook_payload(data: dict):
             if not anti_loss.get("ok"):
                 add_failed_order(order_id, advert_id, service_name, "Zararına satış engellendi", json.dumps(anti_loss, ensure_ascii=False)[:500], link=customer_link, panel=service.get("panel", ""), retryable=False)
                 send_telegram(format_anti_loss_message("Dikkat: Zararına satış engellendi.", service_name, order_id, anti_loss))
+                mark_processed_order(order_keys)
+                save_state()
                 return {"ok": False, "error": "anti_loss_guardrail", "guard": anti_loss}
 
             balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
