@@ -239,8 +239,12 @@ STATE_LAST_SAVE_FAIL_LOG = 0
 CACHE_STATE_LAST_HASH = ""
 CACHE_STATE_LAST_SAVE_FAIL_LOG = 0
 CACHE_STATE_DIRTY = False
+# Panel fiyat cache timestampleri Redis'e yazılmaz; sadece RAM'de throttle amaçlı tutulur.
+SERVICE_RATE_CHECK_TIMES = {}
 DASHBOARD_OPS_CACHE_SECONDS = int(os.getenv("DASHBOARD_OPS_CACHE_SECONDS", "10"))
 _DASHBOARD_OPS_CACHE = {"ts": 0.0, "data": None}
+ITEMSATIS_LOCAL_ADVERTS_CACHE_SECONDS = int(os.getenv("ITEMSATIS_LOCAL_ADVERTS_CACHE_SECONDS", "30"))
+_ITEMSATIS_LOCAL_ADVERTS_CACHE = {"ts": 0.0, "key": "", "rows": None}
 REDIS_ERROR_BACKOFF_SECONDS = int(os.getenv("REDIS_ERROR_BACKOFF_SECONDS", "60"))
 _REDIS_BACKOFF_UNTIL = 0
 _REDIS_BACKOFF_REASON = ""
@@ -256,6 +260,11 @@ ITEMSATIS_WEBHOOK_DEAD_KEY = os.getenv("ITEMSATIS_WEBHOOK_DEAD_KEY", "queue:item
 
 QUEUE_ITEM_MAX_ATTEMPTS = int(os.getenv("QUEUE_ITEM_MAX_ATTEMPTS", "5"))
 QUEUE_WORKER_SLEEP_SEC = float(os.getenv("QUEUE_WORKER_SLEEP_SEC", "2"))
+# Kuyruk boşken Redis RPOPLPUSH polling'i kademeli yavaşlatılır.
+# Sipariş geldiğinde worker tekrar minimum bekleme süresine döner.
+QUEUE_WORKER_EMPTY_MAX_SLEEP_SEC = float(os.getenv("QUEUE_WORKER_EMPTY_MAX_SLEEP_SEC", "15"))
+QUEUE_STATUS_CACHE_SECONDS = int(os.getenv("QUEUE_STATUS_CACHE_SECONDS", "10"))
+_QUEUE_STATUS_CACHE = {"ts": 0.0, "data": None}
 QUEUE_RETRY_DELAY_SEC = int(os.getenv("QUEUE_RETRY_DELAY_SEC", "120"))
 QUEUE_CIRCUIT_RETRY_DELAY_SEC = int(os.getenv("QUEUE_CIRCUIT_RETRY_DELAY_SEC", "600"))
 QUEUE_STUCK_RECOVERY_SEC = int(os.getenv("QUEUE_STUCK_RECOVERY_SEC", "600"))
@@ -380,6 +389,24 @@ def invalidate_dashboard_ops_cache():
     global _DASHBOARD_OPS_CACHE
     try:
         _DASHBOARD_OPS_CACHE = {"ts": 0.0, "data": None}
+    except Exception:
+        pass
+
+
+def invalidate_itemsatis_local_adverts_cache():
+    """Admin ilan listesinin kısa RAM cache'ini temizler."""
+    global _ITEMSATIS_LOCAL_ADVERTS_CACHE
+    try:
+        _ITEMSATIS_LOCAL_ADVERTS_CACHE = {"ts": 0.0, "key": "", "rows": None}
+    except Exception:
+        pass
+
+
+def invalidate_queue_status_cache():
+    """Queue/circuit status cache'ini temizler. Redis'e yazmaz; sadece RAM cache sıfırlar."""
+    global _QUEUE_STATUS_CACHE
+    try:
+        _QUEUE_STATUS_CACHE = {"ts": 0.0, "data": None}
     except Exception:
         pass
 
@@ -830,6 +857,7 @@ def enqueue_itemsatis_webhook(data: dict, *, attempts: int = 0, queue_id: str = 
     if not redis_lpush_succeeded(result):
         log("error", "itemsatis_webhook_queue_write_failed", queue_id=queue_id, redis_result=str(result)[:300])
         raise RuntimeError("Itemsatis webhook Redis kuyruğuna yazılamadı")
+    invalidate_queue_status_cache()
     log("info", "itemsatis_webhook_queued", queue_id=queue_id, attempts=attempts, not_before=not_before)
     return queue_id
 
@@ -839,6 +867,7 @@ def push_itemsatis_queue_item(item: dict, event: str = "itemsatis_queue_requeued
     safe_item = item if isinstance(item, dict) else {"payload": item}
     result = redis_lpush_json(ITEMSATIS_WEBHOOK_QUEUE_KEY, safe_item)
     if redis_lpush_succeeded(result):
+        invalidate_queue_status_cache()
         log("info", event, queue_id=safe_item.get("id"), attempts=safe_item.get("attempts"))
         return True
     log("error", "itemsatis_queue_requeue_failed", queue_id=safe_item.get("id"), event=event, redis_result=str(result)[:300])
@@ -856,6 +885,7 @@ def move_queue_item_to_dead(item: dict, reason: str):
     item["dead_at"] = int(time.time())
     item["dead_reason"] = str(reason)[:500]
     redis_lpush_json(ITEMSATIS_WEBHOOK_DEAD_KEY, item)
+    invalidate_queue_status_cache()
     log("error", "itemsatis_queue_dead", queue_id=item.get("id"), reason=reason)
 
 
@@ -890,10 +920,15 @@ def recover_stuck_itemsatis_processing():
 
 
 async def itemsatis_queue_worker():
-    """Redis tabanlı mini webhook worker. Ekstra paket istemez; siparişleri sırayla işler."""
+    """Redis tabanlı mini webhook worker. Ekstra paket istemez; siparişleri sırayla işler.
+    Kuyruk boşken adaptive sleep kullanır; boş Redis polling'i Upstash limitini zorlamasın.
+    """
     log("info", "itemsatis_queue_worker_started")
     recover_stuck_itemsatis_processing()
     last_stuck_recovery = int(time.time())
+    min_empty_sleep = max(0.5, float(QUEUE_WORKER_SLEEP_SEC or 2))
+    max_empty_sleep = max(min_empty_sleep, float(QUEUE_WORKER_EMPTY_MAX_SLEEP_SEC or 15))
+    current_empty_sleep = min_empty_sleep
     while True:
         try:
             now_loop = int(time.time())
@@ -902,12 +937,18 @@ async def itemsatis_queue_worker():
                 last_stuck_recovery = now_loop
             raw = redis_rpoplpush_raw(ITEMSATIS_WEBHOOK_QUEUE_KEY, ITEMSATIS_WEBHOOK_PROCESSING_KEY)
             if not raw:
-                await asyncio.sleep(QUEUE_WORKER_SLEEP_SEC)
+                await asyncio.sleep(current_empty_sleep)
+                current_empty_sleep = min(max_empty_sleep, max(min_empty_sleep, current_empty_sleep * 2))
                 continue
+
+            # İş bulunduğu anda worker tekrar hızlı moda döner.
+            current_empty_sleep = min_empty_sleep
+            invalidate_queue_status_cache()
             try:
                 item = json.loads(raw)
             except Exception as e:
                 redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                invalidate_queue_status_cache()
                 move_queue_item_to_dead({"raw": str(raw)[:1000]}, f"Queue JSON parse error: {e}")
                 continue
             now_ts = int(time.time())
@@ -915,7 +956,8 @@ async def itemsatis_queue_worker():
             if not_before > now_ts:
                 if push_itemsatis_queue_item(item, "itemsatis_not_before_requeued"):
                     redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
-                await asyncio.sleep(min(QUEUE_WORKER_SLEEP_SEC + 3, max(1, not_before - now_ts)))
+                    invalidate_queue_status_cache()
+                await asyncio.sleep(min(min_empty_sleep + 3, max(1, not_before - now_ts)))
                 continue
             item["processing_started_at"] = now_ts
             payload = item.get("payload") if isinstance(item.get("payload"), dict) else item
@@ -925,6 +967,7 @@ async def itemsatis_queue_worker():
             try:
                 result = await asyncio.to_thread(process_itemsatis_webhook_payload, payload)
                 redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                invalidate_queue_status_cache()
                 log("info", "itemsatis_queue_processed", queue_id=item.get("id"), result=str(result)[:300])
             except CircuitOpenForOrder as e:
                 attempts = int(item.get("attempts", 0) or 0) + 1
@@ -934,9 +977,11 @@ async def itemsatis_queue_worker():
                 if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
                     move_queue_item_to_dead(item, f"Circuit open max attempts: {e}")
                     redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                    invalidate_queue_status_cache()
                 else:
                     if push_itemsatis_queue_item(item, "itemsatis_requeued_circuit_open"):
                         redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                        invalidate_queue_status_cache()
                         log("warning", "itemsatis_requeued_circuit_open", queue_id=item.get("id"), panel=e.panel_name, attempts=attempts)
             except Exception as e:
                 attempts = int(item.get("attempts", 0) or 0) + 1
@@ -946,8 +991,9 @@ async def itemsatis_queue_worker():
                 if attempts >= QUEUE_ITEM_MAX_ATTEMPTS:
                     move_queue_item_to_dead(item, f"Max attempts: {e}")
                     redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                    invalidate_queue_status_cache()
                     send_telegram_error(
-                        f"Itemsatış queue dead\'e düştü.\n\n"
+                        f"Itemsatış queue dead'e düştü.\n\n"
                         f"Queue ID: {item.get('id')}\n"
                         f"Deneme: {attempts}\n"
                         f"Hata: {str(e)[:500]}"
@@ -955,11 +1001,13 @@ async def itemsatis_queue_worker():
                 else:
                     if push_itemsatis_queue_item(item, "itemsatis_requeued_error"):
                         redis_lrem_value(ITEMSATIS_WEBHOOK_PROCESSING_KEY, raw)
+                        invalidate_queue_status_cache()
                         log("warning", "itemsatis_requeued_error", queue_id=item.get("id"), attempts=attempts, error=str(e))
         except Exception as e:
+            current_empty_sleep = min_empty_sleep
             log("error", "itemsatis_queue_worker_error", error=str(e))
             send_telegram_error(f"Itemsatış queue worker kritik hata:\n{str(e)[:700]}")
-            await asyncio.sleep(max(5, QUEUE_WORKER_SLEEP_SEC))
+            await asyncio.sleep(max(5, min_empty_sleep))
 
 
 def read_queue_items(key: str, limit: int = 100) -> list:
@@ -978,9 +1026,24 @@ def read_queue_items(key: str, limit: int = 100) -> list:
 
 
 def build_queue_status() -> dict:
-    """Itemsatış webhook queue derinliği ve circuit durumlarını döndürür."""
+    """Itemsatış webhook queue derinliği ve circuit durumlarını döndürür.
+    Kısa RAM cache kullanır; admin panel açıkken aynı Redis LLEN/LRANGE/circuit GET çağrıları tekrarlanmaz.
+    """
+    global _QUEUE_STATUS_CACHE
+    now_float = time.time()
+    try:
+        cached = _QUEUE_STATUS_CACHE.get("data")
+        cached_ts = float(_QUEUE_STATUS_CACHE.get("ts", 0) or 0)
+        if cached and (now_float - cached_ts) < max(1, int(QUEUE_STATUS_CACHE_SECONDS)):
+            data = json.loads(json.dumps(cached, ensure_ascii=False, default=str))
+            data["cached"] = True
+            data["cache_age_seconds"] = round(now_float - cached_ts, 2)
+            return data
+    except Exception:
+        pass
+
     circuits = []
-    now_ts = int(time.time())
+    now_ts = int(now_float)
 
     for panel_key in PANEL_MAP.keys():
         panel_id = normalize_panel_key(panel_key)
@@ -1009,8 +1072,10 @@ def build_queue_status() -> dict:
     latest_processing = read_queue_items(ITEMSATIS_WEBHOOK_PROCESSING_KEY, 5)
     latest_dead = read_queue_items(ITEMSATIS_WEBHOOK_DEAD_KEY, 5)
 
-    return {
+    data = {
         "ok": True,
+        "cached": False,
+        "cache_age_seconds": 0,
         "time_tr": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
         "queue": {
             "waiting": redis_llen(ITEMSATIS_WEBHOOK_QUEUE_KEY),
@@ -1053,6 +1118,11 @@ def build_queue_status() -> dict:
         },
         "circuits": circuits,
     }
+    try:
+        _QUEUE_STATUS_CACHE = {"ts": now_float, "data": data}
+    except Exception:
+        pass
+    return data
 
 
 def retry_dead_queue_item(queue_id: str = "", retry_all: bool = False) -> int:
@@ -1083,6 +1153,7 @@ def retry_dead_queue_item(queue_id: str = "", retry_all: bool = False) -> int:
             moved += 1
 
     if moved:
+        invalidate_queue_status_cache()
         log("warning", "dead_queue_requeued_by_admin", queue_id=queue_id, retry_all=retry_all, moved=moved)
 
     return moved
@@ -1148,8 +1219,15 @@ def get_runtime_service_for_pending(item: dict) -> dict:
     return service
 
 def build_cache_state_payload() -> dict:
+    # rate_checked_at:* timestampleri sık değişir; Redis'e yazılırsa cache hash'i sürekli değişir.
+    # Bu timestampler SERVICE_RATE_CHECK_TIMES içinde RAM'de tutulur.
+    clean_price_cache = {
+        str(k): v
+        for k, v in (SERVICE_PRICE_CACHE or {}).items()
+        if not str(k).startswith("rate_checked_at:")
+    }
     return {
-        "service_price_cache": SERVICE_PRICE_CACHE,
+        "service_price_cache": clean_price_cache,
         "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
     }
 
@@ -1198,7 +1276,7 @@ def save_cache_state(force: bool = False):
 def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
     global SERVICE_PRICE_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, MESSAGE_TEMPLATES, LOW_BALANCE_DISABLED_PANELS
-    global CACHE_STATE_LAST_HASH, CACHE_STATE_DIRTY
+    global CACHE_STATE_LAST_HASH, CACHE_STATE_DIRTY, SERVICE_RATE_CHECK_TIMES
 
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
@@ -1206,6 +1284,18 @@ def load_state():
     PENDING_ORDERS = redis_get_json("pending_orders", [])
     sanitize_pending_orders_for_storage()
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
+    if not isinstance(SERVICE_PRICE_CACHE, dict):
+        SERVICE_PRICE_CACHE = {}
+    # Eski Redis kayıtlarında kalmış rate_checked_at:* değerlerini RAM throttle alanına taşı.
+    SERVICE_RATE_CHECK_TIMES = {}
+    for key in list(SERVICE_PRICE_CACHE.keys()):
+        key_text = str(key)
+        if key_text.startswith("rate_checked_at:"):
+            try:
+                SERVICE_RATE_CHECK_TIMES[key_text.replace("rate_checked_at:", "", 1)] = int(SERVICE_PRICE_CACHE.get(key) or 0)
+            except Exception:
+                pass
+            SERVICE_PRICE_CACHE.pop(key, None)
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
     PACKAGE_CONFIGS = redis_get_json("package_configs", {})
@@ -1258,6 +1348,7 @@ def save_state():
         if current_hash:
             STATE_LAST_HASH = current_hash
         invalidate_dashboard_ops_cache()
+        invalidate_itemsatis_local_adverts_cache()
 
 
 
@@ -3749,9 +3840,8 @@ def fetch_panel_service_rate(service: dict) -> dict:
         return {"ok": False, "error": "panel_config_missing"}
 
     cache_key = f"{panel_key}:{service_id}"
-    cache_ts_key = f"rate_checked_at:{cache_key}"
     cached_rate = SERVICE_PRICE_CACHE.get(cache_key)
-    last_checked = int(SERVICE_PRICE_CACHE.get(cache_ts_key, 0) or 0)
+    last_checked = int(SERVICE_RATE_CHECK_TIMES.get(cache_key, 0) or 0)
     throttle_seconds = int(os.getenv("SERVICE_RATE_FETCH_THROTTLE_SECONDS", "300"))
     if cached_rate and last_checked and (int(time.time()) - last_checked) < throttle_seconds:
         return {"ok": True, "rate": cached_rate, "service_name": get_panel_service_display_name(service), "cached": True}
@@ -3772,7 +3862,7 @@ def fetch_panel_service_rate(service: dict) -> dict:
                 old_rate = SERVICE_PRICE_CACHE.get(rate_key)
                 had_missing = missing_key in SERVICE_PRICE_CACHE
                 SERVICE_PRICE_CACHE[rate_key] = rate_raw
-                SERVICE_PRICE_CACHE[f"rate_checked_at:{panel_key}:{service_id}"] = int(time.time())
+                SERVICE_RATE_CHECK_TIMES[rate_key] = int(time.time())
                 SERVICE_PRICE_CACHE.pop(missing_key, None)
                 if old_rate != rate_raw or had_missing:
                     mark_cache_state_dirty()
@@ -4269,6 +4359,8 @@ def remove_itemsatis_advert_from_cache(advert_id: str) -> bool:
             redis_set_json(ITEMSATIS_ADVERT_CACHE_KEY, cache)
             changed = True
 
+    if changed:
+        invalidate_itemsatis_local_adverts_cache()
     return changed
 
 
@@ -4276,6 +4368,7 @@ def clear_itemsatis_advert_import_cache():
     """İlan içe aktarma/cache kayıtlarını temizler; dinamik servis ve paket ayarlarına dokunmaz."""
     redis_set_json(ITEMSATIS_ADVERT_MANUAL_KEY, [])
     redis_set_json(ITEMSATIS_ADVERT_CACHE_KEY, {"items": [], "updated_at": int(time.time()), "updated_at_text": now_tr().strftime("%Y-%m-%d %H:%M:%S"), "source": "cleared", "scraped_count": 0})
+    invalidate_itemsatis_local_adverts_cache()
 
 def get_manual_itemsatis_adverts() -> list[dict]:
     data = redis_get_json(ITEMSATIS_ADVERT_MANUAL_KEY, [])
@@ -4291,9 +4384,23 @@ def save_manual_itemsatis_adverts(items: list[dict], merge: bool = True) -> int:
         current[advert_id] = {"advert_id": advert_id, "name": str(item.get("name") or f"Itemsatış İlanı {advert_id}")[:220], "url": str(item.get("url") or ""), "source": "manual_import"}
     rows = sorted(current.values(), key=lambda x: str(x.get("name", "")).lower())
     redis_set_json(ITEMSATIS_ADVERT_MANUAL_KEY, rows)
+    invalidate_itemsatis_local_adverts_cache()
     return len(rows)
 
 def collect_itemsatis_adverts_from_local_state(include_cache: bool = True, include_history: bool = False) -> list[dict]:
+    global _ITEMSATIS_LOCAL_ADVERTS_CACHE
+    cache_key = f"include_cache={bool(include_cache)}|include_history={bool(include_history)}"
+    now_ts = time.time()
+    try:
+        if (
+            _ITEMSATIS_LOCAL_ADVERTS_CACHE.get("key") == cache_key
+            and _ITEMSATIS_LOCAL_ADVERTS_CACHE.get("rows") is not None
+            and (now_ts - float(_ITEMSATIS_LOCAL_ADVERTS_CACHE.get("ts", 0) or 0)) < max(1, int(ITEMSATIS_LOCAL_ADVERTS_CACHE_SECONDS))
+        ):
+            return [dict(item) for item in (_ITEMSATIS_LOCAL_ADVERTS_CACHE.get("rows") or [])]
+    except Exception:
+        pass
+
     rows = {}
 
     def is_bad_advert(advert_id_s: str, name_s: str = "", source: str = "") -> bool:
@@ -4340,7 +4447,12 @@ def collect_itemsatis_adverts_from_local_state(include_cache: bool = True, inclu
     for row in rows.values():
         row.update(_advert_link_status(row.get("advert_id")))
         enriched.append(row)
-    return sorted(enriched, key=lambda x: (x.get("status") != "missing", str(x.get("name", "").lower())))
+    result_rows = sorted(enriched, key=lambda x: (x.get("status") != "missing", str(x.get("name", "").lower())))
+    try:
+        _ITEMSATIS_LOCAL_ADVERTS_CACHE = {"ts": now_ts, "key": cache_key, "rows": [dict(item) for item in result_rows]}
+    except Exception:
+        pass
+    return result_rows
 
 
 def fetch_itemsatis_public_adverts(force: bool = False, include_history: bool = False) -> dict:
@@ -8382,7 +8494,7 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
     <small>Boş bırakılırsa sadece panel maliyeti ve bakiye gösterilir.</small>
   </label>
   <div class="notice full" id="manualCostBox">Panel maliyeti: Panel + servis ID + adet girince otomatik hesaplanır.</div>
-  <button class="full" type="submit" onclick="return confirm('Bu sipariş seçilen dış panele gönderilecek. Devam edilsin mi?')">Siparişi Panele Gönder</button>
+  <button class="full" type="submit" onclick="if(!confirm('Bu sipariş seçilen dış panele gönderilecek. Devam edilsin mi?')) return false; this.disabled=true; this.textContent='Gönderiliyor...'; this.form.submit(); return false;">Siparişi Panele Gönder</button>
 </form>
 </div>
 
