@@ -67,7 +67,6 @@ TR_TIMEZONE = timezone(timedelta(hours=3))
 
 
 ITEMSATIS_COMMISSION_RATE = 0.07
-RECORDED_SALES = set()
 
 SMM_API_URL = os.getenv("SMM_API_URL", "https://smmrush.com/api/v2")
 SMM_API_KEY = os.getenv("SMM_API_KEY", "")
@@ -172,20 +171,8 @@ PROCESSED_ORDERS = set()
 PROCESSED_LINKS = set()
 FAILED_ORDERS = []
 PENDING_ORDERS = []
-DAILY_STATS = {}
-LAST_DAILY_REPORT_DATE = ""
 SERVICE_PRICE_CACHE = {}
-WEEKLY_STATS = {}
-MONTHLY_STATS = {}
-LAST_WEEKLY_REPORT_DATE = ""
-LAST_MONTHLY_REPORT_DATE = ""
-PRODUCT_NAME_CACHE = {}
 PANEL_SERVICE_NAME_CACHE = {}
-SALES_HISTORY = {}
-ORDER_HISTORY = []
-FAVORITE_SERVICES = {}
-BALANCE_HISTORY = {}
-LINK_AUDIT_HISTORY = []
 
 # ─── YENİ: LOG GEÇMİŞİ (son 200 log dashboard için) ───────────────────────────
 MAX_LOG_HISTORY = 200
@@ -196,9 +183,6 @@ BALANCE_WARN_LAST = {}
 LOG_FLUSH_INTERVAL_SECONDS = int(os.getenv("LOG_FLUSH_INTERVAL_SECONDS", "30"))
 DASHBOARD_REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "45"))
 API_LOG_LIMIT = int(os.getenv("API_LOG_LIMIT", "40"))
-API_HISTORY_LIMIT = int(os.getenv("API_HISTORY_LIMIT", "50"))
-GROWTH_INSIGHTS_CACHE_SECONDS = int(os.getenv("GROWTH_INSIGHTS_CACHE_SECONDS", "60"))
-_GROWTH_INSIGHTS_CACHE = {"ts": 0, "data": None}
 
 _LOG_DIRTY = False
 _LOG_LAST_FLUSH = 0
@@ -239,24 +223,14 @@ LOW_BALANCE_WARN_REPEAT_MINUTES_BY_PANEL = {
 }
 
 CHECK_BALANCE_INTERVAL_SECONDS = int(os.getenv("CHECK_BALANCE_INTERVAL_SECONDS", "300"))
-VIP_ORDER_THRESHOLD = int(os.getenv("VIP_ORDER_THRESHOLD", "5"))
 PROFIT_TARGET_MARGIN_PERCENT = float(os.getenv("PROFIT_TARGET_MARGIN_PERCENT", "30"))
 PROFIT_MIN_TL = float(os.getenv("PROFIT_MIN_TL", "2"))
-HIGH_VALUE_ORDER_TL = float(os.getenv("HIGH_VALUE_ORDER_TL", "250"))
-PRODUCT_HEALTH_MIN_MARGIN_PERCENT = float(os.getenv("PRODUCT_HEALTH_MIN_MARGIN_PERCENT", "18"))
 _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
 _ADMIN_BACKGROUND_JOBS = {}
 _ADMIN_BACKGROUND_LOCK = threading.Lock()
-PANEL_STATS = {}
-SERVICE_COMPLETION_STATS = {}
-BUYER_STATS = {}
-ORDER_NOTES = {}
 PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "1000"))
 PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "1000"))
-PERSIST_ANALYTICS_STATE = os.getenv("PERSIST_ANALYTICS_STATE", "false").lower() == "true"
-PERSIST_LOG_HISTORY = os.getenv("PERSIST_LOG_HISTORY", "false").lower() == "true"
-PERSIST_AUX_CACHE = os.getenv("PERSIST_AUX_CACHE", "false").lower() == "true"
 REDIS_ERROR_BACKOFF_SECONDS = int(os.getenv("REDIS_ERROR_BACKOFF_SECONDS", "60"))
 _REDIS_BACKOFF_UNTIL = 0
 _REDIS_BACKOFF_REASON = ""
@@ -391,17 +365,9 @@ def now_tr():
 # ─── YENİ: GELİŞMİŞ LOGLAMA ──────────────────────────────────────────────────
 def flush_logs(force: bool = False):
     """Log geçmişini Redis'e kontrollü yazar; her logda Redis yazıp yavaşlatmaz."""
-    global _LOG_DIRTY, _LOG_LAST_FLUSH
-    if not PERSIST_LOG_HISTORY:
-        _LOG_DIRTY = False
-        return
-    if not force and not _LOG_DIRTY:
-        return
-    now_ts = time.time()
-    if force or (now_ts - _LOG_LAST_FLUSH) >= LOG_FLUSH_INTERVAL_SECONDS:
-        redis_set_json("log_history", list(LOG_HISTORY)[-MAX_LOG_HISTORY:])
-        _LOG_LAST_FLUSH = now_ts
-        _LOG_DIRTY = False
+    global _LOG_DIRTY
+    _LOG_DIRTY = False
+    return
 
 
 def log(level: str, event: str, **kwargs):
@@ -420,12 +386,6 @@ def log(level: str, event: str, **kwargs):
     with STATE_LOCK:
         LOG_HISTORY.append(entry)
         _LOG_DIRTY = True
-
-    # Sadece aralık dolduysa Redis'e yaz.
-    try:
-        flush_logs(force=False)
-    except Exception:
-        pass
 
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -1167,9 +1127,7 @@ def get_runtime_service_for_pending(item: dict) -> dict:
 
 def load_state():
     global PROCESSED_ORDERS, PROCESSED_LINKS, FAILED_ORDERS, PENDING_ORDERS
-    global DAILY_STATS, LAST_DAILY_REPORT_DATE, SERVICE_PRICE_CACHE
-    global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
-    global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES
+    global SERVICE_PRICE_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, MESSAGE_TEMPLATES, LOW_BALANCE_DISABLED_PANELS
 
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
@@ -1181,44 +1139,7 @@ def load_state():
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
     PACKAGE_CONFIGS = redis_get_json("package_configs", {})
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
-    BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
     LOW_BALANCE_DISABLED_PANELS = set(redis_get_json("low_balance_disabled_panels", list(LOW_BALANCE_DISABLED_PANELS)))
-    if PERSIST_ANALYTICS_STATE:
-        RECORDED_SALES = set(redis_get_json("recorded_sales", []))
-        DAILY_STATS = redis_get_json("daily_stats", {})
-        LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
-        WEEKLY_STATS = redis_get_json("weekly_stats", {})
-        MONTHLY_STATS = redis_get_json("monthly_stats", {})
-        LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
-        LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
-        SALES_HISTORY = redis_get_json("sales_history", {})
-        ORDER_HISTORY = redis_get_json("order_history", [])
-        FAVORITE_SERVICES = redis_get_json("favorite_services", {})
-        BALANCE_HISTORY = redis_get_json("balance_history", {})
-        LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
-        PANEL_STATS = redis_get_json("panel_stats", {})
-        SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
-        BUYER_STATS = redis_get_json("buyer_stats", {})
-        ORDER_NOTES = redis_get_json("order_notes", {})
-    else:
-        RECORDED_SALES = set()
-        DAILY_STATS = {}
-        LAST_DAILY_REPORT_DATE = ""
-        WEEKLY_STATS = {}
-        MONTHLY_STATS = {}
-        LAST_WEEKLY_REPORT_DATE = ""
-        LAST_MONTHLY_REPORT_DATE = ""
-        SALES_HISTORY = {}
-        ORDER_HISTORY = []
-        FAVORITE_SERVICES = redis_get_json("favorite_services", {})
-        BALANCE_HISTORY = {}
-        LINK_AUDIT_HISTORY = []
-        PANEL_STATS = {}
-        SERVICE_COMPLETION_STATS = {}
-        BUYER_STATS = {}
-        ORDER_NOTES = {}
-    LOG_HISTORY = deque(redis_get_json("log_history", [])[-MAX_LOG_HISTORY:], maxlen=MAX_LOG_HISTORY) if PERSIST_LOG_HISTORY else deque(maxlen=MAX_LOG_HISTORY)
-    PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {}) if PERSIST_AUX_CACHE else {}
     trim_processed_memory()
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
@@ -1238,45 +1159,17 @@ def save_state():
             "failed_orders": FAILED_ORDERS,
             "pending_orders": PENDING_ORDERS,
             "service_price_cache": SERVICE_PRICE_CACHE,
+            "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
             "dynamic_services": DYNAMIC_SERVICES,
             "package_configs": PACKAGE_CONFIGS,
             "message_templates": MESSAGE_TEMPLATES,
-            "balance_warn_last": BALANCE_WARN_LAST,
             "low_balance_disabled_panels": sorted(LOW_BALANCE_DISABLED_PANELS),
         }
-
-        if PERSIST_ANALYTICS_STATE:
-            data_to_save.update({
-                "recorded_sales": list(RECORDED_SALES),
-                "daily_stats": DAILY_STATS,
-                "last_daily_report_date": LAST_DAILY_REPORT_DATE,
-                "weekly_stats": WEEKLY_STATS,
-                "monthly_stats": MONTHLY_STATS,
-                "last_weekly_report_date": LAST_WEEKLY_REPORT_DATE,
-                "last_monthly_report_date": LAST_MONTHLY_REPORT_DATE,
-                "sales_history": SALES_HISTORY,
-                "order_history": ORDER_HISTORY[-100:],
-                "favorite_services": FAVORITE_SERVICES,
-                "balance_history": BALANCE_HISTORY,
-                "link_audit_history": LINK_AUDIT_HISTORY[-100:],
-                "panel_stats": PANEL_STATS,
-                "service_completion_stats": SERVICE_COMPLETION_STATS,
-                "buyer_stats": BUYER_STATS,
-                "order_notes": ORDER_NOTES,
-            })
-
-        if PERSIST_AUX_CACHE:
-            data_to_save.update({
-                "product_name_cache": PRODUCT_NAME_CACHE,
-                "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
-            })
 
         result = redis_mset_json(data_to_save)
         if result is None:
             log("warning", "redis_mset_skipped_or_failed")
 
-        if PERSIST_LOG_HISTORY:
-            flush_logs(force=True)
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -1328,6 +1221,20 @@ def normalize_link_for_check(link: str, platform: str = "") -> str:
         .replace("www.", "")
         .rstrip("/")
     )
+
+
+def find_active_pending_by_link(link: str, platform: str = "") -> dict | None:
+    normalized = normalize_link_for_check(link, platform)
+    if not normalized:
+        return None
+
+    for item in PENDING_ORDERS:
+        if not isinstance(item, dict) or item.get("cancelled"):
+            continue
+        item_link = normalize_link_for_check(item.get("link", ""), item.get("platform", platform))
+        if item_link and item_link == normalized:
+            return item
+    return None
 
 
 def make_order_key(order_id, advert_id, buyer, link="", platform=""):
@@ -1443,23 +1350,9 @@ def build_finance_summary(price_tl: float, cost_tl: float | None = None) -> str:
     ]
     if sale > 0 and cost > 0:
         lines.append(f"Net kâr: {format_tl_amount(profit.get('profit', 0))} | Marj: %{profit.get('margin_pct', 0)}")
-        lines.append(build_pricing_advice(sale, cost))
     elif sale > 0:
         lines.append("Net kâr: Panel maliyeti bilinmediği için hesaplanamadı")
     return "\n".join(lines)
-
-
-def build_buyer_summary(buyer: str) -> str:
-    """Telegram sipariş mesajları için müşteri geçmişi özeti üretir."""
-    buyer = str(buyer or "Bilinmiyor").strip() or "Bilinmiyor"
-    stats = BUYER_STATS.get(buyer, {}) if isinstance(BUYER_STATS, dict) else {}
-    try:
-        count = int(stats.get("count", 0) or 0)
-        total_spent = float(stats.get("total_spent", 0) or 0)
-    except Exception:
-        count, total_spent = 0, 0.0
-    vip = "Evet" if count >= VIP_ORDER_THRESHOLD else "Hayır"
-    return f"👤 Müşteri: {buyer}\nSipariş sayısı: {count}\nToplam harcama: {format_tl_amount(total_spent)}\nVIP: {vip}"
 
 
 def estimate_order_cost_from_service(service: dict, quantity=None) -> float | None:
@@ -1923,18 +1816,8 @@ def calculate_service_health_score(panel_key: str, service_id: str, service: dic
         score -= 10
         notes.append("price_cache_missing")
 
-    completion = (SERVICE_COMPLETION_STATS or {}).get(make_service_completion_key(panel_key, service_id), {})
-    avg_minutes = float(completion.get("avg_completion_minutes", 0) or 0)
-    completed_count = int(completion.get("completed_count", 0) or 0)
-    if completed_count == 0:
-        score -= 5
-        notes.append("no_completion_data")
-    elif avg_minutes >= 1440:
-        score -= 15
-        notes.append("slow_completion")
-    elif avg_minutes >= 360:
-        score -= 8
-        notes.append("completion_getting_slow")
+    avg_minutes = 0
+    completed_count = 0
 
     recent_failed = 0
     now_ts = int(time.time())
@@ -2189,181 +2072,6 @@ def normalize_stat_item(value):
         return {"count": 0, "gross": 0.0}
 
 
-def add_sales_history(price: float = 0):
-    """Dashboard grafiği için günlük satış geçmişini tutar."""
-    global SALES_HISTORY
-    today = now_tr().strftime("%Y-%m-%d")
-    item = SALES_HISTORY.get(today, {})
-    try:
-        count = int(item.get("count", 0) or 0)
-        gross = float(item.get("gross", 0) or 0)
-    except Exception:
-        count = 0
-        gross = 0.0
-
-    SALES_HISTORY[today] = {
-        "count": count + 1,
-        "gross": gross + float(price or 0),
-    }
-
-    # Eski verileri şişirmemek için son 90 günü tut.
-    try:
-        keep_from = (now_tr() - timedelta(days=90)).strftime("%Y-%m-%d")
-        SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) >= keep_from}
-    except Exception:
-        pass
-
-
-def add_daily_stat(product_name: str, price: float = 0):
-    global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS
-    product_name = str(product_name or "Bilinmeyen Ürün").strip() or "Bilinmeyen Ürün"
-
-    def add_to(stats):
-        stats[product_name] = normalize_stat_item(stats.get(product_name, {}))
-        stats[product_name]["count"] += 1
-        stats[product_name]["gross"] += float(price or 0)
-
-    with STATE_LOCK:
-        add_to(DAILY_STATS)
-        add_to(WEEKLY_STATS)
-        add_to(MONTHLY_STATS)
-        add_sales_history(price)
-        # save_state burada çağrılmaz; record_itemsatis_sale tek sefer yazdırır.
-
-
-def record_itemsatis_sale(data, order_id, advert_id, buyer, product_name, price, link="") -> bool:
-    """Itemsatış satışını belleğe işler; kalıcı kayıt caller tarafından tek save_state ile yapılır."""
-    global RECORDED_SALES
-    sale_key = make_sale_key(data, order_id, advert_id, buyer, product_name, price, link)
-    with STATE_LOCK:
-        if sale_key in RECORDED_SALES:
-            return False
-        add_daily_stat(product_name, price)
-        RECORDED_SALES.add(sale_key)
-    return True
-
-
-def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, link, price=0, duration_minutes=None, estimated_completion_minutes=None, submitted_at=""):
-    entry = {
-        "order_id": str(order_id),
-        "advert_id": str(advert_id),
-        "product_name": str(product_name),
-        "panel": str(panel),
-        "smm_order_id": str(smm_order_id),
-        "link": str(link),
-        "price": float(price or 0),
-        "duration_minutes": int(duration_minutes or 0) if duration_minutes is not None else "",
-        "estimated_completion_minutes": float(estimated_completion_minutes or 0) if estimated_completion_minutes else "",
-        "submitted_at": str(submitted_at or ""),
-        "completed_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    with STATE_LOCK:
-        ORDER_HISTORY.append(entry)
-        if len(ORDER_HISTORY) > 500:
-            del ORDER_HISTORY[:-500]
-        if PERSIST_ANALYTICS_STATE:
-            save_state()
-
-
-def record_buyer_stats(buyer: str, price: float = 0):
-    """Müşteri bazlı sipariş sayısı ve harcama istatistiği tutar."""
-    global BUYER_STATS
-    buyer = str(buyer or "Bilinmiyor").strip() or "Bilinmiyor"
-    now_s = now_tr().strftime("%Y-%m-%d %H:%M:%S")
-    item = BUYER_STATS.get(buyer, {}) if isinstance(BUYER_STATS, dict) else {}
-    try:
-        count = int(item.get("count", 0) or 0) + 1
-        total_spent = float(item.get("total_spent", 0) or 0) + float(price or 0)
-    except Exception:
-        count, total_spent = 1, float(price or 0)
-    BUYER_STATS[buyer] = {
-        "count": count,
-        "total_spent": round(total_spent, 2),
-        "first_order": item.get("first_order") or now_s,
-        "last_order": now_s,
-    }
-    if count == VIP_ORDER_THRESHOLD:
-        send_telegram_sale(
-            f"VIP müşteri eşiğine ulaştı.\n\n"
-            f"Müşteri: {buyer}\n"
-            f"Toplam sipariş: {count}\n"
-            f"Toplam harcama: {format_tl_amount(total_spent)}"
-        )
-
-
-def update_panel_stats(panel_key: str, result: str, duration_minutes: int | None = None):
-    """Panel bazında başarı/başarısız/partial istatistikleri tutar."""
-    global PANEL_STATS
-    panel_key = normalize_panel_key(panel_key or "unknown")
-    item = PANEL_STATS.get(panel_key, {}) if isinstance(PANEL_STATS, dict) else {}
-    item.setdefault("success", 0)
-    item.setdefault("failed", 0)
-    item.setdefault("partial", 0)
-    item.setdefault("completed_total_minutes", 0)
-    item.setdefault("completed_count", 0)
-    item.setdefault("last_update", "")
-    if result == "success":
-        item["success"] += 1
-        if duration_minutes is not None:
-            item["completed_total_minutes"] += max(0, int(duration_minutes))
-            item["completed_count"] += 1
-    elif result == "partial":
-        item["partial"] += 1
-    else:
-        item["failed"] += 1
-    item["last_update"] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
-    PANEL_STATS[panel_key] = item
-
-
-def make_service_completion_key(panel_key: str, service_id: str) -> str:
-    panel_key = normalize_panel_key(panel_key or "unknown")
-    service_id = str(service_id or "").strip() or "unknown"
-    return f"{panel_key}:{service_id}"
-
-
-def update_service_completion_stats(panel_key: str, service_id: str, duration_minutes: int):
-    """Servis bazında ortalama tamamlanma süresi tutar; yeni siparişlerde daha doğru tahmin verir."""
-    global SERVICE_COMPLETION_STATS
-    key = make_service_completion_key(panel_key, service_id)
-    item = SERVICE_COMPLETION_STATS.get(key, {}) if isinstance(SERVICE_COMPLETION_STATS, dict) else {}
-    count = int(item.get("completed_count", 0) or 0) + 1
-    total_minutes = int(item.get("completed_total_minutes", 0) or 0) + max(0, int(duration_minutes or 0))
-    SERVICE_COMPLETION_STATS[key] = {
-        "panel_key": normalize_panel_key(panel_key or "unknown"),
-        "service_id": str(service_id or ""),
-        "completed_count": count,
-        "completed_total_minutes": total_minutes,
-        "avg_completion_minutes": round(total_minutes / count, 1) if count else 0,
-        "last_duration_minutes": max(0, int(duration_minutes or 0)),
-        "last_update": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-def get_average_completion_minutes(panel_key: str = "", service_id: str = "", panel_name: str = "") -> tuple[float, str]:
-    """Önce servis ortalamasını, yoksa panel ortalamasını döndürür."""
-    panel_key = normalize_panel_key(panel_key or panel_name or "unknown")
-    service_id = str(service_id or "").strip()
-    if service_id:
-        row = (SERVICE_COMPLETION_STATS or {}).get(make_service_completion_key(panel_key, service_id), {})
-        try:
-            service_count = int(row.get("completed_count", 0) or 0)
-            service_avg = float(row.get("avg_completion_minutes", 0) or 0)
-            if service_count > 0 and service_avg > 0:
-                return service_avg, "servis"
-        except Exception:
-            pass
-
-    panel_row = (PANEL_STATS or {}).get(panel_key, {})
-    try:
-        completed_count = int(panel_row.get("completed_count", 0) or 0)
-        total_minutes = int(panel_row.get("completed_total_minutes", 0) or 0)
-        if completed_count > 0 and total_minutes > 0:
-            return round(total_minutes / completed_count, 1), "panel"
-    except Exception:
-        pass
-    return 0, ""
-
-
 def format_duration_minutes(minutes) -> str:
     try:
         minutes = int(round(float(minutes or 0)))
@@ -2379,27 +2087,6 @@ def format_duration_minutes(minutes) -> str:
     return f"{mins} dk"
 
 
-def build_completion_estimate(panel_key: str = "", service_id: str = "", panel_name: str = "") -> dict:
-    avg_minutes, source = get_average_completion_minutes(panel_key, service_id, panel_name)
-    estimated_at = ""
-    if avg_minutes > 0:
-        estimated_at = (now_tr() + timedelta(minutes=int(round(avg_minutes)))).strftime("%H:%M")
-    return {
-        "avg_minutes": round(float(avg_minutes or 0), 1),
-        "source": source,
-        "text": format_duration_minutes(avg_minutes),
-        "estimated_at": estimated_at,
-    }
-
-
-def build_completion_estimate_text(panel_key: str = "", service_id: str = "", panel_name: str = "") -> str:
-    estimate = build_completion_estimate(panel_key, service_id, panel_name)
-    if not estimate.get("avg_minutes"):
-        return "Ortalama tamamlanma: Henüz veri yok"
-    source = "servis" if estimate.get("source") == "servis" else "panel"
-    return f"Ortalama tamamlanma: {estimate['text']} ({source} ortalaması, tahmini {estimate['estimated_at']})"
-
-
 def get_delay_alert_threshold_seconds(item: dict) -> int:
     """Gecikme alarmını sabit süre yerine geçmiş tamamlanma ortalamasına göre ayarlar."""
     try:
@@ -2412,12 +2099,7 @@ def get_delay_alert_threshold_seconds(item: dict) -> int:
 
 
 def add_order_note(smm_order_id: str, note: str):
-    smm_order_id = str(smm_order_id or "").strip()
-    note = str(note or "").strip()
-    if smm_order_id and note:
-        ORDER_NOTES[smm_order_id] = {"note": note, "updated_at": now_tr().strftime("%Y-%m-%d %H:%M:%S")}
-        if PERSIST_ANALYTICS_STATE:
-            save_state()
+    return False
 
 def calculate_profit(sale_tl: float, cost_tl: float) -> dict:
     sale_tl = float(sale_tl or 0)
@@ -2498,23 +2180,9 @@ def build_pricing_advice(price_tl: float, cost_tl: float | None = None) -> str:
     if recommended > sale:
         gap = recommended - sale
         return f"Fiyat önerisi: Bu ürün {format_tl_amount(recommended)} civarına çıkarılırsa hedef kâr daha sağlıklı olur. Fark: {format_tl_amount(gap)}"
-    if margin >= PRODUCT_HEALTH_MIN_MARGIN_PERCENT:
+    if margin >= PROFIT_TARGET_MARGIN_PERCENT:
         return f"Fiyat önerisi: Mevcut fiyat sağlıklı görünüyor. Net kâr: {format_tl_amount(current_profit)}"
     return f"Fiyat önerisi: Marj düşük (%{round(margin, 1)}). Fiyat veya panel servisi kontrol edilmeli."
-
-
-def build_order_growth_tip(platform: str = "", product_name: str = "") -> str:
-    """Satıcıya sipariş başı geliri artırabilecek kısa upsell önerisi verir."""
-    text = normalize_text(f"{platform} {product_name}")
-    if "instagram" in text or "insta" in text:
-        return "Ek satış önerisi: Takipçi alan müşteriye beğeni, kaydetme veya keşfet paketi sun."
-    if "tiktok" in text:
-        return "Ek satış önerisi: İzlenme alan müşteriye beğeni + takipçi paketi sun."
-    if "youtube" in text or "yt" in text:
-        return "Ek satış önerisi: İzlenme alan müşteriye abone + beğeni paketi sun."
-    if "twitter" in text or "x " in text:
-        return "Ek satış önerisi: Etkileşim alan müşteriye takipçi + görüntülenme paketi sun."
-    return "Ek satış önerisi: Müşteriye aynı platform için tamamlayıcı paket öner."
 
 
 def classify_failed_reason(reason: str, detail: str = "") -> str:
@@ -2582,16 +2250,7 @@ def build_lost_order_summary(limit: int = 50) -> dict:
 
 def get_advert_sales_stat(advert_id: str, product_name: str = "") -> dict:
     report_name = get_itemsatis_report_name(advert_id, product_name)
-    sources = [DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS]
-    best = {"count": 0, "gross": 0.0, "source": ""}
-    for name, source in [("daily", DAILY_STATS), ("weekly", WEEKLY_STATS), ("monthly", MONTHLY_STATS)]:
-        item = normalize_stat_item((source or {}).get(report_name, {}))
-        if item["count"] >= best["count"]:
-            best = {"count": item["count"], "gross": item["gross"], "source": name}
-    avg_sale = round(best["gross"] / best["count"], 2) if best["count"] else 0
-    best["avg_sale_tl"] = avg_sale
-    best["product_name"] = report_name
-    return best
+    return {"count": 0, "gross": 0.0, "source": "", "avg_sale_tl": 0, "product_name": report_name}
 
 
 def score_product_health(cost_tl: float | None, avg_sale_tl: float, failed_count: int = 0, completion_avg: float = 0) -> tuple[int, list[str]]:
@@ -2606,7 +2265,7 @@ def score_product_health(cost_tl: float | None, avg_sale_tl: float, failed_count
     if cost_tl and avg_sale_tl:
         profit = calculate_profit(avg_sale_tl, cost_tl)
         margin = float(profit.get("margin_pct", 0) or 0)
-        if margin < PRODUCT_HEALTH_MIN_MARGIN_PERCENT:
+        if margin < PROFIT_TARGET_MARGIN_PERCENT:
             score -= 26
             notes.append(f"marj düşük (%{round(margin, 1)})")
     if failed_count >= 3:
@@ -2621,164 +2280,7 @@ def score_product_health(cost_tl: float | None, avg_sale_tl: float, failed_count
     return max(0, min(100, score)), notes
 
 
-def build_product_growth_insights(limit: int = 12) -> dict:
-    """Kâr, fiyat ve sağlık skorlarını mevcut cache/state üzerinden hesaplar."""
-    rows = []
-    failed_by_advert = defaultdict(int)
-    for item in FAILED_ORDERS[-100:]:
-        if isinstance(item, dict):
-            failed_by_advert[str(item.get("advert_id", ""))] += 1
-
-    for advert_id, raw in get_all_services(include_inactive=True).items():
-        service = get_service_config(raw)
-        cost = estimate_order_cost_from_service(service)
-        sales = get_advert_sales_stat(advert_id)
-        avg_sale = float(sales.get("avg_sale_tl", 0) or 0)
-        advice = calculate_recommended_sale_price(cost or 0)
-        completion_avg, completion_source = get_average_completion_minutes(service.get("panel_key", ""), service.get("service_id", ""), service.get("panel", ""))
-        score, notes = score_product_health(cost, avg_sale, failed_by_advert.get(str(advert_id), 0), completion_avg)
-        profit = calculate_profit(avg_sale, cost or 0) if avg_sale and cost else {}
-        rows.append({
-            "advert_id": str(advert_id),
-            "product_name": sales.get("product_name") or str(advert_id),
-            "panel": service.get("panel", ""),
-            "service_id": service.get("service_id", ""),
-            "sales_count": int(sales.get("count", 0) or 0),
-            "avg_sale_tl": avg_sale,
-            "estimated_cost_tl": round(float(cost or 0), 2),
-            "estimated_profit_tl": round(float(profit.get("profit", 0) or 0), 2) if profit else 0,
-            "margin_percent": profit.get("margin_pct", 0) if profit else 0,
-            "recommended_price_tl": advice.get("recommended_price", 0) if advice.get("ok") else 0,
-            "health_score": score,
-            "notes": notes,
-            "avg_completion_minutes": completion_avg,
-            "completion_source": completion_source,
-        })
-
-    rows.sort(key=lambda x: (x["health_score"], -x["sales_count"]))
-    needs_attention = rows[:max(1, int(limit or 12))]
-    top_profit = sorted([r for r in rows if r["estimated_profit_tl"] > 0], key=lambda x: x["estimated_profit_tl"], reverse=True)[:5]
-    price_raise = [r for r in rows if r["recommended_price_tl"] and r["avg_sale_tl"] and r["recommended_price_tl"] > r["avg_sale_tl"]]
-    price_raise = sorted(price_raise, key=lambda x: x["recommended_price_tl"] - x["avg_sale_tl"], reverse=True)[:5]
-    return {
-        "generated_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
-        "total_products": len(rows),
-        "needs_attention": needs_attention,
-        "top_profit": top_profit,
-        "price_raise_candidates": price_raise,
-        "lost_orders": build_lost_order_summary(),
-    }
-
-
-def build_growth_report_text() -> str:
-    insights = build_product_growth_insights(limit=8)
-    lines = ["Kâr ve Satış Fırsat Raporu\n"]
-    price_rows = insights.get("price_raise_candidates", [])[:5]
-    if price_rows:
-        lines.append("Fiyatı artırılabilecek ürünler:")
-        for row in price_rows:
-            lines.append(
-                f"- {row.get('product_name')} | Ortalama satış {format_tl_amount(row.get('avg_sale_tl', 0))} -> öneri {format_tl_amount(row.get('recommended_price_tl', 0))}"
-            )
-    else:
-        lines.append("Fiyat artışı için net aday görünmüyor.")
-
-    top_profit = insights.get("top_profit", [])[:5]
-    if top_profit:
-        lines.append("\nEn iyi kâr bırakanlar:")
-        for row in top_profit:
-            lines.append(f"- {row.get('product_name')} | tahmini kâr {format_tl_amount(row.get('estimated_profit_tl', 0))} | marj %{row.get('margin_percent', 0)}")
-
-    attention = insights.get("needs_attention", [])[:5]
-    if attention:
-        lines.append("\nKontrol edilmesi gereken ürünler:")
-        for row in attention:
-            note = ", ".join(row.get("notes", [])[:3]) or "not yok"
-            lines.append(f"- Skor {row.get('health_score')}/100 | {row.get('product_name')} | {note}")
-
-    lost = insights.get("lost_orders", {}).get("items", {})
-    if lost:
-        lines.append("\nKayıp sipariş nedenleri:")
-        for key, item in sorted(lost.items(), key=lambda x: x[1].get("count", 0), reverse=True):
-            lines.append(f"- {key}: {item.get('count', 0)} adet")
-    return "\n".join(lines)
-
-
-def build_sales_report(title: str, stats: dict, empty_text: str):
-    lines = [f"{title}\n"]
-    total_count = 0
-    gross_total = 0.0
-
-    if stats:
-        normalized_items = []
-        for product_name, raw_value in stats.items():
-            item = normalize_stat_item(raw_value)
-            count = item["count"]
-            gross = item["gross"]
-            if count <= 0:
-                continue
-            normalized_items.append((product_name, count, gross))
-            total_count += count
-            gross_total += gross
-
-        normalized_items.sort(key=lambda x: x[1], reverse=True)
-        if normalized_items:
-            for product_name, count, gross in normalized_items:
-                if gross > 0:
-                    lines.append(f"{product_name} | {count}x | {gross:.2f} TL")
-                else:
-                    lines.append(f"{product_name} | {count}x")
-        else:
-            lines.append(empty_text)
-    else:
-        lines.append(empty_text)
-
-    commission = gross_total * ITEMSATIS_COMMISSION_RATE
-    net_total = gross_total - commission
-    lines.append(f"\nToplam Sipariş: {total_count}")
-    if gross_total > 0:
-        lines.append(f"Brüt Kazanç: {gross_total:.2f} TL")
-        lines.append(f"Itemsatış Komisyonu (%7): {commission:.2f} TL")
-        lines.append(f"Net Kazanç: {net_total:.2f} TL")
-    else:
-        lines.append("Kazanç: Tutar bilgisi gelmediği için hesaplanamadı.")
-
-    lines.append(f"Başarısız Sipariş: {len(FAILED_ORDERS)}")
-    lines.append(f"Bekleyen SMM Sipariş: {len(PENDING_ORDERS)}")
-    return "\n".join(lines)
-
-
 def reset_sales_stats(scope: str = "daily"):
-    global DAILY_STATS, WEEKLY_STATS, MONTHLY_STATS, RECORDED_SALES, SALES_HISTORY
-    scope = str(scope or "daily").lower().strip()
-    now = now_tr()
-
-    with STATE_LOCK:
-        if scope == "daily":
-            DAILY_STATS = {}
-            SALES_HISTORY.pop(now.strftime("%Y-%m-%d"), None)
-        elif scope == "weekly":
-            WEEKLY_STATS = {}
-            week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-            SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) < week_start}
-        elif scope in ["monthly", "current_month"]:
-            # Mevcut ayı komple temizler. Dashboard bugünkü kartları da sıfırlansın diye
-            # günlük/haftalık sayaçlar da temizlenir.
-            DAILY_STATS = {}
-            WEEKLY_STATS = {}
-            MONTHLY_STATS = {}
-            month_start = now.replace(day=1).strftime("%Y-%m-%d")
-            SALES_HISTORY = {k: v for k, v in SALES_HISTORY.items() if str(k) < month_start}
-        elif scope == "all":
-            DAILY_STATS = {}
-            WEEKLY_STATS = {}
-            MONTHLY_STATS = {}
-            SALES_HISTORY = {}
-            RECORDED_SALES = set()
-        else:
-            return False
-        if PERSIST_ANALYTICS_STATE:
-            save_state()
     return True
 
 
@@ -2801,7 +2303,6 @@ def add_pending_order(
         return
     if any(str(item.get("smm_order_id")) == str(smm_order_id) for item in PENDING_ORDERS):
         return
-    completion_estimate = build_completion_estimate(panel_key or panel, service_id, panel)
     with STATE_LOCK:
         PENDING_ORDERS.append({
             "itemsatis_order_id": str(order_id),
@@ -2820,9 +2321,6 @@ def add_pending_order(
             "delay_alert_sent": False,
             "cancelled": False,
             "price": float(price or 0),
-            "avg_completion_minutes": completion_estimate.get("avg_minutes", 0),
-            "avg_completion_source": completion_estimate.get("source", ""),
-            "estimated_completion_at": completion_estimate.get("estimated_at", ""),
         })
         log("info", "order_queued", order_id=order_id, smm_order_id=smm_order_id, product=product_name)
         save_state()
@@ -3124,37 +2622,11 @@ def get_product_name(data: dict) -> str:
     return ""
 
 
-def cache_itemsatis_product_name(advert_id: str, product_name: str):
-    """Webhook ile gelen ilan adını kaydeder; raporlarda Itemsatış ilan adı kullanılmasını sağlar."""
-    global PRODUCT_NAME_CACHE
-    advert_id = str(advert_id or "").strip()
-    product_name = str(product_name or "").strip()
-    if advert_id and product_name:
-        PRODUCT_NAME_CACHE[advert_id] = product_name
-        if PERSIST_AUX_CACHE:
-            redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
-
-
 def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
-    """Rapor için gerçek Itemsatış ilan adını kullanır; genel webhook başlığını kullanmaz."""
     product_name = str(product_name or "").strip()
     if product_name and not is_generic_itemsatis_title(product_name):
-        cache_itemsatis_product_name(advert_id, product_name)
         return product_name
-
-    cached_name = str(PRODUCT_NAME_CACHE.get(str(advert_id or ""), "")).strip()
-    if cached_name and not is_generic_itemsatis_title(cached_name):
-        return cached_name
-
-    service = get_all_services(include_inactive=True).get(str(advert_id or ""), {})
-    configured_name = str((service or {}).get("name") or "").strip()
-    if configured_name and not is_generic_itemsatis_title(configured_name):
-        return configured_name
-
-    if advert_id:
-        return f"Itemsatış İlanı {advert_id}"
-
-    return "Bilinmeyen Ürün"
+    return f"Itemsatış İlanı {str(advert_id or "").strip()}" if advert_id else "Bilinmeyen Ürün"
 
 
 def get_buyer(data: dict) -> str:
@@ -3453,8 +2925,6 @@ def cache_panel_service_name(panel_key: str, service_id: str, service_name: str)
 
     cache_key = make_panel_service_cache_key(panel_key, service_id)
     PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
-    if PERSIST_AUX_CACHE:
-        redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
 
 
 def get_cached_panel_service_name(panel_key: str, service_id: str) -> str:
@@ -4146,82 +3616,8 @@ def format_anti_loss_message(title: str, product_name: str, order_id: str, guard
         f"Sipariş panele gönderilmedi. Fiyat/ilan/panel servisini kontrol et."
     )
 
-def record_balance_history(panel_key: str, balance_data: dict):
-    """Panel bakiyesini günlük geçmişe yazar."""
-    global BALANCE_HISTORY
-    try:
-        panel_key = normalize_panel_key(panel_key)
-        balance_tl = convert_balance_to_try((balance_data or {}).get("balance"), (balance_data or {}).get("currency", ""))
-        if balance_tl is None:
-            return
-        today = now_tr().strftime("%Y-%m-%d")
-        BALANCE_HISTORY.setdefault(today, {})[panel_key] = {
-            "balance_tl": round(float(balance_tl), 2),
-            "panel_name": get_panel_config(panel_key).get("name", panel_key),
-            "updated_at": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        # Son 60 günü tut.
-        keep_from = (now_tr() - timedelta(days=60)).strftime("%Y-%m-%d")
-        BALANCE_HISTORY = {k: v for k, v in BALANCE_HISTORY.items() if str(k) >= keep_from}
-    except Exception as e:
-        log("warning", "balance_history_record_failed", error=str(e))
-
-
 def build_admin_balance_rows() -> list:
-    """Admin panel için canlı API çağrısı yapmadan son bilinen panel bakiyelerini hazırlar."""
-    rows = []
-    latest_by_panel = {}
-    try:
-        for day in sorted((BALANCE_HISTORY or {}).keys(), reverse=True):
-            day_items = BALANCE_HISTORY.get(day, {}) if isinstance(BALANCE_HISTORY, dict) else {}
-            if not isinstance(day_items, dict):
-                continue
-            for panel_key, item in day_items.items():
-                normalized = normalize_panel_key(panel_key)
-                if normalized and normalized not in latest_by_panel and isinstance(item, dict):
-                    latest_by_panel[normalized] = item
-    except Exception as e:
-        log("warning", "admin_balance_rows_build_failed", error=str(e))
-
-    for key, panel in PANEL_MAP.items():
-        panel_key = normalize_panel_key(key)
-        latest = latest_by_panel.get(panel_key, {})
-        has_env = bool(panel.get("api_url") and panel.get("api_key"))
-        balance_value = latest.get("balance_tl", "") if isinstance(latest, dict) else ""
-        if balance_value not in [None, ""]:
-            balance_text = format_tl_amount(balance_value)
-        else:
-            balance_text = "Henüz kontrol edilmedi"
-        rows.append({
-            "panel_key": panel_key,
-            "panel_name": panel.get("name", key),
-            "has_env": has_env,
-            "balance_text": balance_text,
-            "updated_at": latest.get("updated_at", "-") if isinstance(latest, dict) else "-",
-            "alert_disabled": is_low_balance_warning_disabled(panel_key, panel.get("name", key)),
-        })
-    return rows
-
-
-def record_link_audit(order_id: str, advert_id: str, product_name: str, platform: str, link: str, status: str, note: str = ""):
-    """Webhook link yakalama geçmişi. Yanlış link olaylarını admin panelden izlemek için."""
-    global LINK_AUDIT_HISTORY
-    try:
-        LINK_AUDIT_HISTORY.append({
-            "ts": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
-            "order_id": str(order_id),
-            "advert_id": str(advert_id),
-            "product_name": str(product_name),
-            "platform": str(platform),
-            "link": str(link or ""),
-            "status": str(status),
-            "note": str(note or ""),
-        })
-        if len(LINK_AUDIT_HISTORY) > 300:
-            del LINK_AUDIT_HISTORY[:-300]
-    except Exception as e:
-        log("warning", "link_audit_failed", error=str(e))
-
+    return [{"panel_key": normalize_panel_key(key), "panel_name": panel.get("name", key), "has_env": bool(panel.get("api_url") and panel.get("api_key")), "balance_text": "Hen?z kontrol edilmedi", "updated_at": "-", "alert_disabled": is_low_balance_warning_disabled(key, panel.get("name", key))} for key, panel in PANEL_MAP.items()]
 
 
 def _strip_html_tags(value: str) -> str:
@@ -4392,7 +3788,7 @@ def parse_itemsatis_adverts_from_html(page_html: str, profile_url: str = "") -> 
             return
         name = _itemsatis_clean_title(name)
         if _itemsatis_is_bad_title(name):
-            name = PRODUCT_NAME_CACHE.get(advert_id, "") or f"Itemsatış İlanı {advert_id}"
+            name = f"Itemsatis Ilani {advert_id}"
         url = _itemsatis_absolute_url(url, profile_url) if url else ""
         current = found.get(advert_id, {})
         current_name = current.get("name", "")
@@ -4604,30 +4000,27 @@ def save_manual_itemsatis_adverts(items: list[dict], merge: bool = True) -> int:
     return len(rows)
 
 def collect_itemsatis_adverts_from_local_state(include_cache: bool = True, include_history: bool = False) -> list[dict]:
-    """Itemsatış ilan listesini cache/manual/admin eşleşmelerden oluşturur.
-
-    Varsayılan olarak test webhook/geçmiş siparişleri ana ilan listesine karıştırmaz.
-    """
     rows = {}
+
     def is_bad_advert(advert_id_s: str, name_s: str = "", source: str = "") -> bool:
         advert_id_s = str(advert_id_s or "").strip()
         name_s = normalize_text(name_s)
         if not advert_id_s or advert_id_s.startswith("manual-") or not advert_id_s.isdigit():
             return True
-        if source in {"order_history", "pending_orders", "failed_orders", "product_name_cache"} and not include_history:
+        if source in {"pending_orders", "failed_orders"} and not include_history:
             return True
-        test_words = ["test", "deneme", "webhook", "raw", "bilinmeyen ürün", "bilinmeyen urun"]
-        if any(w in name_s for w in test_words):
-            return True
-        return False
+        test_words = ["test", "deneme", "webhook", "raw", "bilinmeyen urun"]
+        return any(w in name_s for w in test_words)
+
     def add(advert_id, name="", source="local", url=""):
         advert_id_s = str(advert_id or "").strip()
-        name_s = str(name or "").strip() or PRODUCT_NAME_CACHE.get(advert_id_s, "") or f"Itemsatış İlanı {advert_id_s}"
+        name_s = str(name or "").strip() or f"Itemsatis Ilani {advert_id_s}"
         if is_bad_advert(advert_id_s, name_s, source):
             return
         existing = rows.get(advert_id_s, {})
-        if advert_id_s not in rows or (not existing.get("name") or existing.get("name", "").startswith("Itemsatış İlanı")):
+        if advert_id_s not in rows or not existing.get("name"):
             rows[advert_id_s] = {"advert_id": advert_id_s, "name": name_s[:220], "url": url, "source": source}
+
     if include_cache:
         cache = redis_get_json(ITEMSATIS_ADVERT_CACHE_KEY, {})
         if isinstance(cache, dict):
@@ -4638,26 +4031,23 @@ def collect_itemsatis_adverts_from_local_state(include_cache: bool = True, inclu
         if isinstance(item, dict):
             add(item.get("advert_id"), item.get("name"), "manual_import", item.get("url", ""))
     for advert_id, service in get_all_services(include_inactive=True).items():
-        add(advert_id, (service or {}).get("name") or PRODUCT_NAME_CACHE.get(str(advert_id), ""), "service_mapping")
+        add(advert_id, (service or {}).get("name", ""), "service_mapping")
     for advert_id, package in get_package_configs(include_inactive=True).items():
-        add(advert_id, (package or {}).get("name") or PRODUCT_NAME_CACHE.get(str(advert_id), ""), "package_mapping")
+        add(advert_id, (package or {}).get("name", ""), "package_mapping")
     if include_history:
-        for advert_id, name in (PRODUCT_NAME_CACHE or {}).items():
-            add(advert_id, name, "product_name_cache")
-        for item in (ORDER_HISTORY or [])[-500:]:
-            if isinstance(item, dict):
-                add(item.get("advert_id"), item.get("product_name"), "order_history")
         for item in (PENDING_ORDERS or [])[-300:]:
             if isinstance(item, dict):
                 add(item.get("advert_id"), item.get("product_name"), "pending_orders")
         for item in (FAILED_ORDERS or [])[-100:]:
             if isinstance(item, dict):
                 add(item.get("advert_id"), item.get("product_name"), "failed_orders")
+
     enriched = []
     for row in rows.values():
         row.update(_advert_link_status(row.get("advert_id")))
         enriched.append(row)
-    return sorted(enriched, key=lambda x: (x.get("status") != "missing", str(x.get("name", "")).lower()))
+    return sorted(enriched, key=lambda x: (x.get("status") != "missing", str(x.get("name", "").lower())))
+
 
 def fetch_itemsatis_public_adverts(force: bool = False, include_history: bool = False) -> dict:
     """Public profil ilanlarını çeker; başarısızsa sadece güvenli cache/manual/admin kayıtlarını gösterir."""
@@ -4795,37 +4185,12 @@ def search_panel_services(panel_key: str, query: str = "", limit: int = 50):
 
 
 def add_favorite_service(panel_key: str, service_id: str, name: str = "", platform: str = "other", quantity: int = 1000):
-    global FAVORITE_SERVICES
-    panel_key = normalize_panel_key(panel_key)
-    service_id = str(service_id or "").strip()
-    if not panel_key or not service_id:
-        raise ValueError("Panel ve servis ID gerekli")
-    if not str(quantity).isdigit() or int(quantity) <= 0:
-        quantity = 1000
-    key = f"{panel_key}:{service_id}"
-    service_name = str(name or get_cached_panel_service_name(panel_key, service_id) or fetch_panel_service_name_by_id(panel_key, service_id) or f"{get_panel_config(panel_key).get('name', panel_key)} Servis {service_id}").strip()
-    FAVORITE_SERVICES[key] = {
-        "panel": panel_key,
-        "service_id": service_id,
-        "name": service_name,
-        "platform": normalize_text(platform or "other") or "other",
-        "quantity": int(quantity),
-        "created_at": int(time.time()),
-    }
-    if PERSIST_ANALYTICS_STATE:
-        save_state()
-    return FAVORITE_SERVICES[key]
+    return {}
 
 
 def delete_favorite_service(favorite_key: str) -> bool:
-    global FAVORITE_SERVICES
-    favorite_key = str(favorite_key or "").strip()
-    if favorite_key in FAVORITE_SERVICES:
-        FAVORITE_SERVICES.pop(favorite_key, None)
-        if PERSIST_ANALYTICS_STATE:
-            save_state()
-        return True
     return False
+
 
 def build_all_panel_balances_text() -> str:
     lines = ["Panel Bakiyeleri:\n"]
@@ -4839,7 +4204,6 @@ def build_all_panel_balances_text() -> str:
         if "error" in balance_data:
             lines.append(f"{panel['name']}: Hatalı - {balance_data.get('error')}")
         else:
-            record_balance_history(key, balance_data)
             if get_balance_currency_label(balance_data.get("currency", "")):
                 used_usd_rate = True
             lines.append(f"{panel['name']}: {format_panel_balance_tl(balance_data)}")
@@ -4874,7 +4238,6 @@ def handle_panel_balance_command(text: str):
         send_telegram(f"{panel['name']} bakiye alınamadı.\n\nHata: {balance_data.get('error')}")
         return
 
-    record_balance_history(panel["key"], balance_data)
     save_state()
     currency_note = get_balance_currency_label(balance_data.get("currency", ""))
     extra = f"\n{currency_note}" if currency_note else ""
@@ -5042,7 +4405,6 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
         if balance_tl > threshold:
             if key in BALANCE_WARN_LAST:
                 BALANCE_WARN_LAST.pop(key, None)
-                save_state()
                 log("info", "low_balance_recovered", panel=panel_name, balance_tl=round(balance_tl, 2), threshold=threshold)
             return False
 
@@ -5059,7 +4421,6 @@ def check_low_balance(balance, currency, panel_name="Panel", panel_key: str = ""
             return False
 
         BALANCE_WARN_LAST[key] = now_ts
-        save_state()
         log("warning", "low_balance", panel=panel_name, balance=balance, currency=currency, balance_tl=round(balance_tl, 2), threshold=threshold)
         send_telegram_alert(
             f"{panel_name} bakiyesi {format_tl_amount(threshold)} altına düştü.\n\n"
@@ -5089,7 +4450,6 @@ def check_all_panel_balances(force_alert: bool = False):
             log("error", "panel_balance_check_error", panel=key, error=balance_data.get("error"))
             results[key] = {"ok": False, "error": balance_data.get("error")}
             continue
-        record_balance_history(key, balance_data)
         alerted = check_low_balance(
             balance_data.get("balance", 0),
             balance_data.get("currency", ""),
@@ -6567,7 +5927,7 @@ def refresh_panel_service_names() -> dict:
             else:
                 missing += 1
 
-    save_state()
+    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
     return {"checked": checked, "updated": updated, "missing": missing}
 
 
@@ -8789,7 +8149,7 @@ def admin_manual_order_page(
     user: str = Depends(get_current_admin),
 ):
     template = Template(ADMIN_MANUAL_ORDER_HTML)
-    return HTMLResponse(content=template.render(panels=PANEL_MAP, message=message, error=error, favorites=FAVORITE_SERVICES))
+    return HTMLResponse(content=template.render(panels=PANEL_MAP, message=message, error=error, favorites={}))
 
 
 @app.post("/admin/manual-order")
@@ -8883,7 +8243,6 @@ def admin_manual_order_submit(
 
     log("success", "manual_order_created", panel=panel_key, service_id=service_id, smm_order_id=smm_order_id)
     manual_cost = estimate_order_cost_from_service(manual_service)
-    completion_estimate_text = build_completion_estimate_text(panel_key, service_id, panel_conf.get("name", panel_key))
     send_telegram(
         f"Manuel SMM siparişi panele girildi.\n\n"
         f"Ürün: {final_product_name}\n"
@@ -8892,7 +8251,7 @@ def admin_manual_order_submit(
         f"SMM ID: {smm_order_id}\n"
         f"Adet: {quantity}\n"
         f"Link: {panel_link}\n"
-        f"{completion_estimate_text}\n\n"
+        f"\n"
         f"{build_finance_summary(0, manual_cost)}"
     )
 
@@ -12998,71 +12357,13 @@ def dashboard(user: str = Depends(get_current_admin)):
 
 @app.get("/api/stats")
 def api_stats(user: str = Depends(get_current_admin)):
-    today_count = sum(normalize_stat_item(v)["count"] for v in DAILY_STATS.values())
-    today_gross = sum(normalize_stat_item(v)["gross"] for v in DAILY_STATS.values())
-    commission = today_gross * ITEMSATIS_COMMISSION_RATE
-    return {
-        "today_count": today_count,
-        "today_gross": today_gross,
-        "today_net": today_gross - commission,
-        "pending_count": len(PENDING_ORDERS),
-        "failed_count": len(FAILED_ORDERS),
-    }
+    return {"today_count": 0, "today_gross": 0, "today_net": 0, "pending_count": len(PENDING_ORDERS), "failed_count": len(FAILED_ORDERS)}
 
 
 @app.get("/api/sales-data")
 def api_sales_data(days: int = 30, user: str = Depends(get_current_admin)):
-    """Dashboard grafiği için tarih bazlı satış geçmişi döndürür."""
-    try:
-        days = int(days)
-    except Exception:
-        days = 30
+    return {"labels": [], "order_values": [], "gross_values": [], "net_values": [], "total_orders": 0, "total_gross": 0, "total_net": 0, "values": []}
 
-    if days not in [7, 14, 30, 60, 90]:
-        days = 30
-
-    labels = []
-    order_values = []
-    gross_values = []
-    net_values = []
-    now = now_tr()
-
-    total_orders = 0
-    total_gross = 0.0
-
-    for i in range(days - 1, -1, -1):
-        day_dt = now - timedelta(days=i)
-        day_key = day_dt.strftime("%Y-%m-%d")
-        labels.append(day_dt.strftime("%d.%m"))
-
-        item = SALES_HISTORY.get(day_key, {})
-        try:
-            count = int(item.get("count", 0) or 0)
-            gross = float(item.get("gross", 0) or 0)
-        except Exception:
-            count = 0
-            gross = 0.0
-
-        net = gross * (1 - ITEMSATIS_COMMISSION_RATE)
-        order_values.append(count)
-        gross_values.append(round(gross, 2))
-        net_values.append(round(net, 2))
-        total_orders += count
-        total_gross += gross
-
-    total_net = total_gross * (1 - ITEMSATIS_COMMISSION_RATE)
-
-    return {
-        "labels": labels,
-        "order_values": order_values,
-        "gross_values": gross_values,
-        "net_values": net_values,
-        "total_orders": total_orders,
-        "total_gross": round(total_gross, 2),
-        "total_net": round(total_net, 2),
-        # Eski dashboard parçalarıyla geriye uyumluluk için:
-        "values": order_values,
-    }
 
 @app.get("/api/pending")
 def api_pending(user: str = Depends(get_current_admin)):
@@ -13081,1093 +12382,47 @@ def api_logs(user: str = Depends(get_current_admin)):
 
 @app.get("/api/history")
 def api_history(user: str = Depends(get_current_admin)):
-    return {"orders": ORDER_HISTORY[-max(1, int(API_HISTORY_LIMIT)):]}
+    return {"orders": []}
 
 
 @app.get("/api/balance-history")
 def api_balance_history(user: str = Depends(get_current_admin)):
-    return {"history": BALANCE_HISTORY}
+    return {"history": {}}
 
 
 @app.get("/api/link-audit")
 def api_link_audit(user: str = Depends(get_current_admin)):
-    return {"items": LINK_AUDIT_HISTORY[-300:]}
+    return {"items": []}
 
 
 @app.get("/api/favorites")
 def api_favorites(user: str = Depends(get_current_admin)):
-    return {"items": FAVORITE_SERVICES}
-
+    return {"items": {}}
 
 
 @app.get("/api/panel-stats")
 def api_panel_stats(user: str = Depends(get_current_admin)):
-    """Panel başarı/başarısız/partial istatistikleri."""
-    rows = {}
-    for panel_key, item in (PANEL_STATS or {}).items():
-        try:
-            success = int(item.get("success", 0) or 0)
-            failed = int(item.get("failed", 0) or 0)
-            partial = int(item.get("partial", 0) or 0)
-            total = success + failed + partial
-            completed_count = int(item.get("completed_count", 0) or 0)
-            total_minutes = int(item.get("completed_total_minutes", 0) or 0)
-            avg_minutes = round(total_minutes / completed_count, 1) if completed_count else 0
-            success_rate = round((success / total) * 100, 2) if total else 0
-        except Exception:
-            success = failed = partial = total = completed_count = total_minutes = avg_minutes = success_rate = 0
-        rows[panel_key] = {
-            "success": success,
-            "failed": failed,
-            "partial": partial,
-            "total": total,
-            "success_rate": success_rate,
-            "avg_completion_minutes": avg_minutes,
-            "last_update": item.get("last_update", "") if isinstance(item, dict) else "",
-        }
-    return {"items": rows}
+    return {"items": {}}
 
 
 @app.get("/api/service-completion-stats")
 def api_service_completion_stats(user: str = Depends(get_current_admin)):
-    """Servis bazlı ortalama tamamlanma süreleri."""
-    rows = {}
-    for key, item in (SERVICE_COMPLETION_STATS or {}).items():
-        if not isinstance(item, dict):
-            continue
-        rows[key] = {
-            "panel_key": item.get("panel_key", ""),
-            "service_id": item.get("service_id", ""),
-            "completed_count": int(item.get("completed_count", 0) or 0),
-            "avg_completion_minutes": float(item.get("avg_completion_minutes", 0) or 0),
-            "last_duration_minutes": int(item.get("last_duration_minutes", 0) or 0),
-            "last_update": item.get("last_update", ""),
-        }
-    return {"items": rows}
+    return {"items": {}}
 
 
 @app.get("/api/growth-insights")
 def api_growth_insights(user: str = Depends(get_current_admin)):
-    now_ts = int(time.time())
-    cached = _GROWTH_INSIGHTS_CACHE.get("data")
-    if cached is not None and (now_ts - int(_GROWTH_INSIGHTS_CACHE.get("ts", 0) or 0)) < max(5, int(GROWTH_INSIGHTS_CACHE_SECONDS)):
-        return cached
-
-    """Satış, kâr ve kayıp sipariş fırsatlarını hafif state verilerinden hesaplar."""
-    return build_product_growth_insights()
+    return {"items": [], "summary": {}}
 
 
 @app.get("/api/buyer-stats")
 def api_buyer_stats(user: str = Depends(get_current_admin)):
-    """Müşteri bazlı sipariş istatistikleri."""
-    return {"items": BUYER_STATS or {}}
+    return {"items": {}}
 
 
 @app.get("/api/order-notes")
 def api_order_notes(user: str = Depends(get_current_admin)):
-    """Sipariş notları."""
-    return {"items": ORDER_NOTES or {}}
-
-
-
-QUEUE_DEAD_HTML = """
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Boostera Dead Queue</title>
-<style>
-:root {
-  color-scheme: dark;
-  --bg: #050713;
-  --bg2: #090d1c;
-  --surface: rgba(15, 23, 42, 0.86);
-  --surface2: rgba(17, 24, 39, 0.92);
-  --surface3: rgba(30, 41, 59, 0.72);
-  --card: rgba(15, 23, 42, 0.88);
-  --card2: rgba(2, 6, 23, 0.55);
-  --border: rgba(148, 163, 184, 0.16);
-  --border2: rgba(148, 163, 184, 0.26);
-  --text: #f8fafc;
-  --muted: #94a3b8;
-  --muted2: #64748b;
-  --primary: #8b5cf6;
-  --primary2: #6d28d9;
-  --primary-soft: rgba(139, 92, 246, 0.16);
-  --cyan: #22d3ee;
-  --blue: #3b82f6;
-  --green: #22c55e;
-  --green2: #15803d;
-  --yellow: #f59e0b;
-  --red: #ef4444;
-  --red2: #dc2626;
-  --shadow: 0 22px 70px rgba(0, 0, 0, 0.36);
-  --shadow-soft: 0 12px 32px rgba(0, 0, 0, 0.24);
-  --radius: 22px;
-  --radius2: 16px;
-}
-
-* { box-sizing: border-box; }
-html { min-height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; }
-body {
-  margin: 0;
-  min-height: 100vh;
-  color: var(--text);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-  font-size: 15px;
-  line-height: 1.55;
-  background:
-    radial-gradient(circle at 8% -6%, rgba(139, 92, 246, .26), transparent 30%),
-    radial-gradient(circle at 98% 0%, rgba(34, 211, 238, .14), transparent 28%),
-    radial-gradient(circle at 50% 105%, rgba(59, 130, 246, .10), transparent 34%),
-    linear-gradient(180deg, #050713 0%, #080b18 46%, #04050b 100%);
-  overflow-x: hidden;
-}
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
-  background-size: 38px 38px;
-  mask-image: linear-gradient(180deg, rgba(0,0,0,.55), transparent 78%);
-  z-index: -1;
-}
-a { color: #c4b5fd; text-decoration: none; transition: color .15s ease, opacity .15s ease; }
-a:hover { color: #ede9fe; }
-img, svg, canvas { max-width: 100%; }
-code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-code { color: #e9d5ff; background: rgba(139, 92, 246, .12); padding: 2px 6px; border-radius: 8px; }
-pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; background: rgba(2,6,23,.56); border: 1px solid var(--border); border-radius: 14px; padding: 12px; color: #cbd5e1; }
-
-/* Layout */
-header, .topbar {
-  width: min(1560px, calc(100% - 32px));
-  margin: 16px auto 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 14px 18px;
-  background: linear-gradient(180deg, rgba(15,23,42,.82), rgba(15,23,42,.68));
-  border: 1px solid var(--border);
-  border-radius: 22px;
-  box-shadow: var(--shadow-soft);
-  backdrop-filter: blur(18px);
-  position: sticky;
-  top: 10px;
-  z-index: 20;
-}
-.logo { font-size: 25px; font-weight: 950; letter-spacing: -.055em; color: var(--text); }
-.logo span { color: var(--primary); text-shadow: 0 0 22px rgba(139,92,246,.36); }
-.wrap, .container, .shell {
-  width: min(1560px, calc(100% - 32px));
-  margin: 18px auto 42px;
-  background: linear-gradient(180deg, rgba(15,23,42,.72), rgba(2,6,23,.36));
-  border: 1px solid var(--border);
-  border-radius: 28px;
-  padding: 24px;
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(14px);
-  min-width: 0;
-}
-.wrap { background: transparent; border: 0; box-shadow: none; padding: 0; }
-.shell, .container { overflow: hidden; }
-h1 { margin: 0 0 10px; font-size: clamp(28px, 4vw, 46px); line-height: 1.02; letter-spacing: -.06em; }
-h2 { margin: 30px 0 16px; font-size: clamp(20px, 2.2vw, 28px); line-height: 1.1; letter-spacing: -.045em; }
-h3 { margin: 0 0 13px; color: #cbd5e1; font-size: 13px; text-transform: uppercase; letter-spacing: .11em; }
-.muted, .small { color: var(--muted); font-size: 13px; line-height: 1.58; }
-.notice {
-  background: linear-gradient(90deg, rgba(59,130,246,.22), rgba(139,92,246,.12));
-  border: 1px solid rgba(147,197,253,.18);
-  color: #dbeafe;
-  padding: 13px 15px;
-  border-radius: 16px;
-  margin: 16px 0;
-  font-size: 14px;
-  line-height: 1.58;
-}
-
-/* Navigation / toolbars */
-.toolbar, .top-actions, .filters, .pkg-actions, .tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-  margin: 18px 0 22px;
-}
-.toolbar a:not(:has(button)), .top-actions a:not(:has(button)) {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 42px;
-  padding: 10px 13px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  color: #d8b4fe;
-  background: rgba(15,23,42,.68);
-  font-weight: 850;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.03);
-}
-.toolbar a:not(:has(button)):hover, .top-actions a:not(:has(button)):hover { border-color: rgba(139,92,246,.50); background: rgba(139,92,246,.14); }
-
-/* Grids */
-.g4, .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 15px; margin-bottom: 18px; }
-.g2, .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; margin-bottom: 18px; }
-.grid, form.grid, .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: 13px; margin: 18px 0 22px; }
-.form-grid .wide { grid-column: span 2; }
-.packages { display: grid; grid-template-columns: 1fr; gap: 18px; margin-top: 16px; }
-.components-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 13px; align-items: stretch; }
-
-/* Cards */
-.card, .package-card, .component-card, .component-form, .stat {
-  position: relative;
-  background: linear-gradient(180deg, rgba(15,23,42,.92), rgba(2,6,23,.60));
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 18px;
-  box-shadow: var(--shadow-soft);
-  min-width: 0;
-  overflow: hidden;
-}
-.card::after, .package-card::after, .component-card::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.035);
-}
-.card { margin-bottom: 0; }
-.card:hover, .package-card:hover, .component-card:hover { border-color: rgba(139,92,246,.30); }
-.sc, .stat-card { position: relative; overflow: hidden; }
-.sc::before, .stat-card::before, .stat::before {
-  content: "";
-  position: absolute;
-  left: 0; right: 0; top: 0;
-  height: 3px;
-  background: linear-gradient(90deg, var(--primary), var(--cyan));
-}
-.sc.ok::before, .stat-card.success::before { background: linear-gradient(90deg, var(--green), #86efac); }
-.sc.warn::before, .stat-card.warning::before { background: linear-gradient(90deg, var(--yellow), #fde68a); }
-.sc.err::before, .stat-card.danger::before { background: linear-gradient(90deg, var(--red), #fca5a5); }
-.sc.cy::before, .stat-card.cyan::before { background: linear-gradient(90deg, var(--cyan), var(--blue)); }
-.sl, .stat-label, .ct, .card-title {
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-  letter-spacing: .13em;
-  text-transform: uppercase;
-  font-weight: 900;
-}
-.sl, .stat-label { margin-bottom: 8px; }
-.sv, .stat-value, .stat b { font-size: clamp(27px, 3.6vw, 44px); font-weight: 950; letter-spacing: -.06em; color: #fff; line-height: 1.05; }
-.ss, .stat-sub { margin-top: 5px; color: var(--muted); font-size: 12px; }
-.ct, .card-title { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 14px; padding-bottom: 11px; border-bottom: 1px solid var(--border); }
-.empty { color: var(--muted); text-align: center; padding: 22px; border: 1px dashed var(--border2); border-radius: 16px; background: rgba(15,23,42,.38); }
-
-/* Forms */
-label { color: #cbd5e1; font-size: 13px; font-weight: 750; }
-input, select, textarea {
-  width: 100%;
-  min-height: 48px;
-  padding: 12px 13px;
-  border-radius: 15px;
-  border: 1px solid var(--border2);
-  background: rgba(15,23,42,.78);
-  color: var(--text);
-  outline: none;
-  font: inherit;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.025);
-}
-input::placeholder, textarea::placeholder { color: #64748b; }
-input:focus, select:focus, textarea:focus { border-color: rgba(139,92,246,.76); box-shadow: 0 0 0 4px rgba(139,92,246,.16); }
-input[type="checkbox"], input[type="radio"] { width: auto; min-height: 0; }
-select { appearance: auto; }
-button, .btn, .rbtn, .link-btn, .refresh-btn {
-  min-height: 46px;
-  border-radius: 15px;
-  border: 0;
-  padding: 11px 16px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  cursor: pointer;
-  background: linear-gradient(135deg, var(--primary), var(--primary2));
-  color: #fff;
-  font-weight: 900;
-  font: inherit;
-  line-height: 1.18;
-  text-align: center;
-  transition: transform .16s ease, filter .16s ease, box-shadow .16s ease, border-color .16s ease;
-  text-decoration: none;
-  white-space: normal;
-  touch-action: manipulation;
-  box-shadow: 0 10px 22px rgba(109,40,217,.22);
-}
-button:hover, .btn:hover, .rbtn:hover, .refresh-btn:hover { filter: brightness(1.08); transform: translateY(-1px); box-shadow: 0 14px 28px rgba(109,40,217,.30); }
-button.delete, button.red, .btn.red { background: linear-gradient(135deg, var(--red), var(--red2)); color:#fff; box-shadow: 0 10px 22px rgba(220,38,38,.22); }
-button.green, .btn.green { background: linear-gradient(135deg, #22c55e, var(--green2)); color:#fff; box-shadow: 0 10px 22px rgba(21,128,61,.22); }
-button.toggle, button.slate, .btn.slate { background: linear-gradient(135deg, #475569, #334155); color:#fff; box-shadow: none; }
-.inline-form, .actions form { display: inline-flex; margin: 0 5px 6px 0; }
-
-/* Tables */
-.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 18px; border: 1px solid var(--border); background: rgba(2,6,23,.34); }
-table, .table { width: 100%; border-collapse: separate; border-spacing: 0; overflow: hidden; border-radius: 18px; background: rgba(2,6,23,.30); }
-th, td, .table th, .table td { padding: 14px 13px; border-bottom: 1px solid rgba(148,163,184,.10); text-align: left; vertical-align: middle; }
-th, .table th { background: rgba(15,23,42,.90); color: #cbd5e1; font-size: 12px; letter-spacing: .10em; text-transform: uppercase; font-weight: 950; white-space: nowrap; }
-td, .table td { color: var(--text); font-size: 14px; }
-tr:last-child td { border-bottom: 0; }
-tr:hover td { background: rgba(139,92,246,.045); }
-.service-name, .component-name, .pkg-title, .rdet, .order-detail, .lm, .log-meta, td, a, .history-title, .history-meta, .history-link { overflow-wrap: anywhere; word-break: break-word; }
-.service-name { max-width: 440px; color: #dbeafe; line-height: 1.42; }
-.service-name.missing { color: #8a8fa3; font-style: italic; }
-
-/* Packages */
-.package-card { background: linear-gradient(180deg, rgba(15,23,42,.95), rgba(2,6,23,.68)); }
-.package-head { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 14px; align-items: start; border-bottom: 1px solid var(--border); padding-bottom: 14px; margin-bottom: 14px; }
-.pkg-title { font-size: 20px; font-weight: 950; letter-spacing: -.035em; color: #fff; }
-.pkg-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-.pkg-actions { justify-content: flex-end; margin: 0; }
-.pkg-actions form { flex: 0 1 170px; }
-.pkg-body { display: grid; grid-template-columns: minmax(300px, 440px) minmax(0,1fr); gap: 16px; align-items: start; }
-.component-form { background: rgba(15,23,42,.60); }
-.component-form .stack { display: grid; gap: 10px; }
-.component-card { display: flex; flex-direction: column; gap: 9px; background: rgba(15,23,42,.76); border-color: rgba(96,165,250,.16); }
-.component-card form { margin-top: auto; }
-.component-name { font-size: 16px; font-weight: 950; color:#fff; }
-.component-line { color: #cbd5e1; font-size: 13px; line-height: 1.45; }
-
-/* Badges */
-.pill, .badge, .price-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: fit-content;
-  max-width: 100%;
-  border-radius: 999px;
-  padding: 5px 10px;
-  font-size: 12px;
-  font-weight: 950;
-  line-height: 1.15;
-  background: rgba(30,41,59,.90);
-  color: #cbd5e1;
-  border: 1px solid rgba(148,163,184,.12);
-}
-.pill.ok, .badge.ok, .badge.active, .active { background: rgba(5,150,105,.18); color: #86efac; border-color: rgba(34,197,94,.22); }
-.pill.off, .badge.off, .badge.passive, .passive { background: rgba(239,68,68,.15); color: #fca5a5; border-color: rgba(239,68,68,.25); }
-.badge.pending { background: rgba(245,158,11,.16); color: #fcd34d; border-color: rgba(245,158,11,.25); }
-.badge.failed { background: rgba(239,68,68,.16); color: #fca5a5; border-color: rgba(239,68,68,.25); }
-.price-badge { background: rgba(139,92,246,.16); color: #ddd6fe; border-color: rgba(139,92,246,.28); }
-
-/* Dashboard lists/logs */
-.row, .order-row, .history-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid rgba(148,163,184,.09); min-width: 0; }
-.row:last-child, .order-row:last-child, .history-row:last-child { border-bottom: 0; }
-.row > div, .order-row > div, .history-row > div { min-width: 0; }
-.rdet, .order-detail, .history-meta { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; margin-top: 3px; }
-.history-title { font-weight: 850; color: #e2e8f0; }
-.history-meta { display: flex; flex-wrap: wrap; gap: 8px; }
-.ll, .log-list { max-height: 390px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin; scrollbar-color: rgba(148,163,184,.32) transparent; }
-.ll::-webkit-scrollbar, .log-list::-webkit-scrollbar, pre::-webkit-scrollbar { width: 6px; height: 6px; }
-.ll::-webkit-scrollbar-thumb, .log-list::-webkit-scrollbar-thumb, pre::-webkit-scrollbar-thumb { background: rgba(148,163,184,.30); border-radius: 999px; }
-.le, .log-entry { display: flex; gap: 8px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid rgba(148,163,184,.08); }
-.lts, .log-ts { color: var(--muted); font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; flex: 0 0 auto; }
-.lv, .log-level { flex: 0 0 auto; font-size: 9px; padding: 3px 7px; border-radius: 8px; font-weight: 950; text-transform: uppercase; }
-.lv.info, .log-level.info { background: rgba(139,92,246,.22); color:#c4b5fd; }
-.lv.success, .log-level.success { background: rgba(16,185,129,.18); color:#86efac; }
-.lv.warning, .log-level.warning { background: rgba(245,158,11,.18); color:#fcd34d; }
-.lv.error, .log-level.error { background: rgba(239,68,68,.18); color:#fca5a5; }
-.lev, .log-event { min-width: 0; color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
-.lm, .log-meta { color: var(--muted); font-size: 10px; }
-.bar-wrap { display:flex; align-items:flex-end; height:88px; gap:5px; margin-top:10px; }
-.bar { flex:1; min-width:4px; min-height:2px; border-radius:5px 5px 0 0; background: linear-gradient(180deg,#c4b5fd,#7c3aed); opacity:.76; }
-.bar:hover { opacity:1; }
-.tab { padding:8px 13px; border-radius:12px; cursor:pointer; color:var(--muted); font-size:12px; font-weight:950; background:rgba(15,23,42,.54); border:1px solid var(--border); }
-.tab.active { background: linear-gradient(135deg, var(--primary), var(--primary2)); color:#fff; border-color: transparent; }
-
-/* Chart area */
-canvas { max-width: 100%; }
-.chart-wrap, .chart-card { min-height: 280px; }
-
-/* Mobile */
-@media (max-width: 1180px) {
-  .g4, .grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
-  .g2, .grid-2, .pkg-body { grid-template-columns: 1fr; }
-  .form-grid .wide { grid-column: span 2; }
-}
-@media (max-width: 780px) {
-  body { font-size: 14px; }
-  body::before { opacity: .55; background-size: 30px 30px; }
-  header, .topbar, .container, .wrap, .shell { width: 100%; max-width: 100%; margin: 0; border-left: 0; border-right: 0; border-radius: 0; }
-  header, .topbar { position: static; flex-direction: column; align-items: stretch; padding: 14px 12px; }
-  .wrap, .container, .shell { padding: 13px; overflow-x: hidden; }
-  h1 { font-size: 28px; letter-spacing: -.045em; }
-  h2 { font-size: 22px; }
-  .logo { font-size: 22px; }
-  .g4, .grid-4, .g2, .grid-2, .grid, form.grid, .form-grid, .components-grid { grid-template-columns: 1fr; }
-  .form-grid .wide { grid-column: auto; }
-  .toolbar, .top-actions, .filters, .pkg-actions { display: grid; grid-template-columns: 1fr; width: 100%; gap: 9px; }
-  .toolbar a, .toolbar form, .toolbar button, .top-actions a, .top-actions form, .pkg-actions form, .pkg-actions button, .btn, .rbtn, .link-btn { width: 100%; justify-content: center; }
-  input, select, textarea, button, .btn, .rbtn, .link-btn { min-height: 50px; font-size: 16px; width: 100%; }
-  .card, .package-card, .component-card, .component-form { padding: 14px; border-radius: 18px; }
-  .ct, .card-title { flex-direction: column; align-items: flex-start; }
-  .package-head { grid-template-columns: 1fr; }
-  .pkg-actions { justify-content: stretch; }
-  .pkg-body, .package-head, .components-grid { grid-template-columns: 1fr !important; }
-  .pkg-meta { gap: 6px; }
-  .pill, .badge { font-size: 11px; padding: 5px 9px; }
-  .row, .order-row, .history-row { align-items: flex-start; flex-direction: column; gap: 8px; }
-  .history-meta { gap: 6px; }
-  .bar-wrap { height: 76px; }
-  .ll, .log-list { max-height: 330px; }
-
-  .table-wrap { overflow: visible; border: 0; background: transparent; }
-  table, .table { width: 100%; display: block; background: transparent; border: 0; border-radius: 0; overflow: visible; white-space: normal; }
-  thead { display: none !important; }
-  tbody { display: grid !important; gap: 12px; width: 100%; }
-  tr { display: grid !important; width: 100%; background: linear-gradient(180deg, rgba(15,23,42,.94), rgba(2,6,23,.72)); border: 1px solid var(--border); border-radius: 18px; padding: 8px; box-shadow: var(--shadow-soft); overflow: hidden; }
-  tr:hover td { background: transparent; }
-  th { display: none; }
-  td, .table td { display: grid !important; grid-template-columns: 120px minmax(0, 1fr); gap: 10px; align-items: start; width: 100%; min-width: 0; max-width: 100%; padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.10); white-space: normal !important; overflow-wrap: anywhere; word-break: break-word; font-size: 14px; }
-  td:last-child { border-bottom: 0; }
-  td::before { content: attr(data-label); color: var(--muted); font-size: 10px; line-height: 1.35; font-weight: 950; letter-spacing: .10em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  td[data-label="İşlem"], td[data-label="İŞLEM"], td[data-label="Bileşen Ekle"], td[data-label="BİLEŞEN EKLE"], td[data-label="Payload"] { grid-template-columns: 1fr; }
-  td[data-label="İşlem"]::before, td[data-label="İŞLEM"]::before, td[data-label="Bileşen Ekle"]::before, td[data-label="BİLEŞEN EKLE"]::before, td[data-label="Payload"]::before { margin-bottom: 4px; }
-  td form, td .inline-form, .actions form { width: 100%; display: grid; gap: 8px; margin: 0 0 8px 0; }
-  td button, td .btn, td .rbtn { width: 100%; }
-}
-@media (max-width: 430px) {
-  td, .table td { grid-template-columns: 1fr; gap: 5px; }
-  td::before { margin-bottom: 2px; }
-  .wrap, .container, .shell { padding: 10px; }
-  .card, .package-card, .component-card, .component-form { padding: 12px; border-radius: 16px; }
-  h1 { font-size: 24px; }
-  .sv, .stat-value, .stat b { font-size: 27px; }
-  .notice, .muted, .small { font-size: 13px; }
-  .toolbar a:not(:has(button)), .top-actions a:not(:has(button)) { min-height: 46px; }
-}
-
-/* ─── BOOSTERA V15 UI POLISH: daha profesyonel + mobil dostu ─────────────── */
-:root {
-  --v15-bg-deep: #050816;
-  --v15-panel: rgba(15, 23, 42, .78);
-  --v15-panel-strong: rgba(15, 23, 42, .94);
-  --v15-border: rgba(148, 163, 184, .20);
-  --v15-border-strong: rgba(168, 85, 247, .32);
-  --v15-glow-purple: rgba(139, 92, 246, .28);
-  --v15-glow-cyan: rgba(34, 211, 238, .18);
-  --v15-shadow: 0 18px 55px rgba(0, 0, 0, .34);
-  --v15-radius: 24px;
-}
-
-html { scroll-behavior: smooth; }
-
-body {
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
-
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background:
-    radial-gradient(circle at 18% 10%, rgba(139, 92, 246, .14), transparent 30%),
-    radial-gradient(circle at 86% 18%, rgba(34, 211, 238, .10), transparent 26%),
-    linear-gradient(180deg, transparent 0%, rgba(2, 6, 23, .24) 100%);
-  z-index: -2;
-}
-
-header,
-.topbar {
-  border-color: var(--v15-border);
-  background: linear-gradient(180deg, rgba(15, 23, 42, .86), rgba(2, 6, 23, .72));
-  box-shadow: 0 16px 44px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.04);
-}
-
-.logo,
-.brand,
-h1,
-h2,
-h3 {
-  letter-spacing: -0.035em;
-}
-
-.container,
-.shell,
-.wrap {
-  width: min(1560px, calc(100% - 32px));
-}
-
-.card,
-.stat,
-.stat-card,
-.notice,
-.filter-box,
-.package-card,
-.component-card,
-.chart-wrap {
-  border: 1px solid var(--v15-border);
-  background:
-    linear-gradient(180deg, rgba(15,23,42,.88), rgba(2,6,23,.62)),
-    radial-gradient(circle at top left, rgba(139,92,246,.10), transparent 32%);
-  box-shadow: var(--v15-shadow), inset 0 1px 0 rgba(255,255,255,.035);
-  border-radius: var(--v15-radius);
-}
-
-.card:hover,
-.stat:hover,
-.stat-card:hover,
-.package-card:hover,
-.component-card:hover {
-  border-color: rgba(196,181,253,.34);
-  transform: translateY(-1px);
-  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
-}
-
-.card-title,
-.stat-label,
-.label {
-  letter-spacing: .12em;
-}
-
-.stat-value,
-.value {
-  letter-spacing: -0.055em;
-}
-
-.badge,
-.pill,
-.price-badge {
-  border: 1px solid rgba(255,255,255,.08);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
-  white-space: nowrap;
-}
-
-button,
-.btn,
-.link-btn,
-.refresh-btn,
-input[type="submit"] {
-  min-height: 42px;
-  touch-action: manipulation;
-  font-weight: 800;
-  letter-spacing: -.01em;
-}
-
-button:hover,
-.btn:hover,
-.link-btn:hover,
-.refresh-btn:hover,
-input[type="submit"]:hover {
-  transform: translateY(-1px);
-}
-
-input,
-select,
-textarea {
-  min-height: 44px;
-  border-color: rgba(148,163,184,.22) !important;
-  background: rgba(2,6,23,.45) !important;
-  color: #f8fafc !important;
-  outline: none;
-}
-
-input:focus,
-select:focus,
-textarea:focus {
-  border-color: rgba(168,85,247,.72) !important;
-  box-shadow: 0 0 0 4px rgba(139,92,246,.14);
-}
-
-textarea { resize: vertical; }
-
-table {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-}
-
-th {
-  color: #c4b5fd;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: .08em;
-}
-
-td, th { vertical-align: middle; }
-
-.log-list,
-pre,
-textarea {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(139,92,246,.45) rgba(15,23,42,.45);
-}
-
-.log-list::-webkit-scrollbar,
-pre::-webkit-scrollbar,
-textarea::-webkit-scrollbar,
-.card::-webkit-scrollbar {
-  height: 7px;
-  width: 7px;
-}
-
-.log-list::-webkit-scrollbar-thumb,
-pre::-webkit-scrollbar-thumb,
-textarea::-webkit-scrollbar-thumb,
-.card::-webkit-scrollbar-thumb {
-  background: rgba(139,92,246,.45);
-  border-radius: 999px;
-}
-
-.nav,
-.top-actions,
-.actions,
-.toolbar {
-  gap: 10px;
-}
-
-.nav a,
-.top-actions a,
-.actions a,
-.toolbar a,
-.toolbar button {
-  min-height: 40px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.card:has(table),
-.notice:has(table),
-.filter-box:has(table) {
-  overflow-x: auto;
-}
-
-.price-badge,
-.value,
-.stat-value {
-  text-shadow: 0 0 24px rgba(139,92,246,.15);
-}
-
-@media (max-width: 900px) {
-  header,
-  .topbar {
-    position: static;
-    width: calc(100% - 20px);
-    margin: 10px auto 0;
-    padding: 12px;
-    border-radius: 18px;
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .logo,
-  .brand {
-    font-size: clamp(20px, 6vw, 28px);
-    line-height: 1.05;
-  }
-
-  .container,
-  .shell,
-  .wrap {
-    width: calc(100% - 20px);
-    margin-left: auto;
-    margin-right: auto;
-    padding-left: 0 !important;
-    padding-right: 0 !important;
-  }
-
-  .grid,
-  .grid-2,
-  .grid-3,
-  .grid-4,
-  .two,
-  .form-grid,
-  .components-grid,
-  .packages {
-    display: grid !important;
-    grid-template-columns: 1fr !important;
-    gap: 14px !important;
-  }
-
-  .card,
-  .stat,
-  .stat-card,
-  .notice,
-  .filter-box,
-  .package-card,
-  .component-card,
-  .chart-wrap {
-    padding: 18px !important;
-    border-radius: 20px !important;
-  }
-
-  .nav,
-  .top-actions,
-  .actions,
-  .toolbar {
-    display: grid !important;
-    grid-template-columns: 1fr 1fr;
-    width: 100%;
-  }
-
-  .nav a,
-  .top-actions a,
-  .actions a,
-  .toolbar a,
-  .toolbar button,
-  .btn,
-  .link-btn,
-  .refresh-btn,
-  button,
-  input[type="submit"] {
-    width: 100%;
-    min-height: 48px;
-    padding: 12px 14px !important;
-    border-radius: 14px !important;
-    font-size: 14px;
-    text-align: center;
-  }
-
-  input,
-  select,
-  textarea {
-    width: 100% !important;
-    font-size: 16px !important;
-    border-radius: 14px !important;
-  }
-
-  label,
-  .label {
-    font-size: 13px;
-  }
-
-  table {
-    min-width: 720px;
-    font-size: 13px;
-  }
-
-  td, th {
-    padding: 10px 12px !important;
-  }
-
-  .stat-value,
-  .value {
-    font-size: clamp(30px, 12vw, 46px) !important;
-    line-height: 1.05;
-    word-break: break-word;
-  }
-
-  .stat-label {
-    font-size: 11px !important;
-  }
-
-  .log-entry,
-  .order-row,
-  .history-row,
-  .line,
-  .component-line {
-    align-items: flex-start !important;
-    gap: 8px !important;
-  }
-
-  .muted,
-  .small,
-  .sub,
-  .stat-sub,
-  .order-detail {
-    font-size: 13px !important;
-    line-height: 1.55;
-  }
-
-  pre {
-    max-height: 320px;
-  }
-}
-
-@media (max-width: 560px) {
-  body { font-size: 14px; }
-
-  header,
-  .topbar {
-    width: calc(100% - 14px);
-    margin-top: 7px;
-    border-radius: 16px;
-  }
-
-  .container,
-  .shell,
-  .wrap {
-    width: calc(100% - 14px);
-  }
-
-  .card,
-  .stat,
-  .stat-card,
-  .notice,
-  .filter-box,
-  .package-card,
-  .component-card,
-  .chart-wrap {
-    padding: 15px !important;
-    border-radius: 18px !important;
-  }
-
-  .nav,
-  .top-actions,
-  .actions,
-  .toolbar {
-    grid-template-columns: 1fr !important;
-  }
-
-  h1 { font-size: clamp(28px, 10vw, 42px) !important; }
-  h2 { font-size: clamp(22px, 8vw, 32px) !important; }
-  h3 { font-size: clamp(18px, 6vw, 24px) !important; }
-
-  .stat-value,
-  .value {
-    font-size: clamp(28px, 14vw, 42px) !important;
-  }
-
-  .badge,
-  .pill,
-  .price-badge {
-    display: inline-flex;
-    max-width: 100%;
-    white-space: normal;
-    line-height: 1.25;
-  }
-
-  .row,
-  .order-row,
-  .history-row,
-  .line,
-  .package-head,
-  .component-line {
-    flex-direction: column !important;
-    align-items: stretch !important;
-  }
-
-  table {
-    min-width: 640px;
-  }
-
-  .card:has(table),
-  .notice:has(table),
-  .filter-box:has(table) {
-    margin-left: -2px;
-    margin-right: -2px;
-  }
-}
-
-@supports (padding: max(0px)) {
-  body {
-    padding-left: max(0px, env(safe-area-inset-left));
-    padding-right: max(0px, env(safe-area-inset-right));
-  }
-}
-
-
-
-/* BOOSTERA_PRO_UI_OVERRIDE_V19 */
-:root {
-  --action-primary: #2563eb;
-  --action-primary2: #1d4ed8;
-  --action-success: #16a34a;
-  --action-success2: #15803d;
-  --action-warn: #d97706;
-  --action-warn2: #b45309;
-  --action-danger: #dc2626;
-  --action-danger2: #991b1b;
-  --action-neutral: #475569;
-  --action-neutral2: #334155;
-  --touch: 44px;
-}
-body { letter-spacing: 0; }
-.card, .panel, section, table, form { min-width: 0; }
-button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
-  min-height: var(--touch);
-  border-radius: 10px !important;
-  padding: 10px 14px !important;
-  font-weight: 850 !important;
-  letter-spacing: 0 !important;
-  line-height: 1.15 !important;
-  white-space: normal !important;
-  overflow-wrap: anywhere;
-  box-shadow: 0 8px 18px rgba(15, 23, 42, .22) !important;
-}
-button:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
-.btn:not(.red):not(.delete):not(.green):not(.slate):not(.toggle):not(.retry),
-.refresh-btn {
-  background: linear-gradient(135deg, var(--action-primary), var(--action-primary2)) !important;
-  border-color: rgba(147,197,253,.28) !important;
-  color: #fff !important;
-}
-button.green, .btn.green, input[type="submit"].green,
-a[href*="manual-order"].btn, a[href*="bind"].btn, a[href*="service-search"].btn {
-  background: linear-gradient(135deg, var(--action-success), var(--action-success2)) !important;
-  border-color: rgba(134,239,172,.24) !important;
-  color: #fff !important;
-}
-button.red, button.delete, .btn.red, .btn.delete,
-form[action*="delete"] button, form[action*="reset"] button, form[action*="cancel"] button {
-  background: linear-gradient(135deg, var(--action-danger), var(--action-danger2)) !important;
-  border-color: rgba(252,165,165,.24) !important;
-  color: #fff !important;
-}
-button.slate, button.toggle, .btn.slate, .btn.toggle,
-a[href*="queue"].btn, a[href*="system-check"].btn, a[href*="api/"] .btn {
-  background: linear-gradient(135deg, var(--action-neutral), var(--action-neutral2)) !important;
-  border-color: rgba(203,213,225,.18) !important;
-  color: #fff !important;
-}
-button.retry, .btn.retry, form[action*="retry"] button {
-  background: linear-gradient(135deg, var(--action-warn), var(--action-warn2)) !important;
-  border-color: rgba(253,230,138,.24) !important;
-  color: #fff !important;
-}
-button:hover, .btn:hover, .rbtn:hover, .link-btn:hover, .refresh-btn:hover {
-  filter: brightness(1.04) !important;
-  transform: translateY(-1px) !important;
-}
-.toolbar, .top-actions, .nav, .pkg-actions, .tabs {
-  gap: 8px !important;
-  align-items: center !important;
-}
-.toolbar form, .top-actions form, .pkg-actions form { margin: 0 !important; }
-input, select, textarea {
-  border-radius: 10px !important;
-  min-height: var(--touch);
-  font-size: 15px !important;
-}
-table {
-  width: 100% !important;
-  border-collapse: separate !important;
-  border-spacing: 0 !important;
-}
-th, td { vertical-align: top !important; }
-td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
-.row { align-items: center; }
-.pill { border-radius: 999px !important; }
-@media (max-width: 760px) {
-  body { font-size: 14px !important; }
-  header, .topbar, .wrap, .container, .shell {
-    width: calc(100% - 18px) !important;
-    margin-left: auto !important;
-    margin-right: auto !important;
-  }
-  header, .topbar {
-    position: static !important;
-    padding: 12px !important;
-    border-radius: 16px !important;
-    align-items: stretch !important;
-  }
-  .wrap, .container, .shell {
-    padding: 12px !important;
-    border-radius: 18px !important;
-  }
-  h1 { font-size: 28px !important; }
-  h2 { font-size: 20px !important; margin-top: 20px !important; }
-  .grid, .two, .cards, .stats, .form-grid {
-    grid-template-columns: 1fr !important;
-  }
-  .toolbar, .top-actions, .nav, .pkg-actions, .tabs {
-    display: grid !important;
-    grid-template-columns: 1fr 1fr !important;
-    width: 100% !important;
-  }
-  .toolbar > *, .top-actions > *, .nav > *, .pkg-actions > *, .tabs > * {
-    width: 100% !important;
-    min-width: 0 !important;
-  }
-  button, .btn, .rbtn, .link-btn, .refresh-btn, input[type="submit"] {
-    width: 100% !important;
-    min-height: 48px !important;
-    justify-content: center !important;
-    text-align: center !important;
-    font-size: 14px !important;
-  }
-  input, select, textarea { width: 100% !important; font-size: 16px !important; }
-  table { display: block !important; overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
-  thead, tbody, tr { min-width: max-content; }
-  th, td { padding: 10px !important; font-size: 13px !important; }
-  td button, td .btn, td .rbtn { min-width: 120px; }
-  .row { display: grid !important; grid-template-columns: 1fr !important; gap: 8px !important; align-items: start !important; }
-  pre { max-height: 220px !important; }
-}
-@media (max-width: 420px) {
-  .toolbar, .top-actions, .nav, .pkg-actions, .tabs { grid-template-columns: 1fr !important; }
-  h1 { font-size: 24px !important; }
-  .stat .value { font-size: 30px !important; }
-}
-
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <h1>Boostera Dead Queue</h1>
-    <p class="small">Buraya düşen webhooklar otomatik işlenememiştir. Kontrol edip tekrar kuyruğa alabilirsin.</p>
-    <p><a href="/admin">← Admin panele dön</a></p>
-  </div>
-
-  <div class="card grid">
-    <div class="stat"><span class="small">Bekleyen</span><b>{{ status.queue.waiting }}</b></div>
-    <div class="stat"><span class="small">İşlenen</span><b>{{ status.queue.processing }}</b></div>
-    <div class="stat"><span class="small">Dead</span><b>{{ status.queue.dead }}</b></div>
-  </div>
-
-  <div class="card">
-    <form method="post" action="/admin/queue-dead/retry" onsubmit="return confirm('Tüm dead queue tekrar kuyruğa alınsın mı?')">
-      <input type="hidden" name="retry_all" value="1">
-      <button class="btn red" type="submit">Tüm Dead Queue'yu Tekrar Dene</button>
-    </form>
-  </div>
-
-  <div class="card">
-    <h2>Dead kayıtlar</h2>
-    {% if rows %}
-    <table>
-      <thead>
-        <tr>
-          <th>Queue ID</th>
-          <th>Order ID</th>
-          <th>Deneme</th>
-          <th>Sebep</th>
-          <th>Payload</th>
-          <th>İşlem</th>
-        </tr>
-      </thead>
-      <tbody>
-      {% for row in rows %}
-        <tr>
-          <td>{{ row.id | e }}</td>
-          <td>{{ row.order_id | e }}</td>
-          <td>{{ row.attempts }}</td>
-          <td>{{ row.dead_reason | e }}</td>
-          <td><pre>{{ row.payload_preview | e }}</pre></td>
-          <td>
-            <form method="post" action="/admin/queue-dead/retry">
-              <input type="hidden" name="queue_id" value="{{ row.id | e }}">
-              <button class="btn" type="submit">Tekrar Kuyruğa Al</button>
-            </form>
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-      <p class="small">Dead queue boş.</p>
-    {% endif %}
-  </div>
-</div>
-</body>
-</html>
-"""
+    return {"items": {}}
 
 
 @app.get("/admin/queue-dead", response_class=HTMLResponse)
@@ -14183,7 +12438,42 @@ def admin_queue_dead(user: str = Depends(get_current_admin)):
             "dead_reason": item.get("dead_reason", item.get("last_error", "")),
             "payload_preview": json.dumps(payload or item, ensure_ascii=False, indent=2, default=str)[:3000],
         })
-    return HTMLResponse(Template(QUEUE_DEAD_HTML).render(rows=rows, status=build_queue_status()))
+    row_html = []
+    for row in rows:
+        row_id = html.escape(str(row.get("id", "")))
+        order_id_html = html.escape(str(row.get("order_id", "")))
+        attempts_html = html.escape(str(row.get("attempts", "")))
+        reason_html = html.escape(str(row.get("dead_reason", "")))
+        payload_html = html.escape(str(row.get("payload_preview", "")))
+        row_html.append(
+            "<tr>"
+            f"<td><code>{row_id}</code></td>"
+            f"<td>{order_id_html}</td>"
+            f"<td>{attempts_html}</td>"
+            f"<td>{reason_html}</td>"
+            f"<td><pre style='white-space:pre-wrap;max-width:520px'>{payload_html}</pre></td>"
+            "<td>"
+            "<form method='post' action='/admin/queue-dead/retry'>"
+            f"<input type='hidden' name='queue_id' value='{row_id}'>"
+            "<button>Tekrar kuyruğa al</button>"
+            "</form>"
+            "</td>"
+            "</tr>"
+        )
+    rows_text = "".join(row_html) or "<tr><td colspan='6'>Dead queue boş.</td></tr>"
+    body = (
+        "<div class='card'>"
+        "<form method='post' action='/admin/queue-dead/retry'>"
+        "<input type='hidden' name='retry_all' value='1'>"
+        "<button>Tümünü tekrar kuyruğa al</button>"
+        "</form>"
+        "</div>"
+        "<div class='card'><table class='table'>"
+        "<thead><tr><th>Queue ID</th><th>Sipariş</th><th>Deneme</th><th>Sebep</th><th>Payload</th><th>İşlem</th></tr></thead>"
+        f"<tbody>{rows_text}</tbody>"
+        "</table></div>"
+    )
+    return simple_admin_page("Queue Dead", body)
 
 
 @app.post("/admin/queue-dead/retry")
@@ -14281,15 +12571,23 @@ def build_system_check() -> dict:
         "balance_alerts": {
             "threshold_tl": BALANCE_WARN_THRESHOLD_TL,
             "repeat_minutes": BALANCE_WARN_REPEAT_MINUTES,
-            "last_warn": BALANCE_WARN_LAST,
         },
         "background_tasks": background,
-        "redis": build_redis_health(),
-        "queue_status": build_queue_status(),
+        "redis": {
+            "configured": bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN),
+            "ok": bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN) and not (_REDIS_BACKOFF_UNTIL and time.time() < _REDIS_BACKOFF_UNTIL),
+            "backoff_active": bool(_REDIS_BACKOFF_UNTIL and time.time() < _REDIS_BACKOFF_UNTIL),
+        },
+        "queue_status": {
+            "ok": True,
+            "not_checked": True,
+            "queue": {"waiting": 0, "processing": 0, "dead": 0},
+            "note": "Light system-check does not query Redis queue. Use /api/queue-status for live queue counts.",
+        },
         "itemsatis_adverts": {
             "profile_url_configured": bool(ITEMSATIS_PROFILE_URL),
-            "cached_count": len((redis_get_json(ITEMSATIS_ADVERT_CACHE_KEY, {}) or {}).get("items", []) or []),
-            "local_count": len(collect_itemsatis_adverts_from_local_state()),
+            "cached_count": 0,
+            "local_count": len(DYNAMIC_SERVICES or {}) + len(PACKAGE_CONFIGS or {}),
         },
         "telegram": {
             "main_configured": bool(BOT_TOKEN and CHAT_ID),
@@ -14301,8 +12599,6 @@ def build_system_check() -> dict:
             "processed_orders": len(PROCESSED_ORDERS),
             "processed_links": len(PROCESSED_LINKS),
             "log_history": len(LOG_HISTORY),
-            "link_audit": len(LINK_AUDIT_HISTORY),
-            "service_completion_stats": len(SERVICE_COMPLETION_STATS or {}),
         },
     }
 
@@ -14326,8 +12622,6 @@ def api_export(user: str = Depends(get_current_admin)):
         extrasaction="ignore",
     )
     writer.writeheader()
-    for row in ORDER_HISTORY:
-        writer.writerow(row)
     output.seek(0)
     filename = f"boostera_orders_{now_tr().strftime('%Y%m%d_%H%M%S')}.csv"
     return StreamingResponse(
@@ -15906,10 +14200,7 @@ def admin_bind_package_add_component(advert_id: str = Form(...), component_name:
 
 @app.get("/admin/favorites", response_class=HTMLResponse)
 def admin_favorites(user: str = Depends(get_current_admin)):
-    rows = "".join([
-        f"<tr><td data-label='Ad'>{v.get('name')}</td><td data-label='Panel'>{get_panel_config(v.get('panel')).get('name')}</td><td data-label='Servis ID'>{v.get('service_id')}</td><td data-label='Adet'>{v.get('quantity')}</td><td data-label='Platform'>{v.get('platform')}</td><td data-label='İşlem'><form method='post' action='/admin/favorites/delete'><input type='hidden' name='favorite_key' value='{k}'><button class='red'>Sil</button></form></td></tr>"
-        for k,v in sorted(FAVORITE_SERVICES.items())
-    ])
+    rows = ""
     body = f"""
     <div class='card'><div class='muted'>Sık kullandığın panel servislerini burada tut. Manuel sipariş ekranında bu bilgilerle hızlı işlem yapabilirsin.</div>
     <form class='grid' method='post' action='/admin/favorites/add'><select name='panel'>{''.join([f'<option value="{k}">{v.get("name",k)} ({k})</option>' for k,v in PANEL_MAP.items()])}</select><input name='service_id' placeholder='Servis ID' required><input name='name' placeholder='Favori adı'><input type='number' name='quantity' value='1000'><select name='platform'><option>tiktok</option><option>instagram</option><option>youtube</option><option>x</option><option>twitch</option><option>kick</option><option>other</option></select><button class='green'>Favori Ekle</button></form></div>
@@ -15964,18 +14255,13 @@ def admin_profit_calculator(sale: float = 0, cost: float = 0, user: str = Depend
 
 @app.get("/admin/balance-history", response_class=HTMLResponse)
 def admin_balance_history(user: str = Depends(get_current_admin)):
-    rows = []
-    for day, panels in sorted(BALANCE_HISTORY.items(), reverse=True):
-        for key, item in sorted((panels or {}).items()):
-            rows.append(f"<tr><td data-label='Tarih'>{day}</td><td data-label='Panel'>{item.get('panel_name', key)}</td><td data-label='Bakiye'>{format_tl_amount(item.get('balance_tl',0))}</td><td data-label='Güncelleme'>{item.get('updated_at','')}</td></tr>")
-    body = f"<div class='card'><div class='muted'>/balance, /balance-all veya panel health çalıştıkça bakiye geçmişi dolar.</div><table class='table'><thead><tr><th>Tarih</th><th>Panel</th><th>Bakiye</th><th>Güncelleme</th></tr></thead><tbody>{''.join(rows[:200]) or '<tr><td>Kayıt yok.</td></tr>'}</tbody></table></div>"
+    body = "<div class='card'><table class='table'><tbody><tr><td>Kayıt yok.</td></tr></tbody></table></div>"
     return simple_admin_page("Panel Bakiye Geçmişi", body)
 
 
 @app.get("/admin/link-audit", response_class=HTMLResponse)
 def admin_link_audit(user: str = Depends(get_current_admin)):
-    rows = "".join([f"<tr><td data-label='Saat'>{x.get('ts')}</td><td data-label='Sipariş'>{x.get('order_id')}</td><td data-label='Ürün'>{x.get('product_name')}</td><td data-label='Platform'>{x.get('platform')}</td><td data-label='Link'>{x.get('link')}</td><td data-label='Durum'>{x.get('status')}</td><td data-label='Not'>{x.get('note')}</td></tr>" for x in reversed(LINK_AUDIT_HISTORY[-200:])])
-    body = f"<div class='card'><div class='muted'>Botun siparişte hangi linki yakaladığını gösterir. Yanlış CDN/görsel link olaylarını burada takip edebilirsin.</div><table class='table'><thead><tr><th>Saat</th><th>Sipariş</th><th>Ürün</th><th>Platform</th><th>Link</th><th>Durum</th><th>Not</th></tr></thead><tbody>{rows or '<tr><td>Kayıt yok.</td></tr>'}</tbody></table></div>"
+    body = "<div class='card'><table class='table'><tbody><tr><td>Kayıt yok.</td></tr></tbody></table></div>"
     return simple_admin_page("Link Yakalama Geçmişi", body)
 
 
@@ -16023,15 +14309,6 @@ def admin_failed_mark_completed(
         if matches_smm or matches_order:
             item["manual_completed"] = True
             item["manual_completed_at"] = now_tr().strftime("%Y-%m-%d %H:%M:%S")
-            add_order_history(
-                item.get("order_id", "Bilinmiyor"),
-                item.get("advert_id", ""),
-                item.get("product_name", "Bilinmeyen Ürün"),
-                item.get("panel", ""),
-                item.get("smm_order_id", ""),
-                item.get("link", ""),
-                item.get("price", 0),
-            )
             try:
                 FAILED_ORDERS.pop(index)
             except Exception:
@@ -16165,7 +14442,6 @@ def check_orders():
                 platform=item.get("platform", runtime_service.get("platform", "")),
                 retryable=True,
             )
-            update_panel_stats(item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""), "partial" if status == "partial" else "failed")
             send_telegram(
                 f"⚠️ SMM sipariş sorunlu duruma düştü.\n\n"
                 f"Ürün: {item.get('product_name', 'Bilinmiyor')}\n"
@@ -16199,12 +14475,6 @@ def check_orders():
         if status in COMPLETED_PANEL_STATUSES:
             log("success", "order_completed", smm_order_id=item.get("smm_order_id"), product=item.get("product_name"))
             duration_minutes = int((time.time() - int(item.get("created_at", time.time()) or time.time())) / 60)
-            update_panel_stats(item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""), "success", duration_minutes)
-            update_service_completion_stats(
-                item.get("panel_key") or runtime_service.get("panel_key") or item.get("panel", ""),
-                item.get("service_id") or runtime_service.get("service_id", ""),
-                duration_minutes,
-            )
             send_telegram(
                 f"SMM siparişi tamamlandı.\n\nÜrün: {item.get('product_name', 'Bilinmiyor')}\nPanel: {item.get('panel', 'Bilinmiyor')}\n"
                 f"Itemsatış ID: {item.get('itemsatis_order_id', 'Bilinmiyor')}\nSMM ID: {item.get('smm_order_id', 'Bilinmiyor')}\nLink: {item.get('link', '')}\n\n"
@@ -16212,18 +14482,6 @@ def check_orders():
                 f"Müşteriye değerlendirme mesajı gönderildi."
             )
             notify_customer_order_completed(item.get("itemsatis_order_id", ""), item.get("product_name", ""), item.get("link", ""))
-            add_order_history(
-                item.get("itemsatis_order_id", "Bilinmiyor"),
-                item.get("advert_id", ""),
-                item.get("product_name", "Bilinmeyen Ürün"),
-                item.get("panel", ""),
-                item.get("smm_order_id", ""),
-                item.get("link", ""),
-                item.get("price", 0),
-                duration_minutes,
-                item.get("avg_completion_minutes", ""),
-                item.get("submitted_at", ""),
-            )
             completed_indexes.append(index)
             changed = True
 
@@ -16272,71 +14530,6 @@ def handle_cancel_command(text: str):
 
     save_state()
 
-
-@app.head("/daily-report")
-def daily_report_head():
-    return {"ok": True, "status": "alive", "endpoint": "daily-report"}
-
-
-@app.get("/daily-report")
-def daily_report():
-    global LAST_DAILY_REPORT_DATE, DAILY_STATS
-    now = now_tr()
-    today = now.strftime("%Y-%m-%d")
-    if now.hour != 0:
-        return {"ok": True, "message": "Rapor saati değil"}
-    if LAST_DAILY_REPORT_DATE == today:
-        return {"ok": True, "message": "Bugünün raporu zaten gönderildi"}
-    report_text = build_sales_report("Günlük Satış Özeti", DAILY_STATS, "Bugün kayıtlı sipariş yok.")
-    send_telegram(report_text)
-    LAST_DAILY_REPORT_DATE = today
-    DAILY_STATS = {}
-    save_state()
-    return {"ok": True, "sent": True}
-
-
-@app.head("/weekly-report")
-def weekly_report_head():
-    return {"ok": True, "status": "alive", "endpoint": "weekly-report"}
-
-
-@app.get("/weekly-report")
-def weekly_report():
-    global LAST_WEEKLY_REPORT_DATE, WEEKLY_STATS
-    now = now_tr()
-    today = now.strftime("%Y-%m-%d")
-    if now.weekday() != 0 or now.hour != 0:
-        return {"ok": True, "message": "Haftalık rapor saati değil"}
-    if LAST_WEEKLY_REPORT_DATE == today:
-        return {"ok": True, "message": "Bu haftanın raporu zaten gönderildi"}
-    report_text = build_sales_report("Haftalık Satış Raporu", WEEKLY_STATS, "Bu hafta kayıtlı sipariş yok.")
-    send_telegram(report_text)
-    LAST_WEEKLY_REPORT_DATE = today
-    WEEKLY_STATS = {}
-    save_state()
-    return {"ok": True, "sent": True}
-
-
-@app.head("/monthly-report")
-def monthly_report_head():
-    return {"ok": True, "status": "alive", "endpoint": "monthly-report"}
-
-
-@app.get("/monthly-report")
-def monthly_report():
-    global LAST_MONTHLY_REPORT_DATE, MONTHLY_STATS
-    now = now_tr()
-    today = now.strftime("%Y-%m-%d")
-    if now.day != 1 or now.hour != 0:
-        return {"ok": True, "message": "Aylık rapor saati değil"}
-    if LAST_MONTHLY_REPORT_DATE == today:
-        return {"ok": True, "message": "Bu ayın raporu zaten gönderildi"}
-    report_text = build_sales_report("Aylık Satış Raporu", MONTHLY_STATS, "Bu ay kayıtlı sipariş yok.")
-    send_telegram(report_text)
-    LAST_MONTHLY_REPORT_DATE = today
-    MONTHLY_STATS = {}
-    save_state()
-    return {"ok": True, "sent": True}
 
 
 def get_price_check_targets(include_inactive: bool = False):
@@ -16579,13 +14772,6 @@ def process_itemsatis_webhook_payload(data: dict):
 
         report_product_name = get_itemsatis_report_name(advert_id, product_name)
 
-        sale_recorded = record_itemsatis_sale(data=data, order_id=order_id, advert_id=advert_id, buyer=buyer,
-                              product_name=report_product_name, price=price)
-        if sale_recorded:
-            record_buyer_stats(buyer, price)
-            # record_itemsatis_sale bu sürümde Redis'e yazmaz; buyer stats ile birlikte tek save yeterlidir.
-            if PERSIST_ANALYTICS_STATE:
-                save_state()
 
         log("info", "sale_received", order_id=order_id, product=report_product_name, buyer=buyer, price=price)
 
@@ -16602,7 +14788,6 @@ def process_itemsatis_webhook_payload(data: dict):
             customer_link, detected_link_platform = find_package_order_link(data, package)
 
             if not customer_link:
-                record_link_audit(order_id, advert_id, package_name, package_platform, "", "blocked", "Paket linki bulunamadı")
                 add_failed_order(order_id, advert_id, package_name, "Paket sipariş linki bulunamadı")
                 notify_customer_order_failed(order_id, package_name)
                 send_telegram(
@@ -16612,7 +14797,6 @@ def process_itemsatis_webhook_payload(data: dict):
                 return {"ok": False, "error": "package_link_not_found"}
 
             log("info", "package_customer_link_detected", advert_id=advert_id, platform=detected_link_platform, link=customer_link)
-            record_link_audit(order_id, advert_id, package_name, detected_link_platform or package_platform, customer_link, "ok", "Paket linki yakalandı")
 
 
             normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
@@ -16621,8 +14805,32 @@ def process_itemsatis_webhook_payload(data: dict):
 
             if has_processed_order(order_keys):
                 return {"ignored": True, "reason": "duplicate_package_order"}
-            if duplicate_link_key in PROCESSED_LINKS:
-                return {"ignored": True, "reason": "duplicate_package_link"}
+
+            active_pending = find_active_pending_by_link(customer_link, detected_link_platform or package_platform)
+            if active_pending:
+                add_failed_order(
+                    order_id,
+                    advert_id,
+                    package_name,
+                    "Aynı link için aktif pending sipariş var",
+                    "Bu link için önceki sipariş hâlâ pending durumda. Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi.",
+                    link=customer_link,
+                    panel="package",
+                    platform=detected_link_platform or package_platform,
+                    retryable=False,
+                    existing_pending_order_id=active_pending.get("itemsatis_order_id", ""),
+                    existing_smm_order_id=active_pending.get("smm_order_id", ""),
+                )
+                mark_processed_order(order_keys)
+                save_state()
+                notify_customer_order_failed(order_id, package_name)
+                send_telegram(
+                    f"Aynı link için aktif pending sipariş var.\n\n"
+                    f"Sipariş ID: {order_id}\nPaket: {package_name}\nLink: {customer_link}\n"
+                    f"Mevcut SMM ID: {active_pending.get('smm_order_id', '-')}\n\n"
+                    f"Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi."
+                )
+                return {"ok": False, "reason": "active_pending_same_link"}
 
             success_rows = []
             failed_rows = []
@@ -16720,8 +14928,7 @@ def process_itemsatis_webhook_payload(data: dict):
                     panel_key=service.get("panel_key", ""),
                     price=0,
                 )
-                completion_text = build_completion_estimate_text(service.get("panel_key", ""), service.get("service_id", ""), service.get("panel", ""))
-                success_rows.append((component_name, service.get("panel", "Panel"), smm_order_id, completion_text))
+                success_rows.append((component_name, service.get("panel", "Panel"), smm_order_id))
 
             if success_rows:
                 PROCESSED_LINKS.add(duplicate_link_key)
@@ -16729,15 +14936,13 @@ def process_itemsatis_webhook_payload(data: dict):
                 save_state()
                 notify_customer_order_started(order_id, package_name, customer_link)
 
-            success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id} | {completion_text}" for name, panel, smm_id, completion_text in success_rows]) or "Yok"
+            success_text = "\n".join([f"✅ {name} | {panel} | SMM ID: {smm_id}" for name, panel, smm_id in success_rows]) or "Yok"
             failed_text = "\n".join([f"❌ {name} | {panel} | {err}" for name, panel, err in failed_rows]) or "Yok"
             package_cost = estimate_package_cost_tl(components)
             send_telegram(
                 f"Paket sipariş işlendi.\n\nPaket: {package_name}\nItemsatış ID: {order_id}\nLink: {customer_link}\n\n"
                 f"Başarılı:\n{success_text}\n\nHatalı:\n{failed_text}\n\n"
-                f"{build_finance_summary(price, package_cost)}\n\n"
-                f"{build_buyer_summary(buyer)}\n\n"
-                f"{build_order_growth_tip(package_platform, package_name)}"
+                f"{build_finance_summary(price, package_cost)}"
             )
 
             if not success_rows:
@@ -16752,13 +14957,10 @@ def process_itemsatis_webhook_payload(data: dict):
             customer_link = find_order_link(data, platform)
 
             if not customer_link:
-                record_link_audit(order_id, advert_id, service_name, platform, "", "blocked", "Sipariş linki bulunamadı")
                 add_failed_order(order_id, advert_id, service_name, "Sipariş linki bulunamadı")
                 notify_customer_order_failed(order_id, service_name)
                 send_telegram(f"Sipariş linki bulunamadı.\n\nSipariş ID: {order_id}\nÜrün: {service_name}\nPlatform: {platform or 'belirsiz'}\nMüşteri: {buyer}")
                 return {"ok": False, "error": "order_link_not_found"}
-
-            record_link_audit(order_id, advert_id, service_name, platform, customer_link, "ok", "Servis linki yakalandı")
 
             normalized_link = normalize_link_for_check(customer_link, platform)
             duplicate_link_key = f"{advert_id}:{normalized_link}"
@@ -16767,8 +14969,34 @@ def process_itemsatis_webhook_payload(data: dict):
             if has_processed_order(order_keys):
                 return {"ignored": True, "reason": "duplicate_order"}
 
-            if duplicate_link_key in PROCESSED_LINKS:
-                return {"ignored": True, "reason": "duplicate_link"}
+            active_pending = find_active_pending_by_link(customer_link, platform)
+            if active_pending:
+                add_failed_order(
+                    order_id,
+                    advert_id,
+                    service_name,
+                    "Aynı link için aktif pending sipariş var",
+                    "Bu link için önceki sipariş hâlâ pending durumda. Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi.",
+                    link=customer_link,
+                    panel=service.get("panel", ""),
+                    panel_key=service.get("panel_key", ""),
+                    service_id=service.get("service_id", ""),
+                    quantity=service.get("quantity", ""),
+                    platform=platform,
+                    retryable=False,
+                    existing_pending_order_id=active_pending.get("itemsatis_order_id", ""),
+                    existing_smm_order_id=active_pending.get("smm_order_id", ""),
+                )
+                mark_processed_order(order_keys)
+                save_state()
+                notify_customer_order_failed(order_id, service_name)
+                send_telegram(
+                    f"Aynı link için aktif pending sipariş var.\n\n"
+                    f"Sipariş ID: {order_id}\nÜrün: {service_name}\nLink: {customer_link}\n"
+                    f"Mevcut SMM ID: {active_pending.get('smm_order_id', '-')}\n\n"
+                    f"Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi."
+                )
+                return {"ok": False, "reason": "active_pending_same_link"}
 
             preflight = validate_service_order_preflight(service, customer_link, service_name)
             if not preflight.get("ok"):
@@ -16877,15 +15105,11 @@ def process_itemsatis_webhook_payload(data: dict):
             after_balance_text = ""
             if current_balance_tl is not None and estimated_cost is not None:
                 after_balance_text = f"\nTahmini sipariş sonrası bakiye: {format_tl_amount(current_balance_tl - estimated_cost)}"
-            completion_estimate_text = build_completion_estimate_text(service.get("panel_key", ""), service.get("service_id", ""), service.get("panel", ""))
-
             send_telegram(
                 f"SMM siparişi panele girildi.\n\nÜrün: {service_name}\nPanel: {service['panel']}\n"
                 f"Itemsatış ID: {order_id}\nSMM ID: {smm_order_id}\nLink: {customer_link}\n"
-                f"Adet: {service['quantity']}\n{completion_estimate_text}\nBakiye: {format_tl_amount(current_balance_tl or 0)}{after_balance_text}\n\n"
-                f"{build_finance_summary(price, estimated_cost)}\n\n"
-                f"{build_buyer_summary(buyer)}\n\n"
-                f"{build_order_growth_tip(platform, service_name)}"
+                f"Adet: {service['quantity']}\nBakiye: {format_tl_amount(current_balance_tl or 0)}{after_balance_text}\n\n"
+                f"{build_finance_summary(price, estimated_cost)}"
             )
 
             return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
@@ -16974,15 +15198,6 @@ async def telegram_webhook(request: Request):
 /services - Servis eşleştirmeleri
 /admin - Web servis yönetim paneli
 /cancel smm_id - Siparişi iptal et
-/panel-stats - Panel başarı oranları
-/growth-report - Kâr ve satış fırsat raporu
-/note smm_id not - Sipariş notu ekle
-/report - Bugünkü özet
-/week-report - Haftalık özet
-/month-report - Aylık özet
-/report-all - Tüm özetler
-/reset-report - Bu ayın rapor/dashboard verilerini sıfırla
-/reset-all-reports - Tüm raporları sıfırla
 /help - Komutları gösterir""")
         return {"ok": True}
 
@@ -17081,78 +15296,6 @@ async def telegram_webhook(request: Request):
         handle_cancel_command(text)
         return {"ok": True}
 
-
-
-    if command == "/panel-stats":
-        if not PANEL_STATS:
-            send_telegram("Panel istatistiği henüz yok.")
-            return {"ok": True}
-        lines = ["Panel Başarı Raporu:\n"]
-        for key, item in PANEL_STATS.items():
-            success = int(item.get("success", 0) or 0)
-            failed = int(item.get("failed", 0) or 0)
-            partial = int(item.get("partial", 0) or 0)
-            total = success + failed + partial
-            rate = (success / total * 100) if total else 0
-            avg = 0
-            if int(item.get("completed_count", 0) or 0) > 0:
-                avg = int(item.get("completed_total_minutes", 0) or 0) / int(item.get("completed_count", 1) or 1)
-            panel_name = get_panel_config(key).get("name", key)
-            lines.append(f"{panel_name}: %{rate:.1f} başarı | Başarılı {success} | Hata {failed} | Partial {partial} | Ortalama {avg:.0f} dk")
-        send_telegram("\n".join(lines))
-        return {"ok": True}
-
-    if command in ["/growth-report", "/profit-report"]:
-        send_telegram(build_growth_report_text())
-        return {"ok": True}
-
-    if command == "/note":
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
-            send_telegram("Kullanım: /note smm_id not metni")
-            return {"ok": True}
-        add_order_note(parts[1], parts[2])
-        send_telegram(f"Not kaydedildi.\nSMM ID: {parts[1]}")
-        return {"ok": True}
-
-    if command == "/report":
-        send_telegram(build_sales_report("Bugünkü Sipariş Özeti", DAILY_STATS, "Bugün sipariş yok."))
-        return {"ok": True}
-
-    if command == "/week-report":
-        send_telegram(build_sales_report("Haftalık Özet", WEEKLY_STATS, "Bu hafta sipariş yok."))
-        return {"ok": True}
-
-    if command == "/month-report":
-        send_telegram(build_sales_report("Aylık Özet", MONTHLY_STATS, "Bu ay sipariş yok."))
-        return {"ok": True}
-
-    if command == "/report-all":
-        daily = build_sales_report("Bugünkü Özet", DAILY_STATS, "Bugün sipariş yok.")
-        weekly = build_sales_report("Haftalık Özet", WEEKLY_STATS, "Bu hafta sipariş yok.")
-        monthly = build_sales_report("Aylık Özet", MONTHLY_STATS, "Bu ay sipariş yok.")
-        send_telegram(daily + "\n\n---\n\n" + weekly + "\n\n---\n\n" + monthly)
-        return {"ok": True}
-
-    if command == "/reset-report":
-        reset_sales_stats("current_month")
-        send_telegram("Bu ayın rapor ve dashboard verileri sıfırlandı.")
-        return {"ok": True}
-
-    if command == "/reset-week-report":
-        reset_sales_stats("weekly")
-        send_telegram("Haftalık rapor sıfırlandı.")
-        return {"ok": True}
-
-    if command == "/reset-month-report":
-        reset_sales_stats("monthly")
-        send_telegram("Aylık rapor ve dashboard verileri sıfırlandı.")
-        return {"ok": True}
-
-    if command == "/reset-all-reports":
-        reset_sales_stats("all")
-        send_telegram("Tüm raporlar sıfırlandı.")
-        return {"ok": True}
 
     send_telegram("Bilinmeyen komut. /help ile komutları gör.")
     return {"ok": True}
