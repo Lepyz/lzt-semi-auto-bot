@@ -252,8 +252,15 @@ PANEL_STATS = {}
 SERVICE_COMPLETION_STATS = {}
 BUYER_STATS = {}
 ORDER_NOTES = {}
-PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "3000"))
-PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "3000"))
+PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "1000"))
+PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "1000"))
+PERSIST_ANALYTICS_STATE = os.getenv("PERSIST_ANALYTICS_STATE", "false").lower() == "true"
+PERSIST_LOG_HISTORY = os.getenv("PERSIST_LOG_HISTORY", "false").lower() == "true"
+PERSIST_AUX_CACHE = os.getenv("PERSIST_AUX_CACHE", "false").lower() == "true"
+REDIS_ERROR_BACKOFF_SECONDS = int(os.getenv("REDIS_ERROR_BACKOFF_SECONDS", "60"))
+_REDIS_BACKOFF_UNTIL = 0
+_REDIS_BACKOFF_REASON = ""
+_REDIS_LAST_ERROR_LOG = 0
 
 # ─── PROFESYONEL PANEL DAYANIKLILIĞI: CIRCUIT BREAKER + REDIS QUEUE ──────────
 CIRCUIT_THRESHOLD = int(os.getenv("CIRCUIT_THRESHOLD", "3"))
@@ -385,6 +392,9 @@ def now_tr():
 def flush_logs(force: bool = False):
     """Log geçmişini Redis'e kontrollü yazar; her logda Redis yazıp yavaşlatmaz."""
     global _LOG_DIRTY, _LOG_LAST_FLUSH
+    if not PERSIST_LOG_HISTORY:
+        _LOG_DIRTY = False
+        return
     if not force and not _LOG_DIRTY:
         return
     now_ts = time.time()
@@ -549,8 +559,31 @@ def notify_customer_order_failed(order_id: str, product_name: str):
 
 
 # ─── REDIS ────────────────────────────────────────────────────────────────────
+def is_redis_quota_error_text(text: str) -> bool:
+    text = str(text or "").lower()
+    return (
+        "max requests limit exceeded" in text
+        or "max monthly" in text
+        or "quota exceeded" in text
+        or "usage limit" in text
+        or "request limit" in text
+    )
+
+
 def redis_request(command):
+    global _REDIS_BACKOFF_UNTIL, _REDIS_BACKOFF_REASON, _REDIS_LAST_ERROR_LOG
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+
+    now_ts = time.time()
+    if _REDIS_BACKOFF_UNTIL and now_ts < _REDIS_BACKOFF_UNTIL:
+        if now_ts - _REDIS_LAST_ERROR_LOG >= 60:
+            _REDIS_LAST_ERROR_LOG = now_ts
+            logger.error(
+                "redis_backoff_active",
+                reason=_REDIS_BACKOFF_REASON,
+                retry_after_seconds=int(_REDIS_BACKOFF_UNTIL - now_ts),
+            )
         return None
 
     try:
@@ -561,7 +594,19 @@ def redis_request(command):
             timeout=20,
         )
         if r.status_code >= 400:
-            logger.error("redis_http_error", status=r.status_code, response=r.text[:300])
+            response_text = r.text[:300]
+            if is_redis_quota_error_text(response_text):
+                _REDIS_BACKOFF_UNTIL = time.time() + max(1, REDIS_ERROR_BACKOFF_SECONDS)
+                _REDIS_BACKOFF_REASON = response_text
+                _REDIS_LAST_ERROR_LOG = time.time()
+                logger.error(
+                    "redis_quota_backoff_started",
+                    status=r.status_code,
+                    retry_after_seconds=REDIS_ERROR_BACKOFF_SECONDS,
+                    response=response_text,
+                )
+            else:
+                logger.error("redis_http_error", status=r.status_code, response=response_text)
             return None
         try:
             result = r.json()
@@ -569,7 +614,18 @@ def redis_request(command):
             logger.error("redis_json_error", error=str(e), response=r.text[:300])
             return None
         if isinstance(result, dict) and result.get("error"):
-            logger.error("redis_command_error", error=str(result.get("error"))[:300], command=str(command)[:120])
+            error_text = str(result.get("error"))[:300]
+            if is_redis_quota_error_text(error_text):
+                _REDIS_BACKOFF_UNTIL = time.time() + max(1, REDIS_ERROR_BACKOFF_SECONDS)
+                _REDIS_BACKOFF_REASON = error_text
+                _REDIS_LAST_ERROR_LOG = time.time()
+                logger.error(
+                    "redis_quota_backoff_started",
+                    retry_after_seconds=REDIS_ERROR_BACKOFF_SECONDS,
+                    error=error_text,
+                )
+            else:
+                logger.error("redis_command_error", error=error_text, command=str(command)[:120])
             return None
         return result
     except Exception as e:
@@ -1115,36 +1171,54 @@ def load_state():
     global WEEKLY_STATS, MONTHLY_STATS, LAST_WEEKLY_REPORT_DATE, LAST_MONTHLY_REPORT_DATE
     global RECORDED_SALES, LOG_HISTORY, PRODUCT_NAME_CACHE, PANEL_SERVICE_NAME_CACHE, DYNAMIC_SERVICES, PACKAGE_CONFIGS, SALES_HISTORY, ORDER_HISTORY, FAVORITE_SERVICES, BALANCE_HISTORY, LINK_AUDIT_HISTORY, MESSAGE_TEMPLATES, BALANCE_WARN_LAST, LOW_BALANCE_DISABLED_PANELS, PANEL_STATS, SERVICE_COMPLETION_STATS, BUYER_STATS, ORDER_NOTES
 
-    RECORDED_SALES = set(redis_get_json("recorded_sales", []))
     PROCESSED_ORDERS = set(redis_get_json("processed_orders", []))
     PROCESSED_LINKS = set(redis_get_json("processed_links", []))
     FAILED_ORDERS = [normalize_failed_order(item) for item in redis_get_json("failed_orders", []) if isinstance(item, dict)]
     PENDING_ORDERS = redis_get_json("pending_orders", [])
     sanitize_pending_orders_for_storage()
-    DAILY_STATS = redis_get_json("daily_stats", {})
-    LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
     SERVICE_PRICE_CACHE = redis_get_json("service_price_cache", {})
-    WEEKLY_STATS = redis_get_json("weekly_stats", {})
-    MONTHLY_STATS = redis_get_json("monthly_stats", {})
-    LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
-    LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
-    LOG_HISTORY = deque(redis_get_json("log_history", [])[-MAX_LOG_HISTORY:], maxlen=MAX_LOG_HISTORY)
-    PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {})
     PANEL_SERVICE_NAME_CACHE = redis_get_json("panel_service_name_cache", {})
     DYNAMIC_SERVICES = redis_get_json("dynamic_services", {})
     PACKAGE_CONFIGS = redis_get_json("package_configs", {})
-    SALES_HISTORY = redis_get_json("sales_history", {})
-    ORDER_HISTORY = redis_get_json("order_history", [])
-    FAVORITE_SERVICES = redis_get_json("favorite_services", {})
-    BALANCE_HISTORY = redis_get_json("balance_history", {})
-    LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
     MESSAGE_TEMPLATES = redis_get_json("message_templates", {})
     BALANCE_WARN_LAST = redis_get_json("balance_warn_last", {})
     LOW_BALANCE_DISABLED_PANELS = set(redis_get_json("low_balance_disabled_panels", list(LOW_BALANCE_DISABLED_PANELS)))
-    PANEL_STATS = redis_get_json("panel_stats", {})
-    SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
-    BUYER_STATS = redis_get_json("buyer_stats", {})
-    ORDER_NOTES = redis_get_json("order_notes", {})
+    if PERSIST_ANALYTICS_STATE:
+        RECORDED_SALES = set(redis_get_json("recorded_sales", []))
+        DAILY_STATS = redis_get_json("daily_stats", {})
+        LAST_DAILY_REPORT_DATE = redis_get_json("last_daily_report_date", "")
+        WEEKLY_STATS = redis_get_json("weekly_stats", {})
+        MONTHLY_STATS = redis_get_json("monthly_stats", {})
+        LAST_WEEKLY_REPORT_DATE = redis_get_json("last_weekly_report_date", "")
+        LAST_MONTHLY_REPORT_DATE = redis_get_json("last_monthly_report_date", "")
+        SALES_HISTORY = redis_get_json("sales_history", {})
+        ORDER_HISTORY = redis_get_json("order_history", [])
+        FAVORITE_SERVICES = redis_get_json("favorite_services", {})
+        BALANCE_HISTORY = redis_get_json("balance_history", {})
+        LINK_AUDIT_HISTORY = redis_get_json("link_audit_history", [])
+        PANEL_STATS = redis_get_json("panel_stats", {})
+        SERVICE_COMPLETION_STATS = redis_get_json("service_completion_stats", {})
+        BUYER_STATS = redis_get_json("buyer_stats", {})
+        ORDER_NOTES = redis_get_json("order_notes", {})
+    else:
+        RECORDED_SALES = set()
+        DAILY_STATS = {}
+        LAST_DAILY_REPORT_DATE = ""
+        WEEKLY_STATS = {}
+        MONTHLY_STATS = {}
+        LAST_WEEKLY_REPORT_DATE = ""
+        LAST_MONTHLY_REPORT_DATE = ""
+        SALES_HISTORY = {}
+        ORDER_HISTORY = []
+        FAVORITE_SERVICES = redis_get_json("favorite_services", {})
+        BALANCE_HISTORY = {}
+        LINK_AUDIT_HISTORY = []
+        PANEL_STATS = {}
+        SERVICE_COMPLETION_STATS = {}
+        BUYER_STATS = {}
+        ORDER_NOTES = {}
+    LOG_HISTORY = deque(redis_get_json("log_history", [])[-MAX_LOG_HISTORY:], maxlen=MAX_LOG_HISTORY) if PERSIST_LOG_HISTORY else deque(maxlen=MAX_LOG_HISTORY)
+    PRODUCT_NAME_CACHE = redis_get_json("product_name_cache", {}) if PERSIST_AUX_CACHE else {}
     trim_processed_memory()
 
     log("info", "state_loaded", pending=len(PENDING_ORDERS), failed=len(FAILED_ORDERS))
@@ -1159,41 +1233,50 @@ def save_state():
         trim_processed_memory()
 
         data_to_save = {
-            "recorded_sales": list(RECORDED_SALES),
             "processed_orders": list(PROCESSED_ORDERS),
             "processed_links": list(PROCESSED_LINKS),
             "failed_orders": FAILED_ORDERS,
             "pending_orders": PENDING_ORDERS,
-            "daily_stats": DAILY_STATS,
-            "last_daily_report_date": LAST_DAILY_REPORT_DATE,
             "service_price_cache": SERVICE_PRICE_CACHE,
-            "weekly_stats": WEEKLY_STATS,
-            "monthly_stats": MONTHLY_STATS,
-            "last_weekly_report_date": LAST_WEEKLY_REPORT_DATE,
-            "last_monthly_report_date": LAST_MONTHLY_REPORT_DATE,
-            "product_name_cache": PRODUCT_NAME_CACHE,
-            "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
             "dynamic_services": DYNAMIC_SERVICES,
             "package_configs": PACKAGE_CONFIGS,
-            "sales_history": SALES_HISTORY,
-            "order_history": ORDER_HISTORY[-500:],
-            "favorite_services": FAVORITE_SERVICES,
-            "balance_history": BALANCE_HISTORY,
-            "link_audit_history": LINK_AUDIT_HISTORY[-300:],
             "message_templates": MESSAGE_TEMPLATES,
             "balance_warn_last": BALANCE_WARN_LAST,
             "low_balance_disabled_panels": sorted(LOW_BALANCE_DISABLED_PANELS),
-            "panel_stats": PANEL_STATS,
-            "service_completion_stats": SERVICE_COMPLETION_STATS,
-            "buyer_stats": BUYER_STATS,
-            "order_notes": ORDER_NOTES,
         }
+
+        if PERSIST_ANALYTICS_STATE:
+            data_to_save.update({
+                "recorded_sales": list(RECORDED_SALES),
+                "daily_stats": DAILY_STATS,
+                "last_daily_report_date": LAST_DAILY_REPORT_DATE,
+                "weekly_stats": WEEKLY_STATS,
+                "monthly_stats": MONTHLY_STATS,
+                "last_weekly_report_date": LAST_WEEKLY_REPORT_DATE,
+                "last_monthly_report_date": LAST_MONTHLY_REPORT_DATE,
+                "sales_history": SALES_HISTORY,
+                "order_history": ORDER_HISTORY[-100:],
+                "favorite_services": FAVORITE_SERVICES,
+                "balance_history": BALANCE_HISTORY,
+                "link_audit_history": LINK_AUDIT_HISTORY[-100:],
+                "panel_stats": PANEL_STATS,
+                "service_completion_stats": SERVICE_COMPLETION_STATS,
+                "buyer_stats": BUYER_STATS,
+                "order_notes": ORDER_NOTES,
+            })
+
+        if PERSIST_AUX_CACHE:
+            data_to_save.update({
+                "product_name_cache": PRODUCT_NAME_CACHE,
+                "panel_service_name_cache": PANEL_SERVICE_NAME_CACHE,
+            })
 
         result = redis_mset_json(data_to_save)
         if result is None:
             log("warning", "redis_mset_skipped_or_failed")
 
-        flush_logs(force=True)
+        if PERSIST_LOG_HISTORY:
+            flush_logs(force=True)
 
 
 # ─── YARDIMCI FONKSİYONLAR ────────────────────────────────────────────────────
@@ -2178,7 +2261,8 @@ def add_order_history(order_id, advert_id, product_name, panel, smm_order_id, li
         ORDER_HISTORY.append(entry)
         if len(ORDER_HISTORY) > 500:
             del ORDER_HISTORY[:-500]
-        save_state()
+        if PERSIST_ANALYTICS_STATE:
+            save_state()
 
 
 def record_buyer_stats(buyer: str, price: float = 0):
@@ -2332,7 +2416,8 @@ def add_order_note(smm_order_id: str, note: str):
     note = str(note or "").strip()
     if smm_order_id and note:
         ORDER_NOTES[smm_order_id] = {"note": note, "updated_at": now_tr().strftime("%Y-%m-%d %H:%M:%S")}
-        save_state()
+        if PERSIST_ANALYTICS_STATE:
+            save_state()
 
 def calculate_profit(sale_tl: float, cost_tl: float) -> dict:
     sale_tl = float(sale_tl or 0)
@@ -2692,7 +2777,8 @@ def reset_sales_stats(scope: str = "daily"):
             RECORDED_SALES = set()
         else:
             return False
-        save_state()
+        if PERSIST_ANALYTICS_STATE:
+            save_state()
     return True
 
 
@@ -3045,7 +3131,8 @@ def cache_itemsatis_product_name(advert_id: str, product_name: str):
     product_name = str(product_name or "").strip()
     if advert_id and product_name:
         PRODUCT_NAME_CACHE[advert_id] = product_name
-        redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
+        if PERSIST_AUX_CACHE:
+            redis_set_json("product_name_cache", PRODUCT_NAME_CACHE)
 
 
 def get_itemsatis_report_name(advert_id: str, product_name: str = "") -> str:
@@ -3366,7 +3453,8 @@ def cache_panel_service_name(panel_key: str, service_id: str, service_name: str)
 
     cache_key = make_panel_service_cache_key(panel_key, service_id)
     PANEL_SERVICE_NAME_CACHE[cache_key] = service_name
-    redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
+    if PERSIST_AUX_CACHE:
+        redis_set_json("panel_service_name_cache", PANEL_SERVICE_NAME_CACHE)
 
 
 def get_cached_panel_service_name(panel_key: str, service_id: str) -> str:
@@ -3493,7 +3581,6 @@ def get_all_services(include_inactive: bool = False) -> dict:
 
 def save_dynamic_services():
     redis_set_json("dynamic_services", DYNAMIC_SERVICES)
-    redis_set_json("sales_history", SALES_HISTORY)
 
 
 def set_dynamic_service(advert_id: str, panel: str, service_id: str, quantity: int, platform: str, active: bool = True):
@@ -4725,7 +4812,8 @@ def add_favorite_service(panel_key: str, service_id: str, name: str = "", platfo
         "quantity": int(quantity),
         "created_at": int(time.time()),
     }
-    save_state()
+    if PERSIST_ANALYTICS_STATE:
+        save_state()
     return FAVORITE_SERVICES[key]
 
 
@@ -4734,7 +4822,8 @@ def delete_favorite_service(favorite_key: str) -> bool:
     favorite_key = str(favorite_key or "").strip()
     if favorite_key in FAVORITE_SERVICES:
         FAVORITE_SERVICES.pop(favorite_key, None)
-        save_state()
+        if PERSIST_ANALYTICS_STATE:
+            save_state()
         return True
     return False
 
@@ -16495,7 +16584,8 @@ def process_itemsatis_webhook_payload(data: dict):
         if sale_recorded:
             record_buyer_stats(buyer, price)
             # record_itemsatis_sale bu sürümde Redis'e yazmaz; buyer stats ile birlikte tek save yeterlidir.
-            save_state()
+            if PERSIST_ANALYTICS_STATE:
+                save_state()
 
         log("info", "sale_received", order_id=order_id, product=report_product_name, buyer=buyer, price=price)
 
@@ -16778,7 +16868,6 @@ def process_itemsatis_webhook_payload(data: dict):
                 panel_key=service.get("panel_key", ""),
                 price=price,
             )
-            save_state()
 
             # YENİ: Müşteriye sipariş başladı bildirimi
             notify_customer_order_started(order_id, service_name, customer_link)
