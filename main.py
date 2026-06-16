@@ -419,18 +419,27 @@ def flush_logs(force: bool = False):
     return
 
 
-def log(level: str, event: str, **kwargs):
-    """Hem structlog ile JSON log yazar hem de dashboard için hafızada tutar."""
+def log(level: str, event_name: str, **kwargs):
+    """Hem structlog ile JSON log yazar hem de dashboard için hafızada tutar.
+    
+    Not: kwargs içinde 'event' gelirse structlog/fallback logger ile çakışmaması için
+    detail_event alanına taşınır. Bu, non-order webhook gibi kayıtların 500 hatası
+    üretmesini engeller.
+    """
     global _LOG_DIRTY
+    if "event" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["detail_event"] = kwargs.pop("event")
+
     entry = {
         "ts": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
         "level": level,
-        "event": event,
+        "event": event_name,
         **kwargs,
     }
 
     log_fn = getattr(logger, level if level != "success" else "info", logger.info)
-    log_fn(event, **kwargs)
+    log_fn(event_name, **kwargs)
 
     with STATE_LOCK:
         LOG_HISTORY.append(entry)
@@ -870,7 +879,7 @@ def push_itemsatis_queue_item(item: dict, event: str = "itemsatis_queue_requeued
         invalidate_queue_status_cache()
         log("info", event, queue_id=safe_item.get("id"), attempts=safe_item.get("attempts"))
         return True
-    log("error", "itemsatis_queue_requeue_failed", queue_id=safe_item.get("id"), event=event, redis_result=str(result)[:300])
+    log("error", "itemsatis_queue_requeue_failed", queue_id=safe_item.get("id"), queue_event=event, redis_result=str(result)[:300])
     send_telegram_error(
         f"Itemsatış kuyruğuna yeniden yazma başarısız.\n\n"
         f"Queue ID: {safe_item.get('id', '-')}\n"
@@ -13633,7 +13642,7 @@ def process_itemsatis_webhook_payload(data: dict):
     """Eski Itemsatış webhook işleme mantığı. Worker tarafından thread içinde çağrılır."""
     if not is_itemsatis_purchase_event(data):
         event = get_event(data)
-        log("info", "itemsatis_non_order_webhook_ignored", event=event, order_id=get_order_id(data), advert_id=get_advert_id(data))
+        log("info", "itemsatis_non_order_webhook_ignored", webhook_event=event, order_id=get_order_id(data), advert_id=get_advert_id(data))
         return {"ok": True, "ignored": True, "reason": "non_order_webhook", "event": event}
 
     QUEUE_CONTEXT.active = True
@@ -13650,7 +13659,7 @@ def process_itemsatis_webhook_payload(data: dict):
 
         ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
         if event in ignored_events:
-            log("info", "webhook_ignored", event=event)
+            log("info", "webhook_ignored", webhook_event=event)
             return {"ignored": True, "event": event}
 
         report_product_name = get_itemsatis_report_name(advert_id, product_name)
@@ -14040,12 +14049,12 @@ async def itemsatis_webhook(request: Request):
     # Itemsatış sohbet/mesaj/bildirim webhooklarını kuyruğa bile alma.
     # Örn: listing_chat_started sipariş değildir.
     if not is_itemsatis_purchase_event(data):
-        log("info", "webhook_ignored_before_queue", event=event, advert_id=get_advert_id(data), order_id=get_order_id(data), reason="non_order_webhook")
+        log("info", "webhook_ignored_before_queue", webhook_event=event, advert_id=get_advert_id(data), order_id=get_order_id(data), reason="non_order_webhook")
         return {"ok": True, "ignored": True, "event": event, "reason": "non_order_webhook"}
 
     ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
     if event in ignored_events:
-        log("info", "webhook_ignored_before_queue", event=event)
+        log("info", "webhook_ignored_before_queue", webhook_event=event)
         return {"ok": True, "ignored": True, "event": event}
     order_id = get_order_id(data)
     seen_key = ""
