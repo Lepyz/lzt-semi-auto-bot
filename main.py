@@ -1427,28 +1427,59 @@ def find_active_pending_by_link(link: str, platform: str = "") -> dict | None:
 
 
 def make_order_key(order_id, advert_id, buyer, link="", platform=""):
-    if order_id and str(order_id) != "Bilinmiyor":
-        return f"order:{order_id}"
-    return f"fallback:{advert_id}:{buyer}:{normalize_link_for_check(link, platform)}"
+    """Gerçek Itemsatış order_id varsa kalıcı idempotency anahtarı üretir.
+
+    Eski sürümlerde order_id bilinmiyorsa advert+buyer+link fallback anahtarı üretiliyordu.
+    Bu, aynı müşterinin aynı linke ikinci kez satın almasını yanlışlıkla duplicate sayabiliyordu.
+    Bu yüzden order_id yoksa zayıf fallback anahtarı artık üretilmez.
+    """
+    order_text = str(order_id or "").strip()
+    if order_text and order_text != "Bilinmiyor":
+        return f"order:{order_text}"
+    return ""
 
 
-def build_order_idempotency_keys(order_id, advert_id, buyer, link="", platform="", queue_id="") -> list[str]:
-    """Aynı webhook'un tekrar gelmesi durumunda çift panel siparişini engelleyen uyumlu anahtarlar."""
+def make_webhook_payload_fingerprint(data: dict) -> str:
+    """Order ID gelmeyen Itemsatış webhookları için exact-payload fingerprint üretir.
+
+    Amaç: aynı webhook tekrar gönderilirse duplicate yakalansın;
+    fakat aynı müşteri aynı ilana/linke daha sonra tekrar sipariş verirse engellenmesin.
+    Queue runtime alanları fingerprint dışına alınır.
+    """
+    try:
+        safe = dict(data or {}) if isinstance(data, dict) else {"raw": str(data)}
+        safe.pop("_queue_id", None)
+        safe.pop("processing_started_at", None)
+        raw = json.dumps(safe, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        raw = str(data)
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+def build_order_idempotency_keys(order_id, advert_id, buyer, link="", platform="", queue_id="", payload_fingerprint="") -> list[str]:
+    """Aynı webhook'un tekrar gelmesi durumunda çift panel siparişini engelleyen uyumlu anahtarlar.
+
+    Önemli: order_id yoksa advert+buyer+link gibi kalıcı fallback kullanılmaz.
+    Çünkü aynı müşteri aynı linke tekrar sipariş verebilir. Bu durumda sadece exact payload
+    fingerprint duplicate koruması olarak kullanılır.
+    """
     keys = []
-    base_key = make_order_key(order_id, advert_id, buyer, link, platform)
-    if base_key:
-        keys.append(base_key)
     order_text = str(order_id or "").strip()
     advert_text = str(advert_id or "").strip()
+
+    base_key = make_order_key(order_text, advert_id, buyer, link, platform)
+    if base_key:
+        keys.append(base_key)
+
     if order_text and order_text != "Bilinmiyor":
         keys.append(f"itemsatis_order:{order_text}")
         if advert_text:
             keys.append(f"itemsatis_advert_order:{advert_text}:{order_text}")
     else:
-        normalized_link = normalize_link_for_check(link, platform)
-        buyer_text = str(buyer or "").strip()
-        if advert_text and buyer_text and normalized_link:
-            keys.append(f"itemsatis_fallback:{advert_text}:{buyer_text}:{normalized_link}")
+        fingerprint_text = str(payload_fingerprint or "").strip()
+        if fingerprint_text:
+            keys.append(f"itemsatis_payload:{fingerprint_text}")
+
     queue_text = str(queue_id or "").strip()
     if queue_text:
         keys.append(f"queue:{queue_text}")
@@ -13656,6 +13687,7 @@ def process_itemsatis_webhook_payload(data: dict):
         buyer = get_buyer(data)
         price = get_order_price(data)
         queue_id = str((data or {}).get("_queue_id", "") or "")
+        payload_fingerprint = make_webhook_payload_fingerprint(data)
 
         ignored_events = {"review_received", "review_created", "message_created", "question_created", "advert_updated"}
         if event in ignored_events:
@@ -13688,7 +13720,7 @@ def process_itemsatis_webhook_payload(data: dict):
 
             normalized_link = normalize_link_for_check(customer_link, detected_link_platform or package_platform)
             duplicate_link_key = f"package:{advert_id}:{normalized_link}"
-            order_keys = build_order_idempotency_keys(order_id, advert_id, buyer, customer_link, detected_link_platform or package_platform, queue_id)
+            order_keys = build_order_idempotency_keys(order_id, advert_id, buyer, customer_link, detected_link_platform or package_platform, queue_id, payload_fingerprint)
 
             if has_processed_order(order_keys):
                 return {"ignored": True, "reason": "duplicate_package_order"}
@@ -13870,7 +13902,7 @@ def process_itemsatis_webhook_payload(data: dict):
 
             normalized_link = normalize_link_for_check(customer_link, platform)
             duplicate_link_key = f"{advert_id}:{normalized_link}"
-            order_keys = build_order_idempotency_keys(order_id, advert_id, buyer, customer_link, platform, queue_id)
+            order_keys = build_order_idempotency_keys(order_id, advert_id, buyer, customer_link, platform, queue_id, payload_fingerprint)
 
             if has_processed_order(order_keys):
                 return {"ignored": True, "reason": "duplicate_order"}
