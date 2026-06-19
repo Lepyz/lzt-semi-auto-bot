@@ -198,6 +198,8 @@ COMPLETED_PANEL_STATUSES = {
     "finished", "done", "tamamlandı", "tamamlandi", "başarılı", "basarili",
 }
 SLOW_API_THRESHOLD_SECONDS = float(os.getenv("SLOW_API_THRESHOLD_SECONDS", "8"))
+PANEL_API_LOG_NORMAL = os.getenv("PANEL_API_LOG_NORMAL", "false").lower() == "true"
+MIN_PENDING_STATUS_CHECK_DELAY_SECONDS = int(os.getenv("MIN_PENDING_STATUS_CHECK_DELAY_SECONDS", "180"))
 PANEL_SAFE_RETRY_COUNT = int(os.getenv("PANEL_SAFE_RETRY_COUNT", "2"))
 PANEL_RETRY_SLEEP_SECONDS = float(os.getenv("PANEL_RETRY_SLEEP_SECONDS", "1"))
 USD_TO_TRY_RATE = float(os.getenv("USD_TO_TRY_RATE", "46"))
@@ -232,6 +234,9 @@ _BULK_RETRY_LOCK = threading.Lock()
 _BACKGROUND_TASKS = {}
 _ADMIN_BACKGROUND_JOBS = {}
 _ADMIN_BACKGROUND_LOCK = threading.Lock()
+_LAST_UNBOUND_WEBHOOK = {}
+_UNBOUND_ADVERT_ALERT_LAST = {}
+UNBOUND_ADVERT_ALERT_COOLDOWN_SECONDS = int(os.getenv("UNBOUND_ADVERT_ALERT_COOLDOWN_SECONDS", "900"))
 PROCESSED_ORDERS_MAX = int(os.getenv("PROCESSED_ORDERS_MAX", "1000"))
 PROCESSED_LINKS_MAX = int(os.getenv("PROCESSED_LINKS_MAX", "1000"))
 STATE_LAST_HASH = ""
@@ -2804,12 +2809,49 @@ def parse_embedded_itemsatis_payload(data: dict) -> dict:
     return {}
 
 
+def parse_jsonish_post_datas(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or not ((text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]"))):
+        return value
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else value
+    except Exception:
+        return value
+
+
+def normalize_payload_post_datas(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return data
+    cloned = dict(data)
+    keys = ("post_datas", "postData", "post_data")
+    for key in keys:
+        if key in cloned:
+            cloned[key] = parse_jsonish_post_datas(cloned.get(key))
+    for container_key in ("details", "data", "order", "purchase", "payload"):
+        child = cloned.get(container_key)
+        if isinstance(child, dict):
+            child = dict(child)
+            changed = False
+            for key in keys:
+                if key in child:
+                    child[key] = parse_jsonish_post_datas(child.get(key))
+                    changed = True
+            if changed:
+                cloned[container_key] = child
+    return cloned
+
+
 def payload_variants(data: dict):
     """Önce ana payload, sonra varsa raw içindeki gömülü payload'u döndürür."""
-    yield data
+    yield normalize_payload_post_datas(data)
     embedded = parse_embedded_itemsatis_payload(data)
     if embedded:
-        yield embedded
+        yield normalize_payload_post_datas(embedded)
 
 
 def extract_product_name_from_content(text: str) -> str:
@@ -3479,7 +3521,9 @@ def set_dynamic_service(advert_id: str, panel: str, service_id: str, quantity: i
     if quantity > 1000000:
         raise ValueError("Adet en fazla 1.000.000 olabilir")
 
-    DYNAMIC_SERVICES[advert_id] = normalize_dynamic_service(
+    previous = DYNAMIC_SERVICES.get(advert_id) if isinstance(DYNAMIC_SERVICES, dict) else {}
+    created_at = int((previous or {}).get("created_at") or time.time())
+    next_service = normalize_dynamic_service(
         advert_id,
         {
             "panel": panel_key,
@@ -3488,9 +3532,16 @@ def set_dynamic_service(advert_id: str, panel: str, service_id: str, quantity: i
             "platform": platform,
             "active": active,
             "source": "dynamic",
-            "created_at": int(time.time()),
+            "created_at": created_at,
         },
     )
+
+    if previous:
+        comparable_keys = ("panel", "panel_key", "service_id", "quantity", "platform", "active", "source")
+        if all(previous.get(key) == next_service.get(key) for key in comparable_keys):
+            return previous
+
+    DYNAMIC_SERVICES[advert_id] = next_service
     save_dynamic_services()
     return DYNAMIC_SERVICES[advert_id]
 
@@ -4721,7 +4772,8 @@ def _panel_api_request(api_url, api_key, action, extra_data=None, panel_name="",
             r = requests.post(api_url, data=payload, headers=HEADERS, timeout=timeout)
             elapsed = time.perf_counter() - started
             level = "warning" if elapsed >= SLOW_API_THRESHOLD_SECONDS else "info"
-            log(level, "panel_api_performance", panel=panel_id, action=action, duration=f"{elapsed:.2f}s", status_code=r.status_code, attempt=attempt)
+            if PANEL_API_LOG_NORMAL or elapsed >= SLOW_API_THRESHOLD_SECONDS or r.status_code >= 400:
+                log(level, "panel_api_performance", panel=panel_id, action=action, duration=f"{elapsed:.2f}s", status_code=r.status_code, attempt=attempt)
             if r.status_code >= 500:
                 last_error = f"HTTP {r.status_code}"
                 record_panel_failure(panel_id, last_error)
@@ -6048,6 +6100,7 @@ document.querySelector('form.grid').addEventListener('submit', function(event) {
 <td>{{ service.source }}</td>
 <td class="actions">
   {% if service.source == 'dynamic' %}
+  <a class="btn" href="/admin/bind-service?advert_id={{ advert_id|e }}&panel={{ service.panel_key|e }}&service_id={{ service.service_id|e }}&quantity={{ service.quantity|e }}&platform={{ service.platform|e }}">Düzenle</a>
   <form method="post" action="/admin/toggle-service"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="toggle" type="submit">Aktif/Pasif</button></form>
   <form method="post" action="/admin/delete-service" onsubmit="return confirm('Silinsin mi?')"><input type="hidden" name="advert_id" value="{{ advert_id|e }}"><button class="delete" type="submit">Sil</button></form>
   {% else %}
@@ -6155,6 +6208,7 @@ def admin_panel(user: str = Depends(get_current_admin)):
         service_id = str(service.get("service_id") or "")
         services[advert_id] = {
             "panel": service.get("panel"),
+            "panel_key": panel_key,
             "service_id": service_id,
             "panel_service_name": get_cached_panel_service_name(panel_key, service_id),
             "quantity": service.get("quantity"),
@@ -6246,8 +6300,14 @@ def admin_add_service(
     user: str = Depends(get_current_admin),
 ):
     try:
+        previous = DYNAMIC_SERVICES.get(str(advert_id).strip(), {}) if isinstance(DYNAMIC_SERVICES, dict) else {}
+        previous_panel = normalize_panel_key((previous or {}).get("panel_key") or (previous or {}).get("panel") or "")
+        previous_service_id = str((previous or {}).get("service_id") or "").strip()
         set_dynamic_service(advert_id, panel, service_id, quantity, platform, True)
-        prime_service_price_cache(panel, service_id, f"Itemsatış ilanı {advert_id}")
+        panel_key = normalize_panel_key(panel)
+        service_id_s = str(service_id or "").strip()
+        if (previous_panel != panel_key or previous_service_id != service_id_s) and not _service_price_cache_exists(panel_key, service_id_s):
+            prime_service_price_cache(panel_key, service_id_s, f"Itemsatış ilanı {advert_id}")
         log("success", "admin_service_saved", advert_id=advert_id, panel=panel, service_id=service_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -12596,6 +12656,70 @@ def get_advert_binding_status(advert_id: str) -> dict:
     return {"status": "missing", "label": "Bağlanmamış", "class": "pending"}
 
 
+def remember_unbound_webhook(advert_id: str, product_name: str, buyer: str, price, order_id: str, reason: str = "unbound_advert") -> dict:
+    advert_id = str(advert_id or "").strip() or "unknown"
+    entry = {
+        "advert_id": advert_id,
+        "product_name": str(product_name or ""),
+        "buyer": str(buyer or ""),
+        "price": float(price or 0),
+        "order_id": str(order_id or ""),
+        "ts": int(time.time()),
+        "ts_text": now_tr().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": str(reason or "unbound_advert"),
+    }
+    _LAST_UNBOUND_WEBHOOK[advert_id] = entry
+    while len(_LAST_UNBOUND_WEBHOOK) > 50:
+        oldest_key = next(iter(_LAST_UNBOUND_WEBHOOK.keys()), None)
+        if oldest_key is None:
+            break
+        _LAST_UNBOUND_WEBHOOK.pop(oldest_key, None)
+    return entry
+
+
+def notify_unbound_advert(advert_id: str, product_name: str, buyer: str, price, order_id: str, reason: str = "unbound_advert"):
+    entry = remember_unbound_webhook(advert_id, product_name, buyer, price, order_id, reason)
+    cooldown_key = str(advert_id or "unknown")
+    now_ts = int(time.time())
+    last_ts = int(_UNBOUND_ADVERT_ALERT_LAST.get(cooldown_key, 0) or 0)
+    if last_ts and now_ts - last_ts < UNBOUND_ADVERT_ALERT_COOLDOWN_SECONDS:
+        return entry
+    _UNBOUND_ADVERT_ALERT_LAST[cooldown_key] = now_ts
+    bind_link = f"/admin/bind-service?advert_id={html.escape(str(advert_id or ''))}"
+    send_telegram_alert(
+        "Baglanmamis Itemsatis ilanindan siparis geldi.\n\n"
+        f"Advert ID: {advert_id or '-'}\n"
+        f"Urun: {product_name or '-'}\n"
+        f"Musteri: {buyer or '-'}\n"
+        f"Tutar: {float(price or 0):.2f} TL\n"
+        f"Siparis ID: {order_id or '-'}\n"
+        f"Baglama linki: {bind_link}\n\n"
+        "Otomatik panel siparisi acilmadi."
+    )
+    return entry
+
+
+def find_similar_bound_advert_ids(name: str, current_advert_id: str = "") -> list[str]:
+    normalized = normalize_text(name or "")
+    if not normalized:
+        return []
+    current_advert_id = str(current_advert_id or "").strip()
+    matches = []
+    for item in collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=False):
+        advert_id = str((item or {}).get("advert_id") or "").strip()
+        if not advert_id or advert_id == current_advert_id:
+            continue
+        bind = get_advert_binding_status(advert_id)
+        if bind.get("status") == "missing":
+            continue
+        item_name = normalize_text((item or {}).get("name") or "")
+        if item_name and item_name == normalized:
+            matches.append(advert_id)
+        if len(matches) >= 5:
+            break
+    return matches
+
+
 def build_panel_select_options(selected: str = "") -> str:
     selected_key = normalize_panel_key(selected or "")
     return "".join([
@@ -12897,6 +13021,17 @@ def admin_adverts_bind(status: str = "missing", q: str = "", user: str = Depends
     items = collect_itemsatis_adverts_from_local_state(include_cache=True, include_history=False)
     rows = []
     counts = {"all": 0, "missing": 0, "service": 0, "package": 0, "both": 0}
+    bound_title_map = defaultdict(list)
+    for bound_item in items:
+        bound_advert_id = str((bound_item or {}).get("advert_id", "")).strip()
+        if not bound_advert_id:
+            continue
+        bound_status = get_advert_binding_status(bound_advert_id)
+        if bound_status.get("status") == "missing":
+            continue
+        title_key = normalize_text((bound_item or {}).get("name") or "")
+        if title_key:
+            bound_title_map[title_key].append(bound_advert_id)
     for item in items:
         advert_id = str((item or {}).get("advert_id", "")).strip()
         if not advert_id:
@@ -12911,6 +13046,22 @@ def admin_adverts_bind(status: str = "missing", q: str = "", user: str = Depends
             continue
         infer = infer_advert_binding_fields(name_raw)
         source = html.escape(str((item or {}).get("source", "")))
+        last_unbound = _LAST_UNBOUND_WEBHOOK.get(advert_id) or {}
+        unbound_note = ""
+        if last_unbound:
+            unbound_note = (
+                f"<div class='notice warning'>Son kacan siparis: "
+                f"{html.escape(str(last_unbound.get('order_id') or '-'))} | "
+                f"{html.escape(str(last_unbound.get('buyer') or '-'))} | "
+                f"{float(last_unbound.get('price') or 0):.2f} TL | "
+                f"{html.escape(str(last_unbound.get('ts_text') or '-'))}</div>"
+            )
+        similar_ids = [sid for sid in bound_title_map.get(normalize_text(name_raw), []) if sid != advert_id][:5]
+        similar_note = ""
+        if bind["status"] == "missing" and similar_ids:
+            similar_note = f"<div class='notice warning'>Benzer baslikli bagli ilan var: {html.escape(', '.join(similar_ids))}</div>"
+        if unbound_note or similar_note:
+            source = f"{source}</div>{unbound_note}{similar_note}<div class='muted'>"
         rows.append(
             f"<tr><td data-label='İlan ID'><code>{html.escape(advert_id)}</code></td>"
             f"<td data-label='İlan'>{html.escape(name_raw)}<div class='muted'>Kaynak: {source}</div></td>"
@@ -12937,26 +13088,33 @@ def admin_adverts_bind(status: str = "missing", q: str = "", user: str = Depends
 
 
 @app.get("/admin/bind-service", response_class=HTMLResponse)
-def admin_bind_service_page(advert_id: str, panel: str = "", q: str = "", quantity: int = 0, platform: str = "", user: str = Depends(get_current_admin)):
+def admin_bind_service_page(advert_id: str, panel: str = "", service_id: str = "", q: str = "", quantity: int = 0, platform: str = "", user: str = Depends(get_current_admin)):
     advert = get_itemsatis_advert_record(advert_id)
     name = str(advert.get("name") or f"Itemsatış İlanı {advert_id}")
     infer = infer_advert_binding_fields(name)
-    panel_key = normalize_panel_key(panel or "medyabayim")
-    quantity = int(quantity or infer.get("quantity") or 1000)
-    platform = normalize_text(platform or infer.get("platform") or "other") or "other"
+    existing = get_all_services(include_inactive=True).get(str(advert_id), {})
+    existing_is_dynamic = (existing or {}).get("source") == "dynamic"
+    existing_panel = (existing or {}).get("panel_key") or (existing or {}).get("panel") or ""
+    existing_service_id = str((existing or {}).get("service_id") or "")
+    existing_quantity = int((existing or {}).get("quantity") or 0)
+    existing_platform = str((existing or {}).get("platform") or "")
+    panel_key = normalize_panel_key(panel or existing_panel or "medyabayim")
+    service_id = str(service_id or existing_service_id or "").strip()
+    quantity = int(quantity or existing_quantity or infer.get("quantity") or 1000)
+    platform = normalize_text(platform or existing_platform or infer.get("platform") or "other") or "other"
     q = str(q or infer.get("search_query") or "")
     result = search_panel_services(panel_key, q, 80) if q else {"items": []}
     rows = service_search_rows_for_binding(result.get("items", []), advert_id, quantity, platform, "service")
-    existing = get_all_services(include_inactive=True).get(str(advert_id), {})
     existing_note = ""
     if existing:
-        existing_note = f"<div class='notice warning'>Bu ilan zaten servise bağlı: {html.escape(str(existing.get('panel')))} / {html.escape(str(existing.get('service_id')))} / {html.escape(str(existing.get('quantity')))}</div>"
+        edit_hint = "Aşağıdaki formdan mevcut bağlantıyı silemeden düzenleyebilirsin." if existing_is_dynamic else "Bu servis kod içi görünüyor; düzenleme kaydedilirse dinamik servis olarak üzerine yazılır."
+        existing_note = f"<div class='notice warning'>Bu ilan zaten servise bağlı: {html.escape(str(existing.get('panel')))} / {html.escape(str(existing.get('service_id')))} / {html.escape(str(existing.get('quantity')))}<br>{html.escape(edit_hint)}</div>"
     body = f"""
     <div class='card'><h2>{html.escape(name)}</h2><div class='muted'>İlan ID: <code>{html.escape(str(advert_id))}</code></div>{existing_note}</div>
-    <div class='card'><h2>Direkt Servis Bağla</h2><form class='grid' method='post' action='/admin/bind-service/save'>
+    <div class='card'><h2>Direkt Servis Bağla / Düzenle</h2><form class='grid' method='post' action='/admin/bind-service/save'>
       <input type='hidden' name='advert_id' value='{html.escape(str(advert_id))}'>
       <select name='panel'>{build_panel_select_options(panel_key)}</select>
-      <input name='service_id' placeholder='Panel Servis ID' pattern='^\\d+$' required>
+      <input name='service_id' value='{html.escape(service_id)}' placeholder='Panel Servis ID' pattern='^\\d+$' required>
       <input type='number' name='quantity' value='{quantity}' min='1' max='1000000' required>
       <select name='platform'>{build_platform_options(platform)}</select>
       <button class='green'>Kaydet</button>
@@ -13003,12 +13161,21 @@ def admin_bind_service_save_get(
 @app.post("/admin/bind-service/save")
 def admin_bind_service_save(advert_id: str = Form(...), panel: str = Form(...), service_id: str = Form(...), quantity: int = Form(...), platform: str = Form("other"), user: str = Depends(get_current_admin)):
     try:
+        previous = DYNAMIC_SERVICES.get(str(advert_id).strip(), {}) if isinstance(DYNAMIC_SERVICES, dict) else {}
+        previous_panel = normalize_panel_key((previous or {}).get("panel_key") or (previous or {}).get("panel") or "")
+        previous_service_id = str((previous or {}).get("service_id") or "").strip()
         set_dynamic_service(advert_id, panel, service_id, quantity, platform, True)
         advert = get_itemsatis_advert_record(advert_id)
-        panel_service_name = fetch_panel_service_name_by_id(panel, service_id)
-        if panel_service_name:
-            cache_panel_service_name(panel, service_id, panel_service_name)
-        prime_service_price_cache(panel, service_id, str(advert.get("name") or f"Itemsatış ilanı {advert_id}"))
+        panel_key = normalize_panel_key(panel)
+        service_id_s = str(service_id or "").strip()
+        service_ref_changed = previous_panel != panel_key or previous_service_id != service_id_s
+        if service_ref_changed:
+            if not get_cached_panel_service_name(panel_key, service_id_s):
+                panel_service_name = fetch_panel_service_name_by_id(panel_key, service_id_s)
+                if panel_service_name:
+                    cache_panel_service_name(panel_key, service_id_s, panel_service_name)
+            if not _service_price_cache_exists(panel_key, service_id_s):
+                prime_service_price_cache(panel_key, service_id_s, str(advert.get("name") or f"Itemsatış ilanı {advert_id}"))
         log("success", "advert_bound_to_service", advert_id=advert_id, panel=panel, service_id=service_id, quantity=quantity)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -13162,6 +13329,8 @@ def admin_link_audit(user: str = Depends(get_current_admin)):
 @app.get("/admin/failed-actions", response_class=HTMLResponse)
 def admin_failed_actions(user: str = Depends(get_current_admin)):
     row_parts = []
+    anti_loss_count = 0
+    category_classes = {"profit": "bad", "balance": "warn", "link": "warn", "config": "bad", "panel_timeout": "warn", "panel": "warn", "preflight": "warn", "service": "bad"}
     for o in reversed(FAILED_ORDERS[-50:]):
         if not isinstance(o, dict):
             continue
@@ -13171,9 +13340,14 @@ def admin_failed_actions(user: str = Depends(get_current_admin)):
         panel = html.escape(str(o.get("panel", "-")))
         reason = html.escape(str(o.get("reason", "")))
         link = html.escape(str(o.get("link", "")))
+        category = str(o.get("category") or classify_failed_reason(o.get("reason", ""), o.get("detail", "")) or "other")
+        if category == "profit":
+            anti_loss_count += 1
+        category_badge = f"<span class='badge {category_classes.get(category, 'passive')}'>{html.escape(category)}</span>"
         row_parts.append(
             f"<tr><td data-label='Ürün'>{product_name}</td><td data-label='Sipariş'>{order_id}</td>"
             f"<td data-label='SMM'>{smm_order_id}</td><td data-label='Panel'>{panel}</td>"
+            f"<td data-label='Kategori'>{category_badge}</td>"
             f"<td data-label='Sebep'>{reason}</td><td data-label='Link'>{link}</td>"
             f"<td data-label='İşlem'><form method='post' action='/admin/failed/mark-completed'>"
             f"<input type='hidden' name='smm_order_id' value='{smm_order_id}'>"
@@ -13182,6 +13356,9 @@ def admin_failed_actions(user: str = Depends(get_current_admin)):
         )
     rows = "".join(row_parts)
     body = f"<div class='card'><div class='muted'>Başarısız siparişler için hızlı çözüm merkezi.</div><table class='table'><thead><tr><th>Ürün</th><th>Sipariş</th><th>SMM</th><th>Panel</th><th>Sebep</th><th>Link</th><th>İşlem</th></tr></thead><tbody>{rows or '<tr><td>Başarısız sipariş yok.</td></tr>'}</tbody></table></div>"
+    if anti_loss_count:
+        body = body.replace("<table class='table'>", f"<div class='notice warning'>Anti-loss tarafindan engellenen kayit: {anti_loss_count}. Otomatik retry yapilmaz; fiyat/maliyet kontrol edilmeli.</div><table class='table'>")
+    body = body.replace("<th>Panel</th><th>Sebep</th>", "<th>Panel</th><th>Kategori</th><th>Sebep</th>")
     return simple_admin_page("Hatalı Sipariş Çözüm Merkezi", body)
 
 
@@ -13298,6 +13475,10 @@ def check_orders():
             changed = True
             continue
 
+        created_at = int(item.get("created_at", 0) or 0)
+        if created_at and int(time.time()) - created_at < MIN_PENDING_STATUS_CHECK_DELAY_SECONDS:
+            continue
+
         runtime_service = get_runtime_service_for_pending(item)
         status_data = check_panel_order_status(
             runtime_service.get("api_url", ""),
@@ -13317,7 +13498,6 @@ def check_orders():
             continue
 
         status = extract_panel_status(status_data)
-        created_at = int(item.get("created_at", 0) or 0)
         delay_alert_sent = bool(item.get("delay_alert_sent", False))
 
         if is_failed_panel_status(status_data):
@@ -14053,11 +14233,7 @@ def process_itemsatis_webhook_payload(data: dict):
             return {"ok": True, "type": "smm_order", "smm_order_id": smm_order_id}
 
         log("info", "webhook_unmatched", advert_id=advert_id, product=product_name)
-        send_telegram(
-            f"Itemsatış webhook geldi.\n\nEvent: {event or 'Yok'}\nAdvert ID: {advert_id or 'Yok'}\n"
-            f"Ürün: {report_product_name}\nSipariş ID: {order_id}\nMüşteri: {buyer}\nTutar: {price:.2f} TL\n\n"
-            f"Bu Itemsatış ilanı botta panel servisine veya pakete bağlı değil. Panel siparişi açılmadı."
-        )
+        notify_unbound_advert(advert_id, report_product_name, buyer, price, order_id, "unbound_advert")
         return {"ignored": True, "product": product_name, "advert_id": advert_id, "reason": "unbound_advert"}
 
     finally:
