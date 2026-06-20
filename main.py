@@ -1390,6 +1390,52 @@ def normalize_instagram_link(link: str) -> str:
     return link
 
 
+def normalize_tiktok_link(link: str) -> str:
+    """TikTok paylaşım linklerini aynı hedef için kanonik hale getirir.
+
+    TikTok aynı profil/video linkine _r, _t, utm vb. geçici query parametreleri
+    ekleyebiliyor. Pending aynı-link koruması bu parametreler yüzünden kaçmasın
+    diye TikTok linklerinde query ve fragment temizlenir. Kısa vt/vm linkleri
+    canlı resolve edilmez; sadece üzerindeki query temizlenir.
+    """
+    link = str(link or "").strip()
+    if not link:
+        return ""
+
+    if link.startswith("@"):
+        handle = link.split("?", 1)[0].split("#", 1)[0].strip().lstrip("@").strip("/")
+        return f"https://www.tiktok.com/@{handle}" if handle else ""
+
+    lower = link.lower()
+    if not lower.startswith(("http://", "https://")):
+        if "tiktok.com" in lower:
+            link = "https://" + link.lstrip("/")
+        else:
+            return link
+
+    try:
+        parsed = urlparse(link)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").rstrip("/")
+        if not host:
+            return link.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+
+        canonical_host = host
+        if host in {"tiktok.com", "m.tiktok.com", "www.tiktok.com"}:
+            canonical_host = "www.tiktok.com"
+
+        # Query/fragment TikTok hedefini değil paylaşım izleme parametrelerini taşır.
+        return urlunparse((parsed.scheme or "https", canonical_host, path or "/", "", "", "")).rstrip("/")
+    except Exception:
+        return link.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+
+
+def is_tiktok_platform_or_link(link: str = "", platform: str = "") -> bool:
+    platform = normalize_text(platform)
+    link_text = str(link or "").lower()
+    return platform in {"tiktok", "tik_tok", "tt"} or "tiktok.com" in link_text or "vm.tiktok.com" in link_text or "vt.tiktok.com" in link_text
+
+
 def normalize_panel_link(link: str, platform: str = "") -> str:
     link = str(link or "").strip()
     platform = normalize_text(platform)
@@ -1400,7 +1446,10 @@ def normalize_panel_link(link: str, platform: str = "") -> str:
     if platform == "instagram":
         return normalize_instagram_link(link)
 
-    # Instagram dışındaki tüm platformlarda linki panele aynen gönder.
+    if is_tiktok_platform_or_link(link, platform):
+        return normalize_tiktok_link(link)
+
+    # Diğer platformlarda linki panele aynen gönder.
     return link
 
 
@@ -8700,7 +8749,7 @@ td form { display: inline-flex; gap: 6px; margin: 2px 0 !important; }
   </label>
   <label class="full">Link
     <input name="link" placeholder="Müşteri/profil/video/gönderi linki" required maxlength="500">
-    <small>Instagram seçiliyse link temizlenir, diğer platformlarda link olduğu gibi panele gider.</small>
+    <small>Instagram/TikTok seçiliyse paylaşım parametreleri temizlenir; diğer platformlarda link olduğu gibi panele gider.</small>
   </label>
   <label class="full">Servis adı / not (opsiyonel)
     <input name="product_name" placeholder="Boş bırakırsan paneldeki servis adı çekilir" maxlength="180">
@@ -14144,7 +14193,7 @@ def process_itemsatis_webhook_payload(data: dict):
                     advert_id,
                     package_name,
                     "Aynı link için aktif pending sipariş var",
-                    "Bu link için önceki sipariş hâlâ pending durumda. Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi.",
+                    f"Bu link için önceki sipariş hâlâ pending durumda. Temiz hedef: {normalize_panel_link(customer_link, detected_link_platform or package_platform)}. Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi.",
                     link=customer_link,
                     panel="package",
                     platform=detected_link_platform or package_platform,
@@ -14194,6 +14243,7 @@ def process_itemsatis_webhook_payload(data: dict):
                     failed_rows.append((component_name, service.get("panel", "Panel"), preflight.get("detail", "Ön kontrol hatası")))
                     add_preflight_failed_order(order_id, advert_id, component_label, service, preflight, component_link or customer_link)
                     continue
+                component_link = preflight.get("link") or component_link
 
                 balance_data = panel_balance(service["api_url"], service["api_key"], service.get("panel", ""))
                 if "error" in balance_data:
@@ -14326,7 +14376,7 @@ def process_itemsatis_webhook_payload(data: dict):
                     advert_id,
                     service_name,
                     "Aynı link için aktif pending sipariş var",
-                    "Bu link için önceki sipariş hâlâ pending durumda. Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi.",
+                    f"Bu link için önceki sipariş hâlâ pending durumda. Temiz hedef: {normalize_panel_link(customer_link, platform)}. Önceki sipariş tamamlanmadan yeni panel siparişi geçilmedi.",
                     link=customer_link,
                     panel=service.get("panel", ""),
                     panel_key=service.get("panel_key", ""),
@@ -14361,6 +14411,7 @@ def process_itemsatis_webhook_payload(data: dict):
                     f"Panel siparişi açılmadı."
                 )
                 return {"ok": False, "error": "preflight_failed", "reason_code": preflight.get("code")}
+            customer_link = preflight.get("link") or customer_link
 
             if not service.get("api_url") or not service.get("api_key"):
                 add_failed_order(order_id, advert_id, service_name, "Panel bilgileri eksik", service.get("panel_key", ""))
