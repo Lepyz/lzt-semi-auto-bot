@@ -121,10 +121,10 @@ PANEL_MAP = {
     # PANEL4_NAME, PANEL4_API_URL, PANEL4_API_KEY
     # PANEL5_NAME, PANEL5_API_URL, PANEL5_API_KEY
     # PANEL6_NAME, PANEL6_API_URL, PANEL6_API_KEY
-    "panel3": {
-        "name": os.getenv("PANEL3_NAME", "Panel 3"),
-        "api_url": os.getenv("PANEL3_API_URL", ""),
-        "api_key": os.getenv("PANEL3_API_KEY", ""),
+    "oldsmm": {
+        "name": os.getenv("OldSmm", "Panel 3"),
+        "api_url": os.getenv("OLDSMM_API_URL", ""),
+        "api_key": os.getenv("OLDSMM_API_KEY", ""),
     },
     "panel4": {
         "name": os.getenv("PANEL4_NAME", "Panel 4"),
@@ -154,7 +154,7 @@ PANEL_ALIASES = {
     "morethanpanel": "morethanpanel",
     "morethan": "morethanpanel",
     "mtp": "morethanpanel",
-    "panel3": "panel3",
+    "oldsmm": "oldsmm",
     "panel4": "panel4",
     "panel5": "panel5",
     "panel6": "panel6",
