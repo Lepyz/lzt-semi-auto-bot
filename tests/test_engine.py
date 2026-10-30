@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -30,12 +31,12 @@ def test_blocked_order_never_automatically_submits_after_terminal_status(rig, st
     rig.engine.refresh(first["id"])
     assert rig.store.get(second["id"])["state"] == "ready"
     assert len(rig.panels.adds) == 1
-    ready_notices = [n for n in rig.notices if n["key"] == second["id"] + ":ready"]
+    ready_notices = [n for n in rig.notices if n["key"].startswith(second["id"] + ":ready:")]
     assert len(ready_notices) == 1 and status in ready_notices[0]["text"]
     for _ in range(3):
         rig.engine.refresh(first["id"])
         rig.engine.make_ready(first["target"], rig.store.get(first["id"]))
-    assert len([n for n in rig.notices if n["key"] == second["id"] + ":ready"]) == 1
+    assert len([n for n in rig.notices if n["key"].startswith(second["id"] + ":ready:")]) == 1
     rig.engine.approve(second["id"])
     rig.engine.execute(second["id"])
     assert len(rig.panels.adds) == 2
@@ -230,21 +231,100 @@ def test_restart_retains_waiting_and_ready_without_submission(rig):
         restarted.close()
 
 
-def test_restart_during_add_becomes_uncertain_not_retried(rig):
+def unfinished(rig, state, part_state, age):
     order, _ = rig.engine.receive(payload())
     rig.engine.prepare(order)
-    order["parts"][0]["state"] = "sending"
-    order["state"] = "sending"
+    order["parts"][0]["state"] = part_state
+    order["state"] = state
     rig.store.acquire_target(order["target"], order["id"])
     rig.store.save(order)
+    with rig.store.transaction() as conn:  # Simulate the previous instance's last write time.
+        current = rig.store.get(order["id"])
+        current["updated_at"] -= int(age * 1_000_000)
+        rig.store.execute(conn, "UPDATE orders SET document=? WHERE id=?",
+                          (json.dumps({k: v for k, v in current.items() if k != "revision"}), order["id"]))
+    return order
+
+
+def test_restart_during_add_becomes_uncertain_not_retried(rig):
+    order = unfinished(rig, "sending", "sending", age=600)
     restarted = Engine(rig.store, rig.panels, rig.notifier, rig.settings)
     restarted.enqueue = lambda _: pytest.fail("Recovery must not auto-submit")
     restarted.start()
     try:
+        # Startup itself never touches claims: the previous instance may still own them.
+        assert rig.store.get(order["id"])["state"] == "sending"
+        assert restarted.recover() is True
         assert rig.store.get(order["id"])["state"] == "uncertain"
+        assert rig.store.get(order["id"])["parts"][0]["state"] == "uncertain"
         assert not rig.panels.adds
+        assert any(n["key"].startswith(order["id"] + ":recovery:") for n in rig.notices)
     finally:
         restarted.close()
+
+
+def test_deploy_overlap_leaves_previous_instance_add_alone(rig):
+    order = unfinished(rig, "sending", "sending", age=5)
+    restarted = Engine(rig.store, rig.panels, rig.notifier, rig.settings)
+    restarted.enqueue = lambda _: pytest.fail("Recovery must not auto-submit")
+    try:
+        assert restarted.recover() is False  # Retried later, once certainly stale.
+        assert rig.store.get(order["id"])["state"] == "sending"
+        # The previous instance can still record its real panel result.
+        current = rig.store.get(order["id"])
+        current["parts"][0].update(state="submitted", smm_id="555")
+        current["state"] = "submitted"
+        rig.store.save(current)
+        assert rig.store.get(order["id"])["parts"][0]["smm_id"] == "555"
+    finally:
+        restarted.close()
+
+
+def test_stale_claim_that_never_reached_panel_is_sent_once(rig):
+    order = unfinished(rig, "processing", "new", age=600)
+    restarted = Engine(rig.store, rig.panels, rig.notifier, rig.settings)
+    jobs = []
+    restarted.enqueue = jobs.append
+    try:
+        assert restarted.recover() is True
+        assert rig.store.get(order["id"])["state"] == "queued"
+        for job in jobs:
+            restarted._run(job)
+        assert rig.store.get(order["id"])["state"] == "submitted"
+        assert len(rig.panels.adds) == 1
+    finally:
+        restarted.close()
+
+
+def test_recovery_skips_order_this_instance_is_processing(rig):
+    order = unfinished(rig, "sending", "sending", age=600)
+    rig.engine.running.add(order["id"])
+    assert rig.engine.recover() is True
+    assert rig.store.get(order["id"])["state"] == "sending"
+
+
+def test_recovery_dispatches_receipts_saved_by_previous_instance(rig):
+    restarted = Engine(rig.store, rig.panels, rig.notifier, rig.settings)
+    jobs = []
+    restarted.enqueue = jobs.append
+    try:
+        restarted.start()
+        late, _ = rig.engine.receive(payload(77))  # Saved after the scan, never dispatched.
+        assert late["id"] not in jobs
+        restarted.recover()
+        assert late["id"] in jobs
+    finally:
+        restarted.close()
+
+
+def test_manual_send_held_again_notifies_again(rig):
+    receive_and_run(rig)
+    second = receive_and_run(rig, 2)
+    rig.engine.approve(second["id"])
+    rig.engine.execute(second["id"])
+    waiting = [n for n in rig.notices if n["key"].startswith(second["id"] + ":waiting:")]
+    assert len(waiting) == 2 and len({n["key"] for n in waiting}) == 2
+    assert len(rig.panels.adds) == 1
 
 
 def test_no_database_or_panel_calls_on_idle_check(rig, monkeypatch):

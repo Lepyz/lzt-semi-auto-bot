@@ -261,3 +261,54 @@ def test_import_rechecks_source_instead_of_using_stale_preview(client, rig, monk
     assert wait_migration(client)["state"] == "done"
     assert rig.store.by_source("itemsatis:998") is not None
     assert len(calls) == 2
+
+
+def test_services_page_lists_imported_bindings_on_every_database(client, rig):
+    # Regression: on PostgreSQL the binding query raised ProgrammingError and
+    # /admin/services returned Internal Server Error.
+    for advert_id in ("5", "100", "20"):
+        rig.store.set_setting("binding:" + advert_id, {
+            "name": "Paket " + advert_id, "active": advert_id != "20",
+            "components": [{"panel": "smmrush", "service_id": "11", "quantity": 50, "platform": "spotify"},
+                           {"panel": "medyabayim", "service_id": "12", "quantity": 75, "platform": "spotify"}]})
+    response = client.get("/admin/services")
+    assert response.status_code == 200
+    text = response.text
+    assert text.index("Paket 5") < text.index("Paket 20") < text.index("Paket 100")
+    assert set(rig.store.bindings()) == {"5", "10", "20", "100"}
+    # An imported platform outside the default list stays selected when editing.
+    assert "<option selected>spotify</option>" in text
+
+
+def test_editing_imported_package_keeps_every_component(client, rig):
+    import json
+    csrf = token(client, "/admin/services")
+    components = [{"panel": "smmrush", "service_id": "11", "quantity": "50", "platform": "tiktok", "name": "Beğeni"},
+                  {"panel": "medyabayim", "service_id": "12", "quantity": "75", "platform": "tiktok", "name": ""}]
+    response = client.post("/admin/services", data={"csrf": csrf, "advert_id": "30", "name": "Paket",
+                                                   "active": "true", "components": json.dumps(components)})
+    assert response.status_code == 200
+    saved = rig.store.setting("binding:30")
+    assert [(p["panel"], p["service_id"], p["quantity"]) for p in saved["components"]] == [
+        ("smmrush", "11", 50), ("medyabayim", "12", 75)]
+    bad = client.post("/admin/services", data={"csrf": csrf, "advert_id": "30", "components": "[1]"})
+    assert bad.status_code == 400
+    assert rig.store.setting("binding:30") == saved
+
+
+def test_search_treats_wildcards_literally(client, rig):
+    receive_and_run(rig, 1)
+    assert client.get("/admin", params={"q": "%"}).text.count('href="/admin/orders/') == 0
+    assert client.get("/admin", params={"q": "instagram.com/customer"}).text.count('href="/admin/orders/') == 1
+
+
+def test_telegram_invalid_body_is_rejected_without_server_error(client, rig):
+    rig.settings.telegram_secret = "secret"
+    headers = {"X-Telegram-Bot-Api-Secret-Token": "secret"}
+    assert client.post("/telegram-webhook", content="not json", headers=headers).status_code == 400
+    assert client.post("/telegram-webhook", json=[1], headers=headers).status_code == 400
+
+
+def test_csrf_cookie_is_secure_behind_https_proxy(client):
+    response = client.get("/admin", headers={"X-Forwarded-Proto": "https"})
+    assert "secure" in response.headers["set-cookie"].lower()

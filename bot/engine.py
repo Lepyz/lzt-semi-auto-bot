@@ -12,6 +12,10 @@ from .store import Conflict
 
 logger = logging.getLogger(__name__)
 MANUAL_STATES = {"waiting", "ready", "paused", "review", "error"}
+# Render starts the new instance while the previous one is still finishing its
+# work, so unfinished claims are only recovered once they are certainly stale.
+RECOVERY_DELAY = 120
+STALE_SECONDS = 120
 
 
 def normalize_binding(data, panels):
@@ -20,6 +24,8 @@ def normalize_binding(data, panels):
         raise ValueError("En az bir servis gerekli.")
     result = []
     for part in parts:
+        if not isinstance(part, dict):
+            raise ValueError("Servis bilgisi okunamadı.")
         if not part.get("active", True):
             continue
         key = panel_key(part.get("panel_key") or part.get("panel"))
@@ -47,11 +53,15 @@ class Engine:
         self.stop_event = threading.Event()
         self.watch = {}
         self.recent_checks = {}
+        self.running = set()
+        self.recover_at = None
         self.monitor = None
 
     def notice(self, order, event, text, action=False):
-        return {"key": order["id"] + ":" + event, "text": text[:3500],
-                "order_id": order["id"], "action": action}
+        # The revision makes each transition notify once, including a re-entry
+        # into the same state after the admin's own action.
+        return {"key": order["id"] + ":" + event + ":" + str(order.get("revision", 0)),
+                "text": text[:3500], "order_id": order["id"], "action": action}
 
     def save(self, order, event="", text="", action=False):
         notification = self.notice(order, event, text, action) if event else None
@@ -96,6 +106,15 @@ class Engine:
             self.pool.submit(self._run, order_id)
 
     def _run(self, order_id):
+        with self.guard:
+            self.running.add(order_id)
+        try:
+            self._execute_once(order_id)
+        finally:
+            with self.guard:
+                self.running.discard(order_id)
+
+    def _execute_once(self, order_id):
         try:
             self.execute(order_id)
         except Conflict:
@@ -394,23 +413,64 @@ class Engine:
                     self.watch[target] = time.monotonic() + self.settings.check_interval
 
     def start(self):
-        # One Uvicorn worker is required. Recovery never repeats an unfinished add.
-        for order in self.store.orders(states={"processing", "sending"}, limit=100000):
-            for part in order["parts"]:
-                if part["state"] == "sending":
-                    part["state"] = "uncertain"
-            order.update(state="uncertain" if any(p["state"] == "uncertain" for p in order["parts"]) else "review",
-                         manual_required=True, error="Yeniden başlatma sırasında işlem yarım kaldı. Kontrol edin.")
-            self.save(order, "recovery", "Yarım kalan siparişi kontrol edin.\n" + self.summary(order))
+        # One Uvicorn worker is required. Queued claims are compare-and-swap, so
+        # dispatching them while the previous instance drains is safe.
         for order in self.store.orders(states={"queued"}, limit=100000):
             self.enqueue(order["id"])
         for order in self.store.orders(states={"waiting"}, limit=100000):
             self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
+        self.recover_at = time.monotonic() + RECOVERY_DELAY
         self.monitor = threading.Thread(target=self._monitor, daemon=True)
         self.monitor.start()
 
+    def recover(self):
+        """One-off cleanup after a restart. Never repeats an add with an unknown result.
+
+        Returns True when every unfinished claim was stale and has been handled.
+        """
+        cutoff = (time.time() - STALE_SECONDS) * 1_000_000
+        complete = True
+        for order in self.store.orders(states={"processing", "sending"}, limit=100000):
+            with self.guard:
+                if order["id"] in self.running:
+                    continue
+            if order.get("updated_at", order["created_at"]) > cutoff:
+                complete = False  # Possibly still owned by the previous instance.
+                continue
+            try:
+                if any(p["state"] == "sending" for p in order["parts"]):
+                    for part in order["parts"]:
+                        if part["state"] == "sending":
+                            part["state"] = "uncertain"
+                    order.update(state="uncertain", manual_required=True,
+                                 error="Yeniden başlatma sırasında panel cevabı alınamadı. "
+                                       "Panelden kontrol edin; otomatik tekrar yapılmadı.")
+                    self.save(order, "recovery", "Yarım kalan siparişi panelden kontrol edin.\n" +
+                              self.summary(order))
+                else:
+                    # The 'sending' state is committed before every add call, so
+                    # this claim never reached a panel and can be dispatched again.
+                    order.update(state="queued", error="")
+                    self.store.save(order)
+            except Conflict:
+                continue
+        # Receipts saved by the previous instance after this one started.
+        for order in self.store.orders(states={"queued"}, limit=100000):
+            self.enqueue(order["id"])
+        for item in self.store.pending_notifications():
+            self.notifier.enqueue(item)
+        return complete
+
     def _monitor(self):
         while not self.stop_event.wait(10):
+            if self.recover_at is not None and time.monotonic() >= self.recover_at:
+                self.recover_at = None
+                try:
+                    if not self.recover():
+                        self.recover_at = time.monotonic() + STALE_SECONDS
+                except Exception as exc:
+                    logger.error("recovery_failed type=%s", type(exc).__name__)
+                    self.recover_at = time.monotonic() + RECOVERY_DELAY
             self.check_due()  # No SQL at all when self.watch is empty.
 
     def close(self):
