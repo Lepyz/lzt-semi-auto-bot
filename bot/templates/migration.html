@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Upstash → yeni veritabanı</h1>
+<p class="muted">Eski siparişler ve ilan eşleştirmeleri, Render'a kaydettiğin bağlantılar kullanılarak aktarılır. Şifre kopyalaman gerekmez.</p>
+{% if complete %}<div class="notice">Daha önce aktarım tamamlandı. Yeniden aktarım gönderimleri duraklatır. İlan eşleştirmelerini ve sipariş kimliklerini doğrula.</div>{% endif %}
+{% if not configured %}<div class="card">Upstash bağlantıları bulunamadı. Aktarım için eski UPSTASH_REDIS_REST_URL ve UPSTASH_REDIS_REST_TOKEN değişkenleri Render Environment içinde korunmalı.</div>{% endif %}
+{% if not paused %}<div class="notice">Aktarımdan önce siparişler ekranından yeni gönderimleri duraklat.</div>{% endif %}
+<div class="card">
+<h2>1. Eski kayıtları kontrol et</h2>
+<p>Yalnızca kayıt sayıları okunur. Upstash'ta değişiklik yapılmaz ve panel siparişi açılmaz.</p>
+<form method="post" action="/admin/migration">
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="mode" value="inspect">
+<button {{ 'disabled' if not configured or job.state=='running' }}>Eski kayıtları kontrol et</button>
+</form>
+</div>
+<div class="card" id="job-status">
+{% if job.state=='running' %}
+<h2>İşlem sürüyor…</h2><p>Bu sırada gönderimleri açma. Sonuç burada gösterilecek.</p>
+{% elif job.state=='error' %}
+<h2>İşlem tamamlanamadı</h2><p class="error-text">{{ job.error }}</p>
+{% elif job.state=='done' %}
+<h2>{{ 'Aktarım tamamlandı' if job.mode=='import' else 'Eski kayıtlar okundu' }}</h2>
+{% set names={'dynamic_services':'İlan-servis eşleştirmeleri','package_configs':'Paketler','pending_orders':'Eski aktif panel kayıtları','processed_orders':'Eski tekrar gönderim koruma anahtarları','failed_orders':'Gönderilemeyen kayıtlar','queue':'Eski kuyruk','processing':'Eski işlem sırasındaki kayıtlar','dead':'Eski sorunlu kuyruk','bindings':'Aktarılan eşleştirmeler','history':'Eklenen eski sipariş kimlikleri','active':'İşlenen aktif panel kayıtları','review':'Kontrol için işlenen kayıtlar'} %}
+{% for key,count in job.counts.items() %}<p>{{ names.get(key,key) }}: <strong>{{ count }}</strong></p>{% endfor %}
+{% if job.mode=='import' %}<p>Gönderimler hâlâ duraklatılmıştır. Eski kuyruk kayıtları senin işlemini bekler; kendiliğinden gönderilmez.</p>
+<a class="button" href="/admin/services">Eşleştirmeleri kontrol et</a> <a class="button" href="/admin">Siparişlere dön</a>{% endif %}
+{% else %}<p class="muted">Önce yukarıdaki kontrolü çalıştır.</p>{% endif %}
+</div>
+<div class="card">
+<h2>2. Kayıtları aktar</h2>
+<p>Eski bot sürümü artık çalışmıyor olmalı. Yeni sürümde gönderimler duraklatılmış kalır. Upstash kayıtları silinmez.</p>
+<form method="post" action="/admin/migration">
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="mode" value="import">
+<label><input type="checkbox" name="confirmed" value="yes" style="width:auto" required> Eski sürümün artık çalışmadığını doğruladım.</label>
+<p><button class="primary" {{ 'disabled' if not configured or not paused or not inspected or job.state=='running' }}>Kayıtları yeni veritabanına aktar</button></p>
+</form>
+</div>
+{% if job.state=='running' %}
+<script>
+async function checkMigration(){
+  try{
+    const response=await fetch('/api/migration-status',{cache:'no-store'});
+    if(!response.ok)return;
+    const result=await response.json();
+    if(result.state!=='running'){location.reload();return;}
+    setTimeout(checkMigration,3000);
+  }catch(error){setTimeout(checkMigration,5000);}
+}
+setTimeout(checkMigration,3000);
+</script>
+{% endif %}
+{% endblock %}

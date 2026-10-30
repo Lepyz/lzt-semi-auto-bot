@@ -18,6 +18,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
+from bot.migration import MigrationJob
 from bot.notifications import Notifier
 from bot.panels import PanelClient
 from bot.store import Conflict, Store
@@ -46,6 +47,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         notifier = Notifier(database, settings)
         engine = Engine(database, panels or PanelClient(settings.panels), notifier, settings)
         app.state.store, app.state.engine, app.state.notifier = database, engine, notifier
+        app.state.migration = MigrationJob(database, settings)
         app.state.ready = True
         if start_background:
             notifier.start()
@@ -80,6 +82,8 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         token = str(form.get("csrf", ""))
         if not valid_csrf(token) or not secrets.compare_digest(cookie, token):
             raise HTTPException(403, "İşlem anahtarı geçersiz; sayfayı yenileyin.")
+        if app.state.migration.status()["state"] == "running":
+            raise HTTPException(409, "Geçiş işlemi sürüyor. Tamamlanmasını bekleyin.")
 
     def page(request, template, **values):
         token = request.cookies.get("csrf", "")
@@ -198,6 +202,23 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             raise ValueError("Önce eski Upstash kayıtlarının geçişini tamamlayın.")
         app.state.store.set_setting("paused", paused == "true")
         return RedirectResponse("/admin", 303)
+
+    @app.get("/admin/migration", dependencies=[Depends(admin)])
+    def migration_page(request: Request):
+        return page(request, "migration.html", job=app.state.migration.status(),
+                    configured=app.state.migration.configured(),
+                    paused=app.state.store.setting("paused", True),
+                    complete=app.state.store.setting("migration_complete", False),
+                    inspected=app.state.migration.inspected)
+
+    @app.get("/api/migration-status", dependencies=[Depends(admin)])
+    def migration_status():
+        return app.state.migration.status()  # RAM only: UI progress adds no SQL/Redis queries.
+
+    @app.post("/admin/migration", dependencies=[Depends(mutation)])
+    def run_migration(mode: str = Form(...), confirmed: str = Form("")):
+        app.state.migration.start(mode, confirmed == "yes")
+        return RedirectResponse("/admin/migration", 303)
 
     @app.get("/admin/services", dependencies=[Depends(admin)])
     @app.get("/admin/packages", dependencies=[Depends(admin)])

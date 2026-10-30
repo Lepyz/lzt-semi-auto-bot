@@ -148,3 +148,116 @@ def test_real_background_lifespan_dispatches_saved_receipt(rig):
             time.sleep(0.02)
         assert rig.store.get(order_id)["state"] == "submitted"
         assert len(rig.panels.adds) == 1
+
+
+def wait_migration(client):
+    import time
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        result = client.get("/api/migration-status").json()
+        if result["state"] != "running":
+            return result
+        time.sleep(0.01)
+    pytest.fail("Migration job did not finish")
+
+
+def migration_source(monkeypatch):
+    from test_migration import snapshot
+    monkeypatch.setenv("UPSTASH_REDIS_REST_URL", "https://redis.invalid")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_TOKEN", "test-only-secret")
+    monkeypatch.setattr("scripts.migrate_upstash.read_snapshot", snapshot)
+
+
+def test_migration_page_never_reads_upstash_implicitly(client, monkeypatch):
+    monkeypatch.setattr("scripts.migrate_upstash.read_snapshot",
+                        lambda: pytest.fail("Opening a page must not query Upstash"))
+    response = client.get("/admin/migration")
+    assert response.status_code == 200
+    assert "Eski kayıtları kontrol et" in response.text
+
+
+def test_web_inspection_reads_counts_but_does_not_import(client, rig, monkeypatch):
+    migration_source(monkeypatch)
+    csrf = token(client, "/admin/migration")
+    response = client.post("/admin/migration", data={"csrf": csrf, "mode": "inspect"})
+    assert response.status_code == 200
+    result = wait_migration(client)
+    assert result["state"] == "done" and result["counts"]["pending_orders"] == 1
+    assert rig.store.by_source("itemsatis:1") is None
+    assert not rig.panels.adds
+
+
+def test_web_import_requires_preview_paused_state_and_old_worker_confirmation(client, rig, monkeypatch):
+    migration_source(monkeypatch)
+    csrf = token(client, "/admin/migration")
+    assert client.post("/admin/migration", data={"csrf": csrf, "mode": "import"}).status_code == 400
+    rig.store.set_setting("paused", True)
+    assert client.post("/admin/migration", data={"csrf": csrf, "mode": "import",
+                                               "confirmed": "yes"}).status_code == 400
+    client.post("/admin/migration", data={"csrf": csrf, "mode": "inspect"})
+    assert wait_migration(client)["state"] == "done"
+    assert client.post("/admin/migration", data={"csrf": csrf, "mode": "import"}).status_code == 400
+    client.post("/admin/migration", data={"csrf": csrf, "mode": "import", "confirmed": "yes"})
+    result = wait_migration(client)
+    assert result["state"] == "done" and result["counts"]["active"] == 1
+    assert rig.store.setting("migration_complete") is True
+    assert rig.store.setting("paused") is True
+    assert rig.store.by_source("itemsatis:1")["parts"][0]["smm_id"] == "700"
+    assert not rig.panels.adds
+
+
+def test_migration_error_never_exposes_connection_string(client, monkeypatch):
+    migration_source(monkeypatch)
+    def fail():
+        raise RuntimeError("postgresql://SECRET-PASSWORD@private.invalid")
+    monkeypatch.setattr("scripts.migrate_upstash.read_snapshot", fail)
+    csrf = token(client, "/admin/migration")
+    client.post("/admin/migration", data={"csrf": csrf, "mode": "inspect"})
+    result = wait_migration(client)
+    assert result["state"] == "error"
+    assert "SECRET-PASSWORD" not in str(result)
+    assert "SECRET-PASSWORD" not in client.get("/admin/migration").text
+
+
+def test_migration_busy_blocks_other_mutations_and_status_uses_no_database(client, rig, monkeypatch):
+    from threading import Event
+    migration_source(monkeypatch)
+    released, entered = Event(), Event()
+    def delayed():
+        from test_migration import snapshot
+        entered.set()
+        released.wait(timeout=3)
+        return snapshot()
+    monkeypatch.setattr("scripts.migrate_upstash.read_snapshot", delayed)
+    csrf = token(client, "/admin/migration")
+    client.post("/admin/migration", data={"csrf": csrf, "mode": "inspect"})
+    assert entered.wait(timeout=1)
+    try:
+        assert client.post("/admin/pause", data={"csrf": csrf, "paused": "false"}).status_code == 409
+        with monkeypatch.context() as scoped:
+            scoped.setattr(rig.store, "transaction", lambda: pytest.fail("Status polling must use RAM"))
+            assert client.get("/api/migration-status").json()["state"] == "running"
+    finally:
+        released.set()
+    assert wait_migration(client)["state"] == "done"
+
+
+def test_import_rechecks_source_instead_of_using_stale_preview(client, rig, monkeypatch):
+    from test_migration import snapshot
+    migration_source(monkeypatch)
+    calls = []
+    def source():
+        calls.append(1)
+        result = snapshot()
+        if len(calls) == 2:
+            result["processed_orders"].append("order:998")
+        return result
+    monkeypatch.setattr("scripts.migrate_upstash.read_snapshot", source)
+    rig.store.set_setting("paused", True)
+    csrf = token(client, "/admin/migration")
+    client.post("/admin/migration", data={"csrf": csrf, "mode": "inspect"})
+    assert wait_migration(client)["state"] == "done"
+    client.post("/admin/migration", data={"csrf": csrf, "mode": "import", "confirmed": "yes"})
+    assert wait_migration(client)["state"] == "done"
+    assert rig.store.by_source("itemsatis:998") is not None
+    assert len(calls) == 2

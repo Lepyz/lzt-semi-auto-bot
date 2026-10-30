@@ -54,9 +54,9 @@ reddedilir; ücretsiz Render'ın yerel dosyaları kalıcı değildir.
 Neon Free bir seçenektir; kullanım sınırları vardır, ücretsiz kesintisiz hizmet
 garantisi yoktur. Güncel koşullar: https://neon.com/pricing
 
-1. Neon'da Free proje oluştur, PostgreSQL bağlantısını al. Bağlantı adresini yalnızca
-   Render Environment → DATABASE_URL alanına ve yerelde geçici ortam değişkenine
-   ekle. GitHub dosyasına, sohbet mesajına veya terminal çıktısına yazdırma.
+1. Neon'da Free proje oluştur, PostgreSQL bağlantısını al. Bağlantı adresini
+   Render Environment → DATABASE_URL alanına ekle. GitHub dosyasına, sohbet
+   mesajına veya terminal çıktısına yazdırma.
 2. Mevcut panel API değişkenlerini, ADMIN_PASSWORD, BOT_TOKEN ve CHAT_ID'yi koru.
    Ortam değişkenlerinin listesi .env.example dosyasında. Kod .env dosyasını kendiliğinden
    okumaz; Render ortam değişkenlerini kullanır.
@@ -64,9 +64,10 @@ garantisi yoktur. Güncel koşullar: https://neon.com/pricing
    Start: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers
    Bir Uvicorn işçisi/tek Render instance kullan. İçeride farklı hedefler için
    varsayılan dört gönderim thread'i vardır; aynı hedef veritabanı kilidiyle korunur.
-4. İlk gerçek gönderimden önce aşağıdaki aktarımı yap. Yeni sürüm varsayılan
-   duraklatılmış açılır. Eski Upstash URL'si ortamda duruyorsa geçiş tamamlanmadan
-   gönderimleri etkinleştirmek de engellenir.
+4. Yeni sürümü gönderimler duraklatılmış olarak dağıt. Eski sürümün artık çalışmadığını
+   Render dağıtım durumundan doğrula. Ardından aşağıdaki yönetim ekranıyla aktarımı yap.
+   Eski Upstash URL'si ortamda duruyorsa geçiş tamamlanmadan gönderimleri etkinleştirmek
+   engellenir. İlk kurulum duraklatılmış açılır; bunu değiştirme.
 5. Itemsatış webhook adresi aynı kalır: /itemsatis-webhook. Geçiş aralığında gelen
    satın almaları Itemsatış sipariş listesiyle karşılaştır. Kaynak platformun başarısız
    webhookları tekrar göndermesi doğrulanmadan uçtan uca sipariş kaybı garantisi verilemez.
@@ -79,6 +80,24 @@ garantisi yoktur. Güncel koşullar: https://neon.com/pricing
    Upstash değişkenlerini kaldırabilirsin. Kaynak verileri hemen silme.
 
 ### Eski kayıtları aktarma
+
+Ücretsiz Render'da terminal veya yerel bağlantı anahtarı gerektirmeyen yol:
+
+1. Yeni sürüm dağıtıldıktan sonra /admin/migration adresini aç veya üst menüden
+   Veri aktarımı bağlantısına tıkla. Mevcut admin kullanıcı adı/parolası kullanılır.
+2. Eski kayıtları kontrol et düğmesine bas. Yalnızca eski kayıt sayıları okunur.
+3. Yeni gönderimler duraklatılmış ve eski sürüm artık çalışmıyorken ilgili kutuyu
+   işaretle, Kayıtları yeni veritabanına aktar düğmesine bas.
+4. Aktarım tamamlandı sonucunu bekle. İşlem sırasında durum göstergesi yalnızca
+   sunucu belleğini okur; Upstash veya PostgreSQL sorgusu üretmez.
+5. Eşleştirmeleri ve eski SMM kimliklerini kontrol et. Bundan sonra yeni gönderimleri
+   etkinleştir. Eski kuyruktan taşınan kayıtlar kendiliğinden gönderilmez.
+
+Bağlantılar Render Environment içinden okunur; HTML veya sonuç ekranında gösterilmez.
+Aktarım çalışırken diğer admin değişiklikleri engellenir. Yarım kalan aktarımda
+gönderimler kapalı tutulur, kaynak kayıtlar korunur; işlem tekrar çalıştırılabilir.
+
+Komut satırı alternatifi:
 
 Araç Upstash'a yalnızca GET/LRANGE gönderir; hiçbir kaynak anahtarı silmez veya
 değiştirmez. Log/fiyat/bakiye cache'lerini taşımaz.
