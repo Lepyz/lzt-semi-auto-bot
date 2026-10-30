@@ -6,10 +6,12 @@ import hmac
 import io
 import json
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -19,12 +21,24 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
 from bot.migration import MigrationJob
-from bot.notifications import Notifier
+from bot.notifications import Notifier, callbacks_allowed, register_telegram_webhook, telegram_api
 from bot.panels import PanelClient
 from bot.store import Conflict, Store
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+class HideQuery(logging.Filter):
+    """The Itemsatis webhook key travels in the query string; keep it out of logs."""
+
+    def filter(self, record):
+        if isinstance(record.args, tuple) and len(record.args) >= 3 and isinstance(record.args[2], str):
+            record.args = record.args[:2] + (record.args[2].split("?", 1)[0],) + record.args[3:]
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(HideQuery())
 security = HTTPBasic()
 TEMPLATES = Environment(loader=FileSystemLoader(Path(__file__).parent / "bot" / "templates"),
                         autoescape=select_autoescape())
@@ -40,10 +54,20 @@ TEMPLATES.filters["date"] = lambda ts: datetime.fromtimestamp(
 def create_app(settings=None, store=None, panels=None, start_background=True):
     settings = settings or Settings()
 
+    def load_saved_secrets(database):
+        # Keys created from the admin panel; Render Environment values take precedence.
+        if not settings.webhook_secret:
+            settings.webhook_secret = database.setting("itemsatis_webhook_secret", "")
+            settings.webhook_enforced = bool(settings.webhook_secret and
+                                             database.setting("itemsatis_webhook_enforced", False))
+        if not settings.telegram_secret:
+            settings.telegram_secret = database.setting("telegram_webhook_secret", "")
+
     @asynccontextmanager
     async def lifespan(app):
         database = store or Store(settings.database_url)
         await asyncio.to_thread(database.initialize)
+        await asyncio.to_thread(load_saved_secrets, database)
         notifier = Notifier(database, settings)
         engine = Engine(database, panels or PanelClient(settings.panels), notifier, settings)
         app.state.store, app.state.engine, app.state.notifier = database, engine, notifier
@@ -121,8 +145,10 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):
-        if settings.webhook_secret and not secrets.compare_digest(
-                request.headers.get("X-Webhook-Secret", ""), settings.webhook_secret):
+        supplied = request.headers.get("X-Webhook-Secret", "") or request.query_params.get("key", "")
+        authenticated = bool(settings.webhook_secret) and secrets.compare_digest(
+            supplied.encode(), settings.webhook_secret.encode())
+        if settings.webhook_enforced and not authenticated:
             raise HTTPException(401, "Webhook yetkisi doğrulanamadı.")
         if settings.webhook_ips:
             allowed = {ip.strip() for ip in settings.webhook_ips.split(",") if ip.strip()}
@@ -151,6 +177,14 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         except Exception as exc:
             logger.error("webhook_not_saved type=%s", type(exc).__name__)
             raise HTTPException(503, "Sipariş kaydedilemedi; yeniden gönderilmesi gerekiyor.")
+        if authenticated and not settings.webhook_enforced and not getattr(app.state, "key_seen", False):
+            # One write during the switch-over: proves Itemsatis uses the new address.
+            try:
+                await asyncio.to_thread(app.state.store.set_setting, "itemsatis_webhook_seen",
+                                        int(datetime.now(timezone.utc).timestamp()))
+                app.state.key_seen = True
+            except Exception as exc:
+                logger.error("webhook_key_seen_not_saved type=%s", type(exc).__name__)
         return {"ok": True, "status": "ignored" if order is None else ("saved" if created else "already_saved"),
                 "id": order["id"] if order else None}
 
@@ -246,6 +280,76 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     def delete_service(advert_id: str = Form(...)):
         app.state.store.delete_binding(advert_id)
         return RedirectResponse("/admin/services", 303)
+
+    @app.get("/admin/integrations", dependencies=[Depends(admin)])
+    def integrations(request: Request):
+        key = settings.webhook_secret
+        return page(request, "integrations.html",
+                    webhook_url=settings.public_url + "/itemsatis-webhook" + ("?key=" + key if key else ""),
+                    key_from_env=bool(os.getenv("ITEMSATIS_WEBHOOK_SECRET")), has_key=bool(key),
+                    enforced=settings.webhook_enforced,
+                    seen=app.state.store.setting("itemsatis_webhook_seen") if key else None,
+                    telegram=dict(token=bool(settings.bot_token), chat=bool(settings.chat_id),
+                                  group=settings.chat_id.startswith("-"),
+                                  admins=bool(settings.telegram_admins.strip()),
+                                  secret=bool(settings.telegram_secret),
+                                  secret_from_env=bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
+                                  buttons=callbacks_allowed(settings), public=settings.public_url),
+                    ip_list=bool(settings.webhook_ips))
+
+    def back(message):
+        return RedirectResponse("/admin/integrations?" + urlencode({"message": message}), 303)
+
+    @app.post("/admin/integrations/itemsatis", dependencies=[Depends(mutation)])
+    def itemsatis_key(action: str = Form(...), confirmed: str = Form("")):
+        store = app.state.store
+        if os.getenv("ITEMSATIS_WEBHOOK_SECRET"):
+            raise ValueError("Anahtar Render Environment içinde tanımlı; oradan yönetin.")
+        if action == "create":
+            if settings.webhook_enforced:
+                raise ValueError("Anahtar zorunluyken yenisi oluşturulamaz; önce zorunluluğu kaldırın.")
+            if confirmed != "yes" and settings.webhook_secret:
+                raise ValueError("Yeni anahtar eski adresi geçersiz kılar; işlemi doğrulayın.")
+            store.set_setting("itemsatis_webhook_seen", None)
+            store.set_setting("itemsatis_webhook_secret", secrets.token_urlsafe(32))
+            settings.webhook_secret = store.setting("itemsatis_webhook_secret")
+            app.state.key_seen = False
+            return back("Anahtar oluşturuldu. Aşağıdaki adresi Itemsatış webhook ayarına kaydet.")
+        if action == "enforce":
+            if not settings.webhook_secret or not store.setting("itemsatis_webhook_seen"):
+                raise ValueError("Itemsatış'tan henüz anahtarlı bildirim gelmedi; adres güncellenmeden "
+                                 "zorunlu yapmak siparişlerin reddedilmesine yol açar.")
+            store.set_setting("itemsatis_webhook_enforced", True)
+            settings.webhook_enforced = True
+            return back("Artık yalnızca anahtarlı Itemsatış bildirimleri kabul ediliyor.")
+        if action == "relax":
+            store.set_setting("itemsatis_webhook_enforced", False)
+            settings.webhook_enforced = False
+            return back("Anahtarsız bildirimler yeniden kabul ediliyor.")
+        raise ValueError("İşlem tanınmadı.")
+
+    @app.post("/admin/integrations/telegram", dependencies=[Depends(mutation)])
+    def telegram_setup(action: str = Form(...)):
+        if action == "register":
+            secret = settings.telegram_secret
+            if not secret:
+                secret = secrets.token_urlsafe(32)
+                # Saved before Telegram learns it, so no update can arrive unverifiable.
+                app.state.store.set_setting("telegram_webhook_secret", secret)
+            register_telegram_webhook(settings, secret)
+            settings.telegram_secret = secret
+        elif action != "check":
+            raise ValueError("İşlem tanınmadı.")
+        info = telegram_api(settings, "getWebhookInfo") or {}
+        expected = settings.public_url + "/telegram-webhook"
+        parts = ["Telegram webhook: " + ("bu uygulamaya bağlı" if info.get("url") == expected
+                                         else ("başka adrese bağlı: " + info["url"] if info.get("url")
+                                               else "kayıtlı değil"))]
+        parts.append("Bekleyen güncelleme: " + str(info.get("pending_update_count", 0)))
+        if info.get("last_error_message"):
+            when = datetime.fromtimestamp(info.get("last_error_date", 0), timezone(timedelta(hours=3)))
+            parts.append("Son hata (" + when.strftime("%d.%m.%Y %H:%M") + "): " + str(info["last_error_message"])[:200])
+        return back(" · ".join(parts))
 
     @app.get("/api/orders", dependencies=[Depends(admin)])
     def api_orders(state: str = "", q: str = ""):

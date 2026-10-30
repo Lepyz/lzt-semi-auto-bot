@@ -312,3 +312,102 @@ def test_telegram_invalid_body_is_rejected_without_server_error(client, rig):
 def test_csrf_cookie_is_secure_behind_https_proxy(client):
     response = client.get("/admin", headers={"X-Forwarded-Proto": "https"})
     assert "secure" in response.headers["set-cookie"].lower()
+
+
+def test_itemsatis_key_switch_over_never_rejects_before_key_is_seen(client, rig):
+    csrf = token(client, "/admin/integrations")
+    assert client.post("/itemsatis-webhook", json=payload(1)).json()["status"] == "saved"
+    assert client.post("/admin/integrations/itemsatis", data={"csrf": csrf, "action": "create"}).status_code == 200
+    key = rig.store.setting("itemsatis_webhook_secret")
+    assert key and len(key) >= 40
+    # Created but not enforced: the old address keeps working.
+    assert client.post("/itemsatis-webhook", json=payload(2)).status_code == 200
+    assert client.post("/admin/integrations/itemsatis", data={"csrf": csrf, "action": "enforce"}).status_code == 400
+    assert client.post("/itemsatis-webhook?key=" + key, json=payload(3)).status_code == 200
+    assert rig.store.setting("itemsatis_webhook_seen")
+    assert client.post("/admin/integrations/itemsatis", data={"csrf": csrf, "action": "enforce"}).status_code == 200
+    assert client.post("/itemsatis-webhook", json=payload(4)).status_code == 401
+    assert client.post("/itemsatis-webhook?key=wrong", json=payload(4)).status_code == 401
+    assert client.post("/itemsatis-webhook", json=payload(4), headers={"X-Webhook-Secret": key}).status_code == 200
+    assert rig.store.by_source("itemsatis:4") is not None
+    # A new key can't be generated while enforced; relaxing restores acceptance.
+    assert client.post("/admin/integrations/itemsatis", data={"csrf": csrf, "action": "create",
+                                                             "confirmed": "yes"}).status_code == 400
+    assert client.post("/admin/integrations/itemsatis", data={"csrf": csrf, "action": "relax"}).status_code == 200
+    assert client.post("/itemsatis-webhook", json=payload(5)).status_code == 200
+
+
+def test_saved_keys_survive_restart_and_page_never_calls_telegram(rig, monkeypatch):
+    rig.store.set_setting("itemsatis_webhook_secret", "k" * 43)
+    rig.store.set_setting("itemsatis_webhook_enforced", True)
+    rig.store.set_setting("telegram_webhook_secret", "t" * 43)
+    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("Page view called an external API"))
+    with TestClient(create_app(rig.settings, rig.store, rig.panels, start_background=False)) as live:
+        live.auth = (rig.settings.username, rig.settings.password)
+        assert live.post("/itemsatis-webhook", json=payload(9)).status_code == 401
+        assert live.post("/itemsatis-webhook?key=" + "k" * 43, json=payload(9)).status_code == 200
+        assert rig.settings.telegram_secret == "t" * 43
+        page = live.get("/admin/integrations")
+        assert page.status_code == 200 and "Anahtar zorunlu" in page.text
+
+
+def test_environment_key_wins_and_cannot_be_changed_from_panel(client, rig, monkeypatch):
+    monkeypatch.setenv("ITEMSATIS_WEBHOOK_SECRET", "env-key")
+    rig.settings.webhook_secret, rig.settings.webhook_enforced = "env-key", True
+    csrf = token(client, "/admin/integrations")
+    assert client.post("/admin/integrations/itemsatis", data={"csrf": csrf, "action": "relax"}).status_code == 400
+    assert client.post("/itemsatis-webhook", json=payload()).status_code == 401
+    assert "env-key" not in client.get("/admin/integrations").text.split("<details>")[0]
+
+
+def test_webhook_key_is_removed_from_access_log():
+    import logging
+    from main import HideQuery
+    record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                               ("1.2.3.4:0", "POST", "/itemsatis-webhook?key=SECRET", "1.1", 200), None)
+    HideQuery().filter(record)
+    assert "SECRET" not in record.getMessage()
+
+
+def test_telegram_registration_saves_secret_before_registering(client, rig, monkeypatch):
+    calls = []
+    class Reply:
+        def __init__(self, result):
+            self.result = result
+        def json(self):
+            return {"ok": True, "result": self.result}
+    def fake_post(url, json=None, timeout=None):
+        method = url.rsplit("/", 1)[1]
+        calls.append((method, dict(json or {}), rig.store.setting("telegram_webhook_secret")))
+        return Reply({"url": rig.settings.public_url + "/telegram-webhook", "pending_update_count": 0}
+                     if method == "getWebhookInfo" else True)
+    monkeypatch.setattr("bot.notifications.requests.post", fake_post)
+    rig.settings.bot_token, rig.settings.chat_id = "123:test-token", "555"
+    rig.settings.public_url = "https://bot.example.test"
+    csrf = token(client, "/admin/integrations")
+    response = client.post("/admin/integrations/telegram", data={"csrf": csrf, "action": "register"})
+    assert response.status_code == 200 and "bu uygulamaya bağlı" in response.text
+    method, sent, saved = calls[0]
+    assert method == "setWebhook" and sent["secret_token"] == saved == rig.settings.telegram_secret
+    assert sent["url"] == "https://bot.example.test/telegram-webhook"
+    assert "123:test-token" not in response.text and saved not in response.text
+    # The button is now offered for a private chat, and the webhook accepts Telegram.
+    from bot.notifications import callbacks_allowed
+    assert callbacks_allowed(rig.settings)
+    data = {"update_id": 5, "message": {"chat": {"id": 555}, "from": {"id": 555}, "text": "/status"}}
+    assert client.post("/telegram-webhook", json=data,
+                       headers={"X-Telegram-Bot-Api-Secret-Token": saved}).status_code == 200
+    # Registering again reuses the same secret.
+    client.post("/admin/integrations/telegram", data={"csrf": csrf, "action": "register"})
+    assert calls[-2][1]["secret_token"] == saved
+
+
+def test_telegram_errors_never_expose_token(client, rig, monkeypatch):
+    class Reply:
+        def json(self):
+            return {"ok": False, "description": "Unauthorized for bot 123:test-token"}
+    monkeypatch.setattr("bot.notifications.requests.post", lambda *a, **k: Reply())
+    rig.settings.bot_token = "123:test-token"
+    csrf = token(client, "/admin/integrations")
+    response = client.post("/admin/integrations/telegram", data={"csrf": csrf, "action": "check"})
+    assert response.status_code == 400 and "test-token" not in response.text

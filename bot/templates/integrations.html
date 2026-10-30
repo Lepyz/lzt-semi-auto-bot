@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Bağlantılar</h1>
+<p class="muted">Bu sayfa kendiliğinden Telegram'a veya Itemsatış'a istek göndermez. Kontroller yalnızca butona bastığında yapılır.</p>
+
+<div class="card"><h2>Itemsatış webhook güvenliği</h2>
+{% if key_from_env %}
+  <p>Anahtar Render Environment içinde tanımlı (ITEMSATIS_WEBHOOK_SECRET) ve her bildirimde zorunlu.</p>
+{% elif not has_key %}
+  <p class="error-text">Webhook adresi şu an anahtarsız: adresi bilen herkes sipariş bildirimi gönderebilir.</p>
+  <ol>
+    <li>Aşağıdan anahtar oluştur. Bu adım hiçbir bildirimi reddetmez.</li>
+    <li>Gösterilen yeni adresi Itemsatış'taki webhook ayarına kaydet.</li>
+    <li>Itemsatış'tan anahtarlı bir bildirim geldiği burada görününce anahtarı zorunlu yap.</li>
+  </ol>
+  <form method="post" action="/admin/integrations/itemsatis"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="create"><button class="primary">Anahtar oluştur</button></form>
+{% else %}
+  <p>Durum: <strong>{{ 'Anahtar zorunlu — anahtarsız bildirimler reddediliyor' if enforced else 'Anahtar oluşturuldu — anahtarsız bildirimler henüz kabul ediliyor' }}</strong></p>
+  <p>Anahtarlı bildirim: <strong>{{ 'geldi' if seen else 'henüz gelmedi' }}</strong>{% if seen %} <small>({{ (seen * 1000000)|date }})</small>{% endif %}</p>
+  <details><summary>Itemsatış'a kaydedilecek webhook adresini göster</summary>
+    <p class="muted">Bu adres gizli anahtar içerir. Yalnızca Itemsatış webhook ayarına yapıştır; başka yerde paylaşma.</p>
+    <p><code>{{ webhook_url }}</code></p>
+  </details>
+  {% if not enforced %}
+    <form method="post" action="/admin/integrations/itemsatis"><input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="action" value="enforce">
+      <button class="primary" {{ 'disabled' if not seen }}>Anahtarı zorunlu yap</button>
+      {% if not seen %}<small>Önce Itemsatış'tan anahtarlı bir bildirim gelmeli.</small>{% endif %}
+    </form>
+    <details><summary>Yeni anahtar oluştur</summary>
+      <form method="post" action="/admin/integrations/itemsatis"><input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="action" value="create">
+        <label><input style="width:auto" type="checkbox" name="confirmed" value="yes" required> Eski anahtarlı adresin geçersiz olacağını biliyorum.</label>
+        <p><button>Yeni anahtar oluştur</button></p></form>
+    </details>
+  {% else %}
+    <details><summary>Zorunluluğu kaldır</summary>
+      <p>Yalnızca Itemsatış bildirimleri reddediliyorsa kullan. Anahtarsız bildirimler yeniden kabul edilir.</p>
+      <form method="post" action="/admin/integrations/itemsatis"><input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="action" value="relax"><button class="danger">Anahtarsız bildirimlere izin ver</button></form>
+    </details>
+  {% endif %}
+{% endif %}
+{% if ip_list %}<p class="error-text">WEBHOOK_IP_WHITELIST tanımlı. Render vekil sunucusu arkasında istemci IP'si güvenilir okunamaz; anahtar kullanın ve bu değişkeni kaldırın.</p>{% endif %}
+</div>
+
+<div class="card"><h2>Telegram</h2>
+  <div class="grid">
+    <p><small>Bildirim gönderimi</small><br>{{ 'Açık' if telegram.token and telegram.chat else 'Kapalı (BOT_TOKEN / CHAT_ID eksik)' }}</p>
+    <p><small>Sohbet türü</small><br>{{ 'Grup' if telegram.group else 'Özel sohbet' }}</p>
+    <p><small>Webhook anahtarı</small><br>{{ 'Var' ~ (' (Render Environment)' if telegram.secret_from_env else '') if telegram.secret else 'Yok' }}</p>
+    <p><small>"Siparişi gönder" düğmesi</small><br><strong>{{ 'Etkin' if telegram.buttons else 'Kapalı' }}</strong></p>
+  </div>
+  {% if telegram.group and not telegram.admins %}
+  <p class="error-text">Sohbet bir grup. Gönder düğmesinin çalışması için Render Environment içinde TELEGRAM_ADMIN_USER_IDS (senin Telegram kullanıcı kimliğin) tanımlanmalı.</p>
+  {% endif %}
+  <p class="muted">Kayıt işlemi Telegram'a bu uygulamanın /telegram-webhook adresini ve gizli anahtarını bildirir. Bot başka bir adrese bağlıysa o bağlantı bu adresle değiştirilir; önce durumu kontrol et.</p>
+  <form class="inline" method="post" action="/admin/integrations/telegram"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="check"><button {{ 'disabled' if not telegram.token }}>Telegram durumunu kontrol et</button></form>
+  <form class="inline" method="post" action="/admin/integrations/telegram"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="register"><button class="primary" {{ 'disabled' if not telegram.token or not telegram.public }}>Telegram webhook'unu kaydet</button></form>
+</div>
+{% endblock %}
