@@ -4,7 +4,10 @@
   <label>Panel<select data-field="panel">{% for key,panel in panels.items() %}<option value="{{ key }}" {{ 'selected' if p.get('panel')==key }}>{{ panel.name }}{{ ' · API eksik' if not panel.api_key }}</option>{% endfor %}</select></label>
   <label>Servis ID<input data-field="service_id" value="{{ p.get('service_id','') }}" required pattern="[0-9]+" inputmode="numeric"></label>
   <label>Adet<input data-field="quantity" type="number" min="1" max="1000000" value="{{ p.get('quantity',1000) }}" required></label>
-  <label>Platform<select data-field="platform">{% for platform in ['instagram','tiktok','youtube','x','twitch','kick','facebook','telegram','other'] %}<option {{ 'selected' if p.get('platform')==platform }}>{{ platform }}</option>{% endfor %}</select></label>
+  {% set platforms = ['instagram','tiktok','youtube','x','twitch','kick','facebook','telegram','other'] %}
+  {# Keep an imported value selected; otherwise saving would silently change it. #}
+  {% if p.get('platform') and p.get('platform') not in platforms %}{% set platforms = [p.get('platform')] + platforms %}{% endif %}
+  <label>Platform<select data-field="platform">{% for platform in platforms %}<option {{ 'selected' if p.get('platform')==platform }}>{{ platform }}</option>{% endfor %}</select></label>
   <label>Servis adı (isteğe bağlı)<input data-field="name" value="{{ p.get('name','') }}" placeholder="Takipçi / Beğeni"></label>
 </div><button type="button" data-remove>Bu servisi çıkar</button></div>
 {% endmacro %}

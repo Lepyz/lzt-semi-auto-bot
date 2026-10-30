@@ -56,7 +56,10 @@ class Store:
             conn.close()
 
     def execute(self, conn, sql, params=()):
-        return conn.execute(sql.replace("?", "%s") if self.postgres else sql, params)
+        if not self.postgres:
+            return conn.execute(sql, params)
+        # psycopg parses '%' placeholders whenever params is not None, even ().
+        return conn.execute(sql.replace("?", "%s"), params or None)
 
     def initialize(self):
         statements = [
@@ -174,8 +177,9 @@ class Store:
             sql += " AND target=?"
             params.append(target)
         if search:
-            sql += " AND LOWER(document) LIKE ?"
-            params.append("%" + search.lower() + "%")
+            sql += " AND LOWER(document) LIKE ? ESCAPE '!'"
+            escaped = search.lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            params.append("%" + escaped + "%")
         sql += " ORDER BY created_at " + ("DESC" if newest else "ASC") + ",id LIMIT ?"
         params.append(limit)
         with self.transaction() as conn:
@@ -209,7 +213,8 @@ class Store:
 
     def bindings(self):
         with self.transaction() as conn:
-            rows = self.execute(conn, "SELECT key,value FROM settings WHERE key LIKE 'binding:%'").fetchall()
+            rows = self.execute(conn, "SELECT key,value FROM settings WHERE key LIKE ? ORDER BY LENGTH(key),key",
+                                ("binding:%",)).fetchall()
             return {r["key"][8:]: json.loads(r["value"]) for r in rows}
 
     def delete_binding(self, advert_id):

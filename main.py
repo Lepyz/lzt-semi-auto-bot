@@ -96,8 +96,9 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         response = HTMLResponse(html, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY",
                                               "X-Content-Type-Options": "nosniff",
                                               "Referrer-Policy": "same-origin"})
-        response.set_cookie("csrf", token, httponly=True, samesite="strict",
-                            secure=request.url.scheme == "https")
+        # Render terminates TLS at its proxy; the app itself sees plain HTTP.
+        https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        response.set_cookie("csrf", token, httponly=True, samesite="strict", secure=https)
         return response
 
     @app.exception_handler(ValueError)
@@ -273,8 +274,13 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         if not settings.telegram_secret or not secrets.compare_digest(
                 request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), settings.telegram_secret):
             raise HTTPException(401, "Telegram webhook yetkisi doğrulanamadı.")
-        data = await request.json()
-        callback = data.get("callback_query", {})
+        try:
+            data = await request.json()
+        except ValueError:
+            raise HTTPException(400, "Telegram verisi okunamadı.")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "Telegram verisi okunamadı.")
+        callback = data.get("callback_query") or {}
         message = callback.get("message") or data.get("message") or {}
         chat = str(message.get("chat", {}).get("id", ""))
         sender = str((callback.get("from") or message.get("from") or {}).get("id", ""))

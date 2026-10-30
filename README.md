@@ -15,6 +15,10 @@ Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
   sipariş tekrar kontrol edilir; daha eski bekletilmiş satın alma atlanmaz.
 - Panel add isteği zaman aşımına uğrarsa otomatik tekrar yapılmaz. Panelde açılmış
   olabilir: bulunan SMM kimliğini kaydet veya açılmadığını açıkça doğrula.
+- Render dağıtımında yeni örnek, eski örnek işini bitirirken açılır. Yarım kalan
+  kayıtlar bu yüzden açılıştan ~2 dakika sonra ve yalnızca eskimişse ele alınır:
+  panele gitmemiş kayıt kuyruğa geri alınır, panel cevabı bilinmeyen kayıt
+  "Panelden kontrol et" durumuna geçer ve tekrar gönderilmez.
 - Paket bileşenlerinin SMM kimlikleri ayrı saklanır. Başarılı bileşen yeniden açılmaz.
 - Bilgisi/eşleştirmesi eksik veya türü tanınmayan sipariş biçimindeki webhooklar
   kontrol listesinde kalır; yeni event türü diye sessizce silinmez.

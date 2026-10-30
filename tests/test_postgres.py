@@ -59,3 +59,12 @@ def test_postgres_order_and_notice_commit_together(database):
     database.save(order, notice)
     assert database.get(order["id"])["product_name"] == "Türkçe sipariş"
     assert database.notification(notice["key"])["state"] == "pending"
+
+
+def test_postgres_literal_percent_query_without_parameters(database):
+    # Regression for /admin/services: psycopg parsed '%' even with empty params.
+    database.set_setting("binding:" + uuid.uuid4().hex[:8], {"name": "x", "components": []})
+    with database.transaction() as conn:
+        rows = database.execute(conn, "SELECT key FROM settings WHERE key LIKE 'binding:%'").fetchall()
+    assert rows
+    assert database.bindings()

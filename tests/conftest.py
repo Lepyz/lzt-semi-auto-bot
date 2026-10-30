@@ -1,6 +1,8 @@
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 import pytest
 
@@ -28,9 +30,26 @@ class FakePanels:
         return self.current
 
 
-@pytest.fixture
-def rig(tmp_path):
-    settings = Settings(database_url="sqlite:///" + str(tmp_path / "test.sqlite"),
+def disposable_postgres():
+    """Dedicated test database only; production DATABASE_URL is never read here."""
+    url = os.getenv("TEST_DATABASE_URL", "")
+    if not url:
+        pytest.skip("Dedicated PostgreSQL test URL not provided")
+    if not urlparse(url).path.rstrip("/").endswith("_test"):
+        pytest.fail("TEST_DATABASE_URL database name must end with _test")
+    store = Store(url)
+    store.initialize()
+    with store.transaction() as conn:
+        conn.execute("TRUNCATE orders, settings, target_locks, notifications")
+    return url
+
+
+# Every engine/web test also runs on PostgreSQL: SQLite hides driver differences.
+@pytest.fixture(params=["sqlite", "postgres"])
+def rig(request, tmp_path):
+    url = (disposable_postgres() if request.param == "postgres"
+           else "sqlite:///" + str(tmp_path / "test.sqlite"))
+    settings = Settings(database_url=url,
                         password="test-admin-password", bot_token="", chat_id="", telegram_secret="",
                         telegram_admins="", webhook_secret="", webhook_ips="", public_url="",
                         require_import=False, panels={
