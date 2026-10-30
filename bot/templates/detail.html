@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<a href="/admin">← Siparişlere dön</a><h1>{{ order.product_name or 'Sipariş' }}</h1>
+<div class="card">
+  <span class="badge {{ order.state }}">{{ labels.get(order.state,order.state) }}</span>
+  <div class="grid">
+    <p><small>Itemsatış siparişi</small><br>{{ order.itemsatis_id or 'Kimlik eksik — kontrol gerekli' }}</p>
+    <p><small>İlan</small><br>{{ order.advert_id }}</p><p><small>Alınma</small><br>{{ order.created_at|date }}</p>
+  </div><p class="break"><small>Hedef link</small><br>{{ order.link or 'Henüz belirlenmedi' }}</p>
+  {% if order.error %}<p class="error-text">{{ order.error }}</p>{% endif %}
+  {% if order.state in manual_states %}
+  <form class="inline" method="post" action="/admin/orders/{{ order.id }}/send">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}">
+    <button class="primary">Bu siparişi gönder</button>
+  </form>
+  {% endif %}
+  <form class="inline" method="post" action="/admin/orders/{{ order.id }}/refresh">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button>Panel durumunu kontrol et</button>
+  </form><a class="button" href="/admin/orders/{{ order.id }}">Ekranı yenile</a>
+  {% if order.state in ['waiting','ready'] %}<p class="muted">Bu sipariş otomatik gönderilmeyecek. Gönderme işleminde aktif sipariş yeniden kontrol edilir.</p>{% endif %}
+</div>
+<div class="card table-wrap"><h2>Panel siparişleri</h2><table>
+  <thead><tr><th>Panel / Servis</th><th>Adet</th><th>SMM kimliği</th><th>Son panel durumu</th><th>İşlem sonucu</th></tr></thead>
+  <tbody>{% for p in order.parts %}
+  <tr><td>{{ panels.get(p.panel,{}).get('name',p.panel) }} / {{ p.service_id }}</td><td>{{ p.quantity }}</td>
+  <td>{{ p.smm_id or '—' }}</td><td>{{ p.status or 'Henüz sorgulanmadı' }}</td>
+  <td>{{ 'Henüz gönderilmedi' if p.state=='new' else labels.get(p.state,p.state) }}{% if p.error %}<br><small class="error-text">{{ p.error }}</small>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="5">Servis eşleştirmesi veya müşteri linki gerekiyor.</td></tr>{% endfor %}</tbody>
+</table></div>
+{% if order.state in manual_states and not order.parts|selectattr('state','in',['submitted','finished','sending','uncertain'])|list %}
+<div class="card"><h2>Bilgiyi düzelt</h2>
+  <p class="muted">İlan eşleştirmesini değiştirdiysen veya müşteri linki eksikse düzeltip kaydet. Kaydetmek sipariş göndermez.</p>
+  <form method="post" action="/admin/orders/{{ order.id }}/repair">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}">
+    <label>Müşteri linki</label><input name="link" value="{{ order.link or order.links.get('other','') }}" required>
+    <p><button>Bilgileri kaydet ve eşleştirmeyi yenile</button></p>
+  </form>
+</div>{% endif %}
+{% if order.state in manual_states and not order.parts|selectattr('state','in',['submitted','sending','uncertain'])|list %}
+<details class="card"><summary>Bu kaydı göndermeden kapat</summary>
+<p>Bu işlem panelde sipariş iptal etmez. Bu satın almanın kalan gönderimini takipten çıkarır.</p>
+<form method="post" action="/admin/orders/{{ order.id }}/close">
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}">
+<label><input style="width:auto" type="checkbox" name="confirmed" value="yes" required> Bu kaydı göndermeden kapatmak istiyorum.</label>
+<p><button class="danger">Göndermeden kapat</button></p></form></details>
+{% endif %}
+{% for p in order.parts %}{% if p.state in ['uncertain','sending'] %}
+<div class="card"><h2>Panelde kontrol et · {{ p.panel }} / {{ p.service_id }}</h2>
+  <p>Panelde bu siparişin açılıp açılmadığını kontrol et. Aşağıdaki işlem yeni sipariş açmaz.</p>
+  <form method="post" action="/admin/orders/{{ order.id }}/reconcile">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}">
+    <input type="hidden" name="index" value="{{ loop.index0 }}">
+    <label>Panelde açılmışsa SMM sipariş kimliği</label><input name="smm_id" inputmode="numeric">
+    <label><input style="width:auto" type="checkbox" name="absent" value="yes"> Panelde açılmadığını kontrol ettim.</label>
+    <p><button>Kontrol sonucunu kaydet</button></p>
+  </form>
+</div>{% endif %}{% endfor %}
+{% if order.state == 'uncertain' and not order.parts %}
+<div class="card"><h2>Eski işlem kaydını panelden kontrol et</h2>
+<p>Eski işlem sırasında sipariş açılmış olabilir. Önce panelde kontrol et. Açılmışsa bu kaydı yeniden gönderme.</p>
+<form method="post" action="/admin/orders/{{ order.id }}/reconcile">
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><input type="hidden" name="index" value="-1">
+<label><input style="width:auto" type="checkbox" name="absent" value="yes" required> Panelde bu siparişin açılmadığını kontrol ettim.</label>
+<p><button>Kontrol sonucunu kaydet</button></p></form></div>
+{% endif %}
+{% endblock %}
