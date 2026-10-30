@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import panel_key
 from .payloads import classify, extract_links, get_advert_id, get_order_id, get_product_name
-from .payloads import normalize_panel_link, source_key, target_key, valid_link
+from .payloads import legacy_payload_key, normalize_panel_link, source_key, target_key, valid_link
 from .store import Conflict
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ class Engine:
             self.notifier.enqueue(notification)
 
     def summary(self, order):
-        return (f"Itemsatış: {order.get('itemsatis_id') or 'Kimlik eksik'}\n"
+        return (f"Itemsatış: {order.get('itemsatis_id') or 'Bildirim kaydı ' + order['id'][:10]}\n"
                 f"Ürün: {order.get('product_name') or order.get('advert_id')}\n"
                 f"Link: {order.get('link') or '-'}")
 
@@ -68,8 +68,13 @@ class Engine:
         kind = classify(payload)
         if kind == "ignore":
             return None, False
+        legacy_key = legacy_payload_key(payload)
+        legacy = self.store.by_source(legacy_key)
+        if legacy:
+            return legacy, False
         now = int(time.time() * 1_000_000)
         order = {"id": uuid.uuid4().hex, "source_key": source_key(payload),
+                 "legacy_source_key": legacy_key,
                  "itemsatis_id": get_order_id(payload), "advert_id": get_advert_id(payload),
                  "product_name": get_product_name(payload)[:200], "links": extract_links(payload),
                  "link": "", "target": "", "parts": [], "state": "queued" if kind == "order" else "review",
@@ -160,6 +165,11 @@ class Engine:
             return
         order["state"] = "processing"
         self.store.save(order)  # Atomic compare-and-swap claim.
+        if order.get("legacy_source_key") and self.store.by_source(order["legacy_source_key"]):
+            order.update(state="closed", manual_required=True,
+                         error="Bu bildirim eski sürümde işlenmiş; tekrar sipariş açılmadı.")
+            self.store.save(order)
+            return
         try:
             self.prepare(order)
         except ValueError as exc:
@@ -279,6 +289,8 @@ class Engine:
             raise ValueError("Bu sipariş gönderime uygun değil; mevcut durumu kontrol edin.")
         if revision is not None and order["revision"] != revision:
             raise Conflict("Sipariş değişti; sayfayı yenileyin.")
+        if order.get("legacy_source_key") and self.store.by_source(order["legacy_source_key"]):
+            raise ValueError("Bu bildirim eski sürümde işlenmiş; yeniden gönderilemez.")
         if self.store.setting("paused", False):
             raise ValueError("Önce yeni gönderimleri tekrar etkinleştirin.")
         if any(p["state"] in {"sending", "uncertain"} for p in order["parts"]):

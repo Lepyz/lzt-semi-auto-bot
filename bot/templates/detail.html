@@ -4,7 +4,7 @@
 <div class="card">
   <span class="badge {{ order.state }}">{{ labels.get(order.state,order.state) }}</span>
   <div class="grid">
-    <p><small>Itemsatış siparişi</small><br>{{ order.itemsatis_id or 'Kimlik eksik — kontrol gerekli' }}</p>
+    <p><small>Itemsatış siparişi</small><br>{{ order.itemsatis_id or 'Bildirim kaydı ' ~ order.id[:10] }}</p>
     <p><small>İlan</small><br>{{ order.advert_id }}</p><p><small>Alınma</small><br>{{ order.created_at|date }}</p>
   </div><p class="break"><small>Hedef link</small><br>{{ order.link or 'Henüz belirlenmedi' }}</p>
   {% if order.error %}<p class="error-text">{{ order.error }}</p>{% endif %}

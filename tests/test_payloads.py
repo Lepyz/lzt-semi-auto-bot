@@ -37,8 +37,21 @@ def test_missing_product_or_price_does_not_discard_purchase():
     assert classify({"order_id": "1", "advert_id": "10"}) == "order"
 
 
-def test_missing_id_requires_review():
-    assert classify({"event": "order.created", "advert_id": "10"}) == "review"
+def test_known_sale_without_order_id_remains_compatible():
+    assert classify({"event": "advert_sold", "advert_id": "10"}) == "order"
+    assert classify({"event": "order.created"}) == "review"
+    assert classify({"event": "unknown_notification", "advert_id": "10"}) == "review"
+
+
+def test_legacy_payload_hash_matches_old_bot_and_ignores_queue_fields():
+    import hashlib
+    from bot.payloads import legacy_payload_key
+    data = {"event": "advert_sold", "advert_id": "10", "details": {"time": 1700000000}}
+    expected = hashlib.sha1(json.dumps(data, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:24]
+    assert legacy_payload_key(data) == "legacy_payload:" + expected
+    queued = dict(data, _queue_id="runtime-only", processing_started_at=1700000100)
+    assert legacy_payload_key(queued) == legacy_payload_key(data)
+    assert source_key(queued) == source_key(data)
 
 
 @pytest.mark.parametrize("url", [

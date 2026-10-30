@@ -71,18 +71,32 @@ def classify(data):
                    "sale paid", "advert sold", "ilan satildi", "ilaniniz satildi", "new order"))
     purchase = purchase or event in {"siparis", "satildi", "sale", "purchase"}
     if purchase:
-        return "order" if order_id and advert_id else "review"
+        # Legacy Itemsatis sale notifications often have no purchase ID.
+        # A known sale event + advert can proceed; binding/link checks still
+        # happen before add. Exact webhook payloads are deduplicated.
+        return "order" if advert_id else "review"
     if order_id and advert_id:
         return "order" if not event else "review"
     return "review" if advert_id else "ignore"
+
+
+def receipt_payload(data):
+    safe = dict(data)
+    safe.pop("_queue_id", None)
+    safe.pop("processing_started_at", None)
+    return json.dumps(safe, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def legacy_payload_key(data):
+    """Exactly matches the previous bot's itemsatis_payload SHA1 algorithm."""
+    return "legacy_payload:" + hashlib.sha1(receipt_payload(data).encode("utf-8", errors="ignore")).hexdigest()[:24]
 
 
 def source_key(data):
     order_id = get_order_id(data)
     if order_id:
         return "itemsatis:" + order_id
-    fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False,
-                                            default=str).encode()).hexdigest()
+    fingerprint = hashlib.sha256(receipt_payload(data).encode()).hexdigest()
     return "payload:" + fingerprint
 
 

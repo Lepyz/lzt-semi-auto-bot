@@ -39,6 +39,22 @@ def test_import_can_be_rerun_without_duplicate_orders_or_parts(rig):
     assert len(rig.store.by_source("itemsatis:1")["parts"]) == 1
 
 
+def test_legacy_idless_receipts_are_imported_and_rerunnable(rig):
+    from bot.payloads import legacy_payload_key
+    data = payload()
+    del data["order_id"]
+    key = legacy_payload_key(data)
+    source = snapshot()
+    source["processed_orders"] = ["itemsatis_payload:" + key.split(":", 1)[1], "queue:old-runtime-id"]
+    counts = import_snapshot(rig.store, rig.settings, source)
+    assert counts["history"] == 1
+    assert rig.store.by_source(key)["state"] == "legacy"
+    import_snapshot(rig.store, rig.settings, source)
+    received, created = rig.engine.receive(data)
+    assert not created and received["state"] == "legacy"
+    assert not rig.panels.adds
+
+
 def test_multiple_old_actives_on_same_target_are_all_respected(rig):
     data = snapshot()
     data["pending_orders"].append(dict(data["pending_orders"][0], itemsatis_order_id="4",

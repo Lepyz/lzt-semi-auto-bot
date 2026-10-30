@@ -79,6 +79,49 @@ def test_same_purchase_repeated_does_not_create_duplicate(rig):
     assert len(rig.panels.adds) == 1
 
 
+def test_sale_without_order_id_is_automatic_and_repeats_are_deduplicated(rig):
+    data = payload()
+    del data["order_id"]
+    data["event"] = "advert_sold"
+    data["details"] = {"time": 1700000000}
+    first, created = rig.engine.receive(data)
+    assert created and first["state"] == "queued"
+    rig.engine.execute(first["id"])
+    again, created = rig.engine.receive(dict(data))
+    assert not created and again["id"] == first["id"]
+    assert len(rig.panels.adds) == 1
+    # A later independent purchase for the same link is held, not discarded.
+    later = dict(data, details={"time": 1700000001})
+    second, created = rig.engine.receive(later)
+    assert created and second["id"] != first["id"]
+    rig.engine.execute(second["id"])
+    assert rig.store.get(second["id"])["state"] == "waiting"
+    assert len(rig.panels.adds) == 1
+
+
+def test_imported_legacy_fingerprint_blocks_old_webhook_replay(rig):
+    from bot.payloads import legacy_payload_key
+    from scripts.migrate_upstash import empty_order
+    data = payload()
+    del data["order_id"]
+    data["event"] = "advert_sold"
+    legacy, _ = rig.store.create(empty_order(legacy_payload_key(data)))
+    received, created = rig.engine.receive(data)
+    assert not created and received["id"] == legacy["id"]
+    assert not rig.jobs and not rig.panels.adds
+
+
+def test_legacy_marker_imported_after_receipt_still_prevents_send(rig):
+    from scripts.migrate_upstash import empty_order
+    data = payload()
+    del data["order_id"]
+    order, _ = rig.engine.receive(data)
+    rig.store.create(empty_order(order["legacy_source_key"]))
+    rig.engine.execute(order["id"])
+    assert rig.store.get(order["id"])["state"] == "closed"
+    assert not rig.panels.adds
+
+
 def test_different_links_are_independent(rig):
     receive_and_run(rig)
     other = receive_and_run(rig, 2, "https://instagram.com/other")

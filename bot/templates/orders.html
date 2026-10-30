@@ -17,7 +17,7 @@
 <div class="card table-wrap"><table>
 <thead><tr><th>Alınma</th><th>Itemsatış / İlan</th><th>Ürün ve hedef</th><th>Durum</th><th>SMM kimlikleri</th><th></th></tr></thead>
 <tbody>{% for o in orders %}
-<tr><td>{{ o.created_at|date }}</td><td>{{ o.itemsatis_id or 'Kimlik eksik' }}<br><small>İlan {{ o.advert_id }}</small></td>
+<tr><td>{{ o.created_at|date }}</td><td>{{ o.itemsatis_id or 'Bildirim ' ~ o.id[:10] }}<br><small>İlan {{ o.advert_id }}</small></td>
 <td>{{ o.product_name or 'Ürün adı yok' }}<br><small>{{ o.link or o.links.get('other','Link kontrolü gerekiyor') }}</small></td>
 <td><span class="badge {{ o.state }}">{{ labels.get(o.state,o.state) }}</span>{% if o.error %}<br><small class="error-text">{{ o.error }}</small>{% endif %}</td>
 <td>{% for p in o.parts %}{{ panels.get(p.panel,{}).get('name',p.panel) }}: {{ p.smm_id or '—' }}<br>{% if p.status %}<small>{{ p.status }}</small><br>{% endif %}{% endfor %}</td>
