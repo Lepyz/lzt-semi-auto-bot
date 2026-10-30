@@ -142,7 +142,12 @@ Admin panelindeki manuel gönderme her zaman kullanılabilir.
 - Link/servis/adet doğrulaması yereldir; bakiye veya fiyat sorgusu gerektirmez.
 - Panelin API anahtarları sipariş kayıtlarında veya HTML'de tutulmaz.
 - Admin Basic Auth, POST işlemlerinde CSRF ve revision kontrolü vardır.
-- Kesin sipariş kimliği bulunmayan satışlar otomatik gönderilmez; kontrol ister.
+- Bilinen satış olayı ve ilan kimliği varsa, sipariş kimliği gönderilmeyen eski
+  Itemsatış bildirimleri de link/eşleştirme doğrulamasından sonra işlenir. Tekrar
+  gönderimler tüm bildirim içeriğinin özetiyle engellenir. Bilinmeyen olaylar kontrol ister.
+- Geçiş, eski itemsatis_payload koruma özetlerini de taşır. Aynı eski bildirim
+  yeniden gelirse ikinci panel siparişi açılmaz. Kaynak hiçbir ayırt edici kimlik
+  veya zaman bilgisi göndermiyorsa tamamen aynı iki ayrı satın alma ayırt edilemez.
 - Bekletme takibi yalnızca bu botun bildiği/içe alınmış panel siparişlerini kapsar.
   Panelin sitesinden ayrıca elle açılan siparişleri otomatik keşfetmez.
 - TikTok kısa linkleri ağdan çözülmez. Aynı hedefin iki farklı kısa linkini

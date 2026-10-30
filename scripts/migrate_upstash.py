@@ -98,6 +98,13 @@ def import_snapshot(store, settings, snapshot):
     # Old multi-key dedup records map back to one real purchase.
     for key in snapshot.get("processed_orders", []):
         key = str(key)
+        if key.startswith("itemsatis_payload:"):
+            fingerprint = key.split(":", 1)[1]
+            if not fingerprint:
+                raise ValueError("Eski bildirim koruma anahtarı boş.")
+            _, created = store.create(empty_order("legacy_payload:" + fingerprint))
+            counts["history"] += int(created)
+            continue
         if key.startswith(("order:", "itemsatis_order:")):
             itemsatis_id = key.split(":", 1)[1]
         elif key.startswith("itemsatis_advert_order:"):
@@ -119,7 +126,7 @@ def import_snapshot(store, settings, snapshot):
         if not link:
             raise ValueError("Eski aktif siparişte link eksik; geçiş tamamlanmadı.")
         previous = store.by_source(source)
-        base = empty_order(source, itemsatis_id, str(item.get("advert_id") or ""),
+        base = empty_order(source, itemsatis_id if known_id else "", str(item.get("advert_id") or ""),
                            int(float(item.get("created_at") or time.time()) * 1_000_000))
         base.update(state="submitted", link=link, target=target_key(link, platform),
                     product_name=str(item.get("product_name") or ""), links={platform: link})
@@ -146,7 +153,7 @@ def import_snapshot(store, settings, snapshot):
         itemsatis_id = str(item.get("order_id") or "")
         source = ("itemsatis:" + itemsatis_id if itemsatis_id and itemsatis_id != "Bilinmiyor"
                   else "legacy_failed:" + hashlib.sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest())
-        order = empty_order(source, itemsatis_id, str(item.get("advert_id") or ""),
+        order = empty_order(source, "" if itemsatis_id == "Bilinmiyor" else itemsatis_id, str(item.get("advert_id") or ""),
                             int(float(item.get("created_at") or time.time()) * 1_000_000))
         reason = str(item.get("reason") or "").lower()
         detail = str(item.get("detail") or "").lower()
