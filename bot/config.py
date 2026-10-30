@@ -36,6 +36,9 @@ class Settings:
     telegram_secret: str = field(default_factory=lambda: os.getenv("TELEGRAM_WEBHOOK_SECRET", ""))
     telegram_admins: str = field(default_factory=lambda: os.getenv("TELEGRAM_ADMIN_USER_IDS", ""))
     webhook_secret: str = field(default_factory=lambda: os.getenv("ITEMSATIS_WEBHOOK_SECRET", ""))
+    # An environment secret is always enforced; a key created in the admin panel
+    # is enforced only after Itemsatis has been seen using it.
+    webhook_enforced: bool = field(default_factory=lambda: bool(os.getenv("ITEMSATIS_WEBHOOK_SECRET")))
     webhook_ips: str = field(default_factory=lambda: os.getenv("WEBHOOK_IP_WHITELIST", ""))
     require_import: bool = field(default_factory=lambda: os.getenv(
         "REQUIRE_LEGACY_IMPORT", "true" if os.getenv("UPSTASH_REDIS_REST_URL") else "false").lower() == "true")

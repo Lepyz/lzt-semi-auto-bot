@@ -7,6 +7,36 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def callbacks_allowed(settings):
+    """Private chat owner, or explicitly listed group admins; secret is mandatory."""
+    return bool(settings.telegram_secret and settings.chat_id and
+                (not settings.chat_id.startswith("-") or settings.telegram_admins.strip()))
+
+
+def telegram_api(settings, method, payload=None):
+    """Explicit admin-triggered call. The bot token never appears in errors or logs."""
+    if not settings.bot_token:
+        raise ValueError("Render Environment içinde BOT_TOKEN tanımlı değil.")
+    try:
+        response = requests.post("https://api.telegram.org/bot" + settings.bot_token + "/" + method,
+                                 json=payload or {}, timeout=(5, 15))
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        raise ValueError("Telegram'a ulaşılamadı; biraz sonra tekrar deneyin.") from None
+    if not isinstance(data, dict) or not data.get("ok"):
+        description = str(data.get("description", "") if isinstance(data, dict) else "")
+        raise ValueError("Telegram isteği reddetti: " + description.replace(settings.bot_token, "[gizli]")[:200])
+    return data.get("result")
+
+
+def register_telegram_webhook(settings, secret):
+    if not settings.public_url.startswith("https://"):
+        raise ValueError("Uygulamanın HTTPS adresi bulunamadı (RENDER_EXTERNAL_URL).")
+    telegram_api(settings, "setWebhook", {
+        "url": settings.public_url + "/telegram-webhook", "secret_token": secret,
+        "allowed_updates": ["message", "callback_query"], "drop_pending_updates": False})
+
+
 class Notifier:
     def __init__(self, store, settings):
         self.store, self.settings = store, settings
@@ -39,10 +69,7 @@ class Notifier:
         payload = {"chat_id": self.settings.chat_id, "text": notification["text"],
                    "disable_web_page_preview": True}
         buttons = []
-        # Private chat owner, or explicitly listed group admins; secret is mandatory.
-        callbacks_allowed = (self.settings.telegram_secret and
-                             (not self.settings.chat_id.startswith("-") or self.settings.telegram_admins))
-        if notification.get("action") and callbacks_allowed:
+        if notification.get("action") and callbacks_allowed(self.settings):
             buttons.append({"text": "Siparişi gönder", "callback_data": "send:" + notification["order_id"]})
         if self.settings.public_url:
             buttons.append({"text": "Admin panelinde aç",
