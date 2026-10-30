@@ -128,6 +128,17 @@ def test_different_links_are_independent(rig):
     assert other["state"] == "submitted" and len(rig.panels.adds) == 2
 
 
+def test_recent_migration_write_does_not_make_old_order_look_new(rig):
+    first = receive_and_run(rig)
+    first["created_at"] -= 86_400_000_000
+    rig.store.save(first)  # updated_at is now, but the panel order itself is old.
+    rig.panels.current = {"status": "Completed", "terminal": True}
+    second = receive_and_run(rig, 2)
+    assert rig.panels.checks
+    assert second["state"] == "submitted"
+    assert len(rig.panels.adds) == 2
+
+
 def test_unknown_order_event_saved_for_review(rig):
     data = payload()
     data["event"] = "future_sale_format"

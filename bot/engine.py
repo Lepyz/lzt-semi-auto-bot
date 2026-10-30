@@ -188,7 +188,7 @@ class Engine:
                 self.store.release_target(order["target"], owner_id)
             if owner and any(p["state"] == "submitted" for p in owner["parts"]):
                 # A just-created order is certainly active; do not immediately query it.
-                if time.time() - owner.get("last_checked", owner["updated_at"] / 1_000_000) > 90:
+                if time.time() - owner.get("last_checked", owner["created_at"] / 1_000_000) > 90:
                     self.refresh(owner_id, force=False)
             if self.active_owner(order["target"]):
                 self.wait(order, "Aynı linkte aktif veya sonucu belirsiz bir sipariş var.")
