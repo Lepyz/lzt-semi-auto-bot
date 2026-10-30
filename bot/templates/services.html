@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% macro component(p={}) %}
+<div class="component-row"><div class="grid">
+  <label>Panel<select data-field="panel">{% for key,panel in panels.items() %}<option value="{{ key }}" {{ 'selected' if p.get('panel')==key }}>{{ panel.name }}{{ ' · API eksik' if not panel.api_key }}</option>{% endfor %}</select></label>
+  <label>Servis ID<input data-field="service_id" value="{{ p.get('service_id','') }}" required pattern="[0-9]+" inputmode="numeric"></label>
+  <label>Adet<input data-field="quantity" type="number" min="1" max="1000000" value="{{ p.get('quantity',1000) }}" required></label>
+  <label>Platform<select data-field="platform">{% for platform in ['instagram','tiktok','youtube','x','twitch','kick','facebook','telegram','other'] %}<option {{ 'selected' if p.get('platform')==platform }}>{{ platform }}</option>{% endfor %}</select></label>
+  <label>Servis adı (isteğe bağlı)<input data-field="name" value="{{ p.get('name','') }}" placeholder="Takipçi / Beğeni"></label>
+</div><button type="button" data-remove>Bu servisi çıkar</button></div>
+{% endmacro %}
+{% macro binding_form(id='', b={}) %}
+<form method="post" action="/admin/services" data-binding>
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="components">
+<div class="grid">
+  <label>Itemsatış ilan ID<input name="advert_id" value="{{ id }}" required pattern="[0-9]+" inputmode="numeric" {{ 'readonly' if id }}></label>
+  <label>Ürün / paket adı<input name="name" value="{{ b.get('name','') }}"></label>
+  <label>Durum<select name="active"><option value="true" {{ 'selected' if b.get('active',True) }}>Aktif</option><option value="false" {{ 'selected' if not b.get('active',True) }}>Pasif</option></select></label>
+</div>
+<div data-components>{% for p in b.get('components',[{}]) %}{{ component(p) }}{% endfor %}</div>
+<p><button type="button" data-add>+ Servis ekle</button> <button class="primary">{{ 'Değişiklikleri kaydet' if id else 'Eşleştirmeyi kaydet' }}</button></p>
+</form>
+{% endmacro %}
+{% block content %}
+<h1>İlan–servis eşleştirmeleri</h1>
+<p class="muted">Bir ilan için bir servis seç. Paket oluşturmak için aynı ilana birden fazla servis ekleyebilirsin.</p>
+<div class="card"><h2>Yeni eşleştirme</h2>{{ binding_form() }}</div>
+{% for id,b in bindings.items() %}
+<div class="card"><h2>{{ b.name or 'İlan ' ~ id }} <small>· {{ id }} · {{ 'Aktif' if b.active else 'Pasif' }}</small></h2>
+<div class="table-wrap"><table><thead><tr><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Platform</th></tr></thead>
+<tbody>{% for p in b.components %}<tr><td>{{ panels.get(p.panel,{}).get('name',p.panel) }}</td><td>{{ p.service_id }}</td><td>{{ p.quantity }}</td><td>{{ p.platform }}</td></tr>{% endfor %}</tbody></table></div>
+<details><summary>Eşleştirmeyi düzenle</summary>{{ binding_form(id,b) }}</details>
+<details><summary>Eşleştirmeyi kaldır</summary><form method="post" action="/admin/services/delete"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="advert_id" value="{{ id }}"><p>Kayıtlı siparişlerin bilgileri korunur.</p><button class="danger">Bu eşleştirmeyi kaldır</button></form></details>
+</div>{% else %}<div class="card empty">Henüz eşleştirme yok. Geçişte mevcut Upstash eşleştirmeleri içe aktarılmalıdır.</div>{% endfor %}
+<template id="component-template">{{ component() }}</template>
+<script>
+document.querySelectorAll('[data-binding]').forEach(form=>{
+  const rows=form.querySelector('[data-components]');
+  const update=()=>rows.querySelectorAll('[data-remove]').forEach(button=>button.disabled=rows.children.length===1);
+  form.querySelector('[data-add]').addEventListener('click',()=>{
+    rows.append(document.getElementById('component-template').content.cloneNode(true));update();
+  });
+  rows.addEventListener('click',event=>{
+    const button=event.target.closest('[data-remove]');
+    if(button&&rows.children.length>1){button.closest('.component-row').remove();update();}
+  });
+  form.addEventListener('submit',()=>{
+    form.querySelector('[name=components]').value=JSON.stringify([...rows.children].map(row=>{
+      const result={};
+      row.querySelectorAll('[data-field]').forEach(input=>result[input.dataset.field]=input.value);
+      return result;
+    }));
+  });
+  update();
+});
+</script>
+{% endblock %}

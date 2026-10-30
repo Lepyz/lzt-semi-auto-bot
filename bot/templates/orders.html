@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar"><h1>Siparişler</h1>
+  <form method="post" action="/admin/pause"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="paused" value="{{ 'false' if paused else 'true' }}">
+    <button class="{{ 'primary' if paused else '' }}">{{ 'Yeni gönderimleri etkinleştir' if paused else 'Yeni gönderimleri duraklat' }}</button>
+  </form><a class="button" href="/admin">Yenile</a>
+</div>
+{% if paused %}<div class="notice">Gönderimler duraklatıldı. Yeni siparişler kaydedilir. Tekrar etkinleştirme, tutulan siparişleri otomatik göndermez.</div>{% endif %}
+<form class="grid card" method="get" action="/admin">
+  <div><label for="state">Durum</label><select id="state" name="state"><option value="">Tüm siparişler</option>
+  {% for key,label in labels.items() %}<option value="{{ key }}" {{ 'selected' if selected==key }}>{{ label }}</option>{% endfor %}</select></div>
+  <div><label for="q">Sipariş, ilan veya link ara</label><input id="q" name="q" value="{{ query }}" placeholder="Itemsatış ID / SMM ID / link"></div>
+  <div style="align-self:end"><button class="primary">Filtrele</button></div>
+</form>
+<p class="muted">Filtreye uyan en son 500 kayıt gösterilir. Daha eski bir sipariş için kimliği veya linkiyle arama yapabilirsin.</p>
+<div class="card table-wrap"><table>
+<thead><tr><th>Alınma</th><th>Itemsatış / İlan</th><th>Ürün ve hedef</th><th>Durum</th><th>SMM kimlikleri</th><th></th></tr></thead>
+<tbody>{% for o in orders %}
+<tr><td>{{ o.created_at|date }}</td><td>{{ o.itemsatis_id or 'Kimlik eksik' }}<br><small>İlan {{ o.advert_id }}</small></td>
+<td>{{ o.product_name or 'Ürün adı yok' }}<br><small>{{ o.link or o.links.get('other','Link kontrolü gerekiyor') }}</small></td>
+<td><span class="badge {{ o.state }}">{{ labels.get(o.state,o.state) }}</span>{% if o.error %}<br><small class="error-text">{{ o.error }}</small>{% endif %}</td>
+<td>{% for p in o.parts %}{{ panels.get(p.panel,{}).get('name',p.panel) }}: {{ p.smm_id or '—' }}<br>{% if p.status %}<small>{{ p.status }}</small><br>{% endif %}{% endfor %}</td>
+<td><a class="button" href="/admin/orders/{{ o.id }}">Aç</a></td></tr>
+{% else %}<tr><td colspan="6" class="empty">Bu filtrede sipariş bulunamadı.</td></tr>{% endfor %}</tbody></table></div>
+{% endblock %}
