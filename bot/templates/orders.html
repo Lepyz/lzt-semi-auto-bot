@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 {% include "order_styles.html" %}
-<div class="toolbar"><h1>{{ 'İşlem bekleyenler' if section=='inbox' else 'Siparişler' }}</h1><a class="button" href="/admin?{{ {'view':section,'state':selected,'q':query}|urlencode }}">Yenile</a></div>
+<div class="toolbar"><h1>{{ 'İşlem bekleyenler' if section=='inbox' else 'Siparişler' }}</h1><a class="button" href="/admin?{{ {'view':section,'state':selected,'q':query,'limit':limit}|urlencode }}">Yenile</a></div>
 <p class="order-status">{{ '⏸️ Yeni otomatik gönderimler duraklatıldı.' if paused else '🟢 Yeni siparişlerin otomatik gönderimi açık.' }} Bekletilmiş kayıtlar sen göndermeden başlamaz.</p>
 <div class="order-summary"><a href="/admin?view=inbox"><strong>{{ totals.inbox }}</strong>İşlem bekleyen</a><a href="/admin?view=active"><strong>{{ totals.active }}</strong>Aktif / hazırlanıyor</a><a href="/admin?view=waiting"><strong>{{ totals.waiting }}</strong>Bekletilen / hazır</a></div>
 <div class="order-tabs" aria-label="Sipariş bölümleri">{% for key,label in [('inbox','🛠️ İşlem bekleyenler'),('active','🟢 Aktif siparişler'),('waiting','⏳ Bekletilenler'),('finished','📁 Sonuçlananlar'),('all','Tüm kayıtlar')] %}<a href="/admin?view={{ key }}" {{ 'aria-current=page' if section==key }}>{{ label }}</a>{% endfor %}</div>
@@ -40,7 +40,8 @@
 </article>
 {% else %}<div class="card empty">Bu bölüm ve filtrede kayıt yok.</div>{% endfor %}
 </div>
-<p class="order-check">Filtreye uyan en son 500 kayıt gösterilir. Daha eski bir kayıt için sipariş numarası veya linkiyle arayabilirsin.</p>
+<p class="order-check">Filtreye uyan en son {{ limit }} kayıt gösterilir. Daha eski bir kayıt için sipariş numarası veya linkiyle arayabilirsin.</p>
+{% if limit < 500 and orders|length >= limit %}<p><a class="button" href="/admin?{{ {'view':section,'state':selected,'q':query,'limit':500}|urlencode }}">Daha fazla kayıt göster (500)</a></p>{% endif %}
 <details class="card"><summary>Otomatik gönderim ayarı</summary><p>Duraklatma yeni gönderimleri tutar. Tekrar açmak, daha önce bekletilmiş kayıtları kendiliğinden göndermez.</p>
   <p>Aktif işlemler yaklaşık {{ active_minutes }} dakikada bir, başka siparişi bekletenler {{ blocked_minutes }} dakikada bir kontrol edilir. İstersen sipariş ayrıntısından kontrol isteyebilirsin.</p>
   <form method="post" action="/admin/pause"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="paused" value="{{ 'false' if paused else 'true' }}"><button>{{ 'Yeni gönderimleri etkinleştir' if paused else 'Yeni gönderimleri duraklat' }}</button></form>

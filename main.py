@@ -9,16 +9,18 @@ import json
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from bot import quota
 from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
 from bot.migration import MigrationJob
@@ -41,6 +43,7 @@ class HideQuery(logging.Filter):
 
 
 logging.getLogger("uvicorn.access").addFilter(HideQuery())
+VERSION = "3.2.0"
 security = HTTPBasic()
 TEMPLATES = Environment(loader=FileSystemLoader(Path(__file__).parent / "bot" / "templates"),
                         autoescape=select_autoescape())
@@ -82,6 +85,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         if start_background:
             notifier.start()
             engine.start()
+            app.state.background = True
         try:
             yield
         finally:
@@ -89,8 +93,9 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             await asyncio.to_thread(engine.close)
             await asyncio.to_thread(notifier.close)
 
-    app = FastAPI(title="Boostera", version="3.1.2", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Boostera", version=VERSION, docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
+    health_hits = {"hits": 0, "last": 0.0}  # Shows on the usage page whether UptimeRobot calls in.
 
     def admin(credentials: HTTPBasicCredentials = Depends(security)):
         if not settings.password or settings.password == "changeme":
@@ -160,7 +165,18 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.api_route("/check-panel-health", methods=["GET", "HEAD"])
     def health():
         # Uptime checks must never query a database, panel or Telegram.
-        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.1.2"}
+        health_hits["hits"] += 1
+        health_hits["last"] = time.time()
+        ok = bool(getattr(app.state, "ready", False)) and background_alive()
+        # 503 lets UptimeRobot (and a Render health check) notice a broken instance.
+        return JSONResponse({"ok": ok, "version": VERSION}, status_code=200 if ok else 503)
+
+    def background_alive():
+        """A dead monitor or notifier thread would silently stop checks and alerts."""
+        if not getattr(app.state, "background", False):
+            return True
+        return all(thread is not None and thread.is_alive()
+                   for thread in (app.state.engine.monitor, app.state.notifier.thread))
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):
@@ -209,14 +225,16 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
 
     @app.get("/", dependencies=[Depends(admin)])
     @app.get("/admin", dependencies=[Depends(admin)])
-    def dashboard(request: Request, state: str = "", q: str = "", view: str = ""):
+    def dashboard(request: Request, state: str = "", q: str = "", view: str = "", limit: int = 100):
         sections = {"inbox": {"ready", "review", "error", "uncertain", "paused"},
                     "active": {"submitted", "processing", "sending", "queued"},
                     "waiting": {"waiting", "ready", "paused"}, "finished": {"finished", "closed"},
                     "all": set(LABELS) - {"legacy"}}
         view = view if view in sections else "all" if q or state else "inbox"
+        # Smaller default page: less Neon egress, smaller mobile download.
+        limit = 500 if limit > 100 else 100
         rows = app.state.store.orders(states={state} if state in LABELS else sections[view],
-                                      search=q, limit=500, newest=True, exclude_unmapped=view == "inbox")
+                                      search=q, limit=limit, newest=True, exclude_unmapped=view == "inbox")
         rows = [dict(o, display=order_view(o), cleanup=cleanup_actions(o)) for o in rows]
         if view == "inbox":
             priority = {"ready": 0, "uncertain": 1, "error": 2, "review": 3, "paused": 4}
@@ -224,7 +242,23 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         counts = app.state.store.state_counts()
         totals = {key: sum(counts.get(state, 0) for state in states) for key, states in sections.items()}
         return page(request, "orders.html", orders=rows, selected=state, query=q, section=view, totals=totals,
-                    paused=app.state.store.setting("paused", False))
+                    paused=app.state.store.setting("paused", False), limit=limit)
+
+    @app.get("/admin/usage", dependencies=[Depends(admin)])
+    def usage(request: Request):
+        store, engine = app.state.store, app.state.engine
+        stats = store.usage_report()  # Taken before the storage read below counts itself.
+        try:
+            storage = store.storage_report()
+        except Exception as exc:
+            # Exactly when Neon's quota runs out this page matters most: still render.
+            logger.error("usage_storage_failed type=%s", type(exc).__name__)
+            storage = None
+        return page(request, "usage.html", usage=stats, neon=quota.neon(stats, storage),
+                    counts=storage["counts"] if storage else None, render=quota.render(stats["since"]),
+                    uptime=quota.uptime(health_hits, stats["since"]), limits=quota,
+                    checks=dict(active=len(engine.active_checks), watched=len(engine.watch),
+                                next=engine.next_check(), **engine.stats))
 
     @app.get("/admin/orders/{order_id}", dependencies=[Depends(admin)])
     def detail(request: Request, order_id: str):
@@ -537,7 +571,16 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             if command == "/durum":
                 paused = await asyncio.to_thread(app.state.store.setting, "paused", False)
                 text = ("⏸️ Yeni otomatik gönderimler duraklatıldı." if paused else "🟢 Yeni otomatik gönderimler açık.")
-                text += "\nBekletilmiş siparişler sen göndermeden başlamaz.\n\n" + text_link(settings.public_url)
+                text += "\nBekletilmiş siparişler sen göndermeden başlamaz."
+                engine = app.state.engine
+                upcoming = engine.next_check()
+                text += f"\n🔁 Takipteki aktif sipariş: {len(engine.active_checks)}"
+                if upcoming:
+                    text += " · sonraki kontrol " + TEMPLATES.filters["clock"](upcoming)[-5:]
+                usage_line = quota.telegram_line(app.state.store.usage_report())
+                if usage_line:
+                    text += "\n" + usage_line
+                text += "\n\n" + text_link(settings.public_url)
             elif command in {"/bekleyen", "/sorunlar", "/ara"}:
                 query = raw.partition(" ")[2].strip() if command == "/ara" and raw.startswith("/") else ""
                 if command == "/ara" and len(query) < 2:

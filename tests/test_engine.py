@@ -521,7 +521,15 @@ def test_active_purchase_cannot_be_locally_closed(rig):
 def test_no_status_calls_after_last_waiter_removed(rig):
     first = receive_and_run(rig)
     second = receive_and_run(rig, 2)
+    assert first["target"] in rig.engine.watch
     rig.engine.close_unsubmitted(second["id"], second["revision"])
-    rig.engine.watch[first["target"]] = 0
+    assert first["target"] not in rig.engine.watch
     rig.engine.check_due()
     assert not rig.panels.checks
+
+
+def test_repairing_last_waiter_stops_blocked_polling(rig):
+    first = receive_and_run(rig)
+    second = receive_and_run(rig, 2)
+    rig.engine.repair(second["id"], "https://instagram.com/another", second["revision"])
+    assert first["target"] not in rig.engine.watch
