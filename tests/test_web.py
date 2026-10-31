@@ -90,6 +90,7 @@ def test_preview_and_attention_do_not_send_or_notify(client, rig):
     order = receive_and_run(rig)
     path = "/admin/orders/" + order["id"]
     before = rig.store.get(order["id"])
+    notices_before = rig.store.pending_notifications()
     preview = client.get(path + "?preview=1")
     assert preview.status_code == 200 and "Gönderim önizlemesi" in preview.text
     assert rig.store.get(order["id"]) == before
@@ -97,7 +98,7 @@ def test_preview_and_attention_do_not_send_or_notify(client, rig):
     assert client.post(path + "/send", data={"csrf": csrf, "revision": before["revision"]}).status_code == 400
     assert client.post(path + "/attention", data={"csrf": csrf, "revision": before["revision"]}).status_code == 200
     assert rig.store.get(order["id"])["handling"] is True
-    assert not rig.panels.adds and not rig.store.pending_notifications()
+    assert not rig.panels.adds and rig.store.pending_notifications() == notices_before
 
 
 def test_cancelled_result_is_never_displayed_as_green_completed(client, rig):

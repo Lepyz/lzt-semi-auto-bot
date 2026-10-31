@@ -100,8 +100,11 @@ class Engine:
             if saved["state"] == "queued":
                 self.enqueue(saved["id"])
             else:
-                # Unknown formats are kept for web review; never flood Telegram.
-                pass
+                binding = self.store.setting("binding:" + saved["advert_id"]) if saved["advert_id"] else None
+                if binding and binding.get("active", True):
+                    notification = alert(saved, "review")
+                    if notification and self.store.notify(notification):
+                        self.notifier.enqueue(notification)
         return saved, created
 
     def enqueue(self, order_id):

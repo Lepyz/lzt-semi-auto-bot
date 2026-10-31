@@ -89,7 +89,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             await asyncio.to_thread(engine.close)
             await asyncio.to_thread(notifier.close)
 
-    app = FastAPI(title="Boostera", version="3.1.0", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Boostera", version="3.1.1", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
 
     def admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -158,7 +158,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.api_route("/check-panel-health", methods=["GET", "HEAD"])
     def health():
         # Uptime checks must never query a database, panel or Telegram.
-        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.1.0"}
+        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.1.1"}
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):

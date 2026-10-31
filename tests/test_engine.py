@@ -38,22 +38,34 @@ def test_unmapped_advert_is_recorded_without_any_notification(rig):
     assert not rig.panels.adds
 
 
-def test_repeated_panel_rejections_are_grouped_per_reason_and_panel(rig):
+def test_back_to_back_same_link_sends_first_and_reports_second_without_repeats(rig):
+    first = receive_and_run(rig, 1)
+    second = receive_and_run(rig, 2)
+    assert first["state"] == "submitted" and first["parts"][0]["smm_id"]
+    assert second["state"] == "waiting" and not second["parts"][0]["smm_id"]
+    assert len(rig.notices) == 1 and rig.notices[0]["order_id"] == second["id"]
+    for _ in range(5):
+        rig.engine.execute(second["id"])
+        rig.engine.receive(payload(2))
+    assert len(rig.panels.adds) == len(rig.notices) == 1
+
+
+def test_each_distinct_rejected_purchase_has_its_own_alert(rig):
     rig.panels.results = [AddResult("error", error="Insufficient balance")] * 20
     for number in range(20):
         receive_and_run(rig, number + 1, f"https://instagram.com/person{number}")
     assert len(rig.store.orders(states={"error"})) == 20
-    assert len(rig.notices) == len(rig.store.pending_notifications()) == 1
+    assert len(rig.notices) == len(rig.store.pending_notifications()) == 20
     assert "bakiye" in rig.notices[0]["text"]
 
 
-def test_many_uncertain_receipts_share_one_alert_but_keep_every_lock(rig):
+def test_each_uncertain_purchase_has_an_alert_and_retains_its_lock(rig):
     rig.panels.results = [AddResult("uncertain", error="timeout")] * 20
     for number in range(20):
         order = receive_and_run(rig, number + 1, f"https://instagram.com/person{number}")
         assert rig.store.owner(order["target"]) == order["id"]
     assert len(rig.store.orders(states={"uncertain"})) == 20
-    assert len(rig.notices) == len(rig.store.pending_notifications()) == 1
+    assert len(rig.notices) == len(rig.store.pending_notifications()) == 20
     assert len(rig.panels.adds) == 20  # One initial attempt for each distinct real purchase; no retries.
 
 
@@ -237,6 +249,13 @@ def test_unknown_order_event_saved_for_review(rig):
     order, _ = rig.engine.receive(data)
     assert order["state"] == "review" and not rig.jobs
     assert not rig.panels.adds
+    assert len(rig.notices) == 1 and rig.notices[0]["order_id"] == order["id"]
+    rig.engine.receive(data)
+    assert len(rig.notices) == 1
+    rig.store.delete_binding("10")
+    data["order_id"] = "2"
+    rig.engine.receive(data)
+    assert len(rig.notices) == 1  # Unmapped adverts remain deliberately quiet.
 
 
 def test_missing_link_can_be_fixed_without_automatic_submission(rig):
@@ -300,9 +319,11 @@ def test_pause_resume_does_not_release_held_orders(rig):
     rig.store.set_setting("paused", True)
     order = receive_and_run(rig)
     assert order["state"] == "paused"
+    assert len(rig.notices) == 1 and rig.notices[0]["order_id"] == order["id"]
     rig.store.set_setting("paused", False)
     rig.engine.execute(order["id"])
     assert not rig.panels.adds
+    assert len(rig.notices) == 1
 
 
 def test_restart_retains_waiting_and_ready_without_submission(rig):
@@ -349,7 +370,7 @@ def test_restart_during_add_becomes_uncertain_not_retried(rig):
         assert rig.store.get(order["id"])["state"] == "uncertain"
         assert rig.store.get(order["id"])["parts"][0]["state"] == "uncertain"
         assert not rig.panels.adds
-        assert any(n["key"].startswith("issue:uncertain:") for n in rig.notices)
+        assert any(n["key"].startswith(order["id"] + ":recovery:") for n in rig.notices)
     finally:
         restarted.close()
 
@@ -408,13 +429,13 @@ def test_recovery_dispatches_receipts_saved_by_previous_instance(rig):
         restarted.close()
 
 
-def test_manual_send_held_again_stays_quiet_on_telegram(rig):
+def test_explicit_manual_retry_that_is_blocked_again_is_reported(rig):
     receive_and_run(rig)
     second = receive_and_run(rig, 2)
     rig.engine.approve(second["id"])
     rig.engine.execute(second["id"])
     waiting = [n for n in rig.notices if n["key"].startswith(second["id"] + ":waiting:")]
-    assert not waiting
+    assert len(waiting) == 2 and len({n["key"] for n in waiting}) == 2
     assert len(rig.panels.adds) == 1
 
 
@@ -433,7 +454,7 @@ def test_only_blocking_orders_are_polled(rig):
     rig.engine.check_due()
     assert len(rig.panels.checks) == 1
     assert rig.panels.checks[0]["smm_id"] == first["parts"][0]["smm_id"]
-    assert not rig.notices  # Routine submissions and waiting are web-only.
+    assert len(rig.notices) == 1  # Only the held purchase, not the two successes.
 
 
 def test_concurrent_duplicate_webhooks_have_one_record_and_add(rig):
