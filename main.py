@@ -25,7 +25,7 @@ from bot.migration import MigrationJob
 from bot.notifications import Notifier, callbacks_allowed, register_telegram_webhook, telegram_api
 from bot.panels import PanelClient
 from bot.store import Conflict, Store
-from bot.presentation import order_view, panel_label, summary as order_summary
+from bot.presentation import cleanup_actions, order_view, panel_label, summary as order_summary
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             await asyncio.to_thread(engine.close)
             await asyncio.to_thread(notifier.close)
 
-    app = FastAPI(title="Boostera", version="3.1.1", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Boostera", version="3.1.2", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
 
     def admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -134,18 +134,20 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
 
     @app.exception_handler(ValueError)
     async def bad_value(request, exc):
-        if request.url.path.startswith("/admin/orders/"):
+        if request.url.path == "/admin/order-cleanup" or request.url.path.startswith("/admin/orders/"):
             response = page(request, "order_error.html", error=str(exc),
-                            back="/admin/orders/" + request.url.path.split("/")[3])
+                            back="/admin?view=all" if request.url.path == "/admin/order-cleanup" else
+                            "/admin/orders/" + request.url.path.split("/")[3])
             response.status_code = 400
             return response
         return HTMLResponse("İşlem yapılamadı: " + __import__("html").escape(str(exc)), status_code=400)
 
     @app.exception_handler(Conflict)
     async def conflict(request, exc):
-        if request.url.path.startswith("/admin/orders/"):
+        if request.url.path == "/admin/order-cleanup" or request.url.path.startswith("/admin/orders/"):
             response = page(request, "order_error.html", error=str(exc),
-                            back="/admin/orders/" + request.url.path.split("/")[3])
+                            back="/admin?view=all" if request.url.path == "/admin/order-cleanup" else
+                            "/admin/orders/" + request.url.path.split("/")[3])
             response.status_code = 409
             return response
         return HTMLResponse(__import__("html").escape(str(exc)), status_code=409)
@@ -158,7 +160,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.api_route("/check-panel-health", methods=["GET", "HEAD"])
     def health():
         # Uptime checks must never query a database, panel or Telegram.
-        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.1.1"}
+        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.1.2"}
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):
@@ -215,7 +217,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         view = view if view in sections else "all" if q or state else "inbox"
         rows = app.state.store.orders(states={state} if state in LABELS else sections[view],
                                       search=q, limit=500, newest=True, exclude_unmapped=view == "inbox")
-        rows = [dict(o, display=order_view(o)) for o in rows]
+        rows = [dict(o, display=order_view(o), cleanup=cleanup_actions(o)) for o in rows]
         if view == "inbox":
             priority = {"ready": 0, "uncertain": 1, "error": 2, "review": 3, "paused": 4}
             rows.sort(key=lambda o: (bool(o.get("handling")), priority.get(o["state"], 5), o["created_at"]))
@@ -229,6 +231,8 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         order = app.state.store.get(order_id)
         if not order:
             raise HTTPException(404, "Sipariş bulunamadı.")
+        if order["state"] == "deleted":
+            return page(request, "order_deleted.html")
         related = app.state.store.orders(target=order["target"], limit=50, newest=True) if order.get("target") else []
         owner_id = app.state.store.owner(order["target"]) if order.get("target") else None
         owner = app.state.store.get(owner_id) if owner_id and owner_id != order_id else None
@@ -251,7 +255,25 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                 homes[key] = "https://" + url.hostname
         checks = app.state.engine.check_results.get(order_id, {"at": order.get("last_checked", 0), "ok": True})
         return page(request, "detail.html", order=order, display=order_view(order), related=related,
-                    owner=owner, preview=preview, preview_error=preview_error, checks=checks, panel_homes=homes)
+                    owner=owner, preview=preview, preview_error=preview_error, checks=checks, panel_homes=homes,
+                    cleanup=cleanup_actions(order))
+
+    @app.post("/admin/order-cleanup", dependencies=[Depends(mutation)])
+    def cleanup_orders(selected: list[str] = Form(...), action: str = Form(...), confirmed: str = Form(""),
+                       view: str = Form("inbox"), q: str = Form(""), state: str = Form("")):
+        if confirmed != "yes":
+            raise ValueError("Seçilen kayıtları kapatma veya silme işlemini doğrulayın.")
+        selections = []
+        for value in selected:
+            order_id, separator, revision = value.partition(":")
+            if not order_id or not separator or not revision.isdigit():
+                raise ValueError("Kayıt seçimi geçersiz; listeyi yenileyin.")
+            selections.append((order_id, int(revision)))
+        app.state.engine.cleanup(selections, action)
+        message = (f"{len(selections)} kaydın ayrıntıları silindi. Çift siparişi önleyen kimlikler korundu." if action == "delete"
+                   else f"{len(selections)} kayıt gönderilmeden kapatıldı. Panelde iptal veya iade yapılmadı.")
+        return RedirectResponse("/admin?" + urlencode({"view": view if view in {"inbox", "active", "waiting", "finished", "all"} else "inbox",
+                                                      "q": q, "state": state if state in LABELS else "", "message": message}), 303)
 
     @app.post("/admin/orders/{order_id}/send", dependencies=[Depends(mutation)])
     def send(order_id: str, revision: int = Form(...), confirmed: str = Form("")):

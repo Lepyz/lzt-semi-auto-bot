@@ -22,6 +22,12 @@
   .phone-nav{display:none}.order-copy{padding:6px 12px;font-size:13px}.order-related{list-style:none;padding:0}
   .order-related li{padding:12px 0;border-bottom:1px solid var(--line)}.order-error{color:#ffcfbb}
   .order-form input[type=checkbox]{width:auto}.order-form input,.order-form select{font-size:16px}
+  [hidden]{display:none!important}.cleanup-toolbar{position:sticky;top:8px;z-index:4;box-shadow:0 8px 20px #0006}
+  .cleanup-toolbar .order-actions{margin-top:0;gap:8px}.cleanup-toolbar .order-actions+div{margin-top:10px}
+  .cleanup-choice{display:flex;align-items:center;gap:10px;min-height:44px;margin:0 0 10px}
+  .cleanup-choice input{width:22px;height:22px;accent-color:var(--accent)}.order-card:has(.cleanup-pick:checked){border-color:var(--accent)}
+  #cleanup-dialog{width:min(540px,calc(100% - 28px));max-height:90dvh;overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--text);padding:22px}
+  #cleanup-dialog::backdrop{background:#000b}#cleanup-dialog h2{margin-top:0}
   @media(max-width:650px){.order-summary{gap:7px}.order-summary a{padding:10px;font-size:12px}
     .order-summary strong{font-size:23px}.order-actions{align-items:stretch}.order-actions>.button,.order-actions>form{flex:1 1 140px}
     .order-actions form button{width:100%}.order-tabs a{flex:1 1 135px;text-align:center}

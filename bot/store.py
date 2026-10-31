@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .presentation import cleanup_actions
+
 
 class Conflict(Exception):
     pass
@@ -137,6 +139,53 @@ class Store:
         with self.transaction() as conn:
             return self._notification(conn, notification)
 
+    def cleanup_orders(self, selections, action):
+        """Validate the complete selection before changing anything; keep receipt dedup keys."""
+        if action not in {"close", "delete"} or not 1 <= len(selections) <= 500:
+            raise ValueError("Kapatma veya silme işlemi için 1 ile 500 arasında kayıt seçin.")
+        versions = dict(selections)
+        if len(versions) != len(selections):
+            raise ValueError("Aynı kayıt birden fazla seçilemez.")
+        targets = set()
+        with self.transaction() as conn:
+            sql = "SELECT * FROM orders WHERE id IN (" + ",".join("?" for _ in versions) + ") ORDER BY id"
+            if self.postgres:
+                sql += " FOR UPDATE"
+            rows = self.execute(conn, sql, tuple(versions)).fetchall()
+            if len(rows) != len(versions):
+                raise Conflict("Seçilen kayıtlardan biri bulunamadı; listeyi yenileyin.")
+            orders = [self.decode(row) for row in rows]
+            for order in orders:
+                if order["revision"] != versions[order["id"]]:
+                    raise Conflict("Seçilen kayıtlardan biri değişti. Hiçbir kayıt temizlenmedi; listeyi yenileyin.")
+                if not cleanup_actions(order)[action]:
+                    raise ValueError("Seçimde bu işleme uygun olmayan, aktif veya belirsiz bir kayıt var. Hiçbir kayıt temizlenmedi.")
+            for order in orders:
+                if order.get("target"):
+                    targets.add(order["target"])
+                if action == "delete":
+                    # A repeated webhook must still find its original receipt. Remove its
+                    # customer/product/panel details instead of deleting the unique key.
+                    document = {key: order[key] for key in ("id", "source_key", "created_at")}
+                    if order.get("legacy_source_key"):
+                        document["legacy_source_key"] = order["legacy_source_key"]
+                    document.update(state="deleted", target="", link="", links={}, parts=[],
+                                    advert_id="", itemsatis_id="", product_name="", error="", manual_required=True)
+                else:
+                    document = dict(order, state="closed", manual_required=True, handling=False,
+                                    reason_code="", error="Yönetici tarafından gönderilmeden kapatıldı.")
+                document.update(revision=order["revision"] + 1, updated_at=int(time.time() * 1_000_000))
+                cursor = self.execute(conn, """UPDATE orders SET state=?,target=?,revision=?,document=?
+                    WHERE id=? AND revision=?""", (document["state"], document.get("target", ""),
+                    document["revision"], json.dumps(document, ensure_ascii=False), order["id"], order["revision"]))
+                if cursor.rowcount != 1:
+                    raise Conflict("Kayıt değişti. Hiçbir kayıt temizlenmedi; listeyi yenileyin.")
+                self.execute(conn, "DELETE FROM target_locks WHERE owner=?", (order["id"],))
+                prefix = order["id"].replace("!", "!!").replace("%", "!%").replace("_", "!_") + ":%"
+                self.execute(conn, """UPDATE notifications SET state='cancelled',document='{}'
+                    WHERE key LIKE ? ESCAPE '!' AND state IN ('pending','failed')""", (prefix,))
+        return targets
+
     def pending_notifications(self):
         with self.transaction() as conn:
             return [json.loads(r["document"]) for r in self.execute(conn,
@@ -172,7 +221,7 @@ class Store:
                 WHERE key=? AND state='failed' AND attempts<3""", (key,))
 
     def orders(self, states=None, target=None, limit=200, search="", newest=False, exclude_unmapped=False):
-        sql, params = "SELECT * FROM orders WHERE 1=1", []
+        sql, params = "SELECT * FROM orders WHERE state<>'deleted'", []
         if states:
             sql += " AND state IN (" + ",".join("?" for _ in states) + ")"
             params.extend(states)
@@ -193,7 +242,7 @@ class Store:
 
     def state_counts(self):
         with self.transaction() as conn:
-            rows = self.execute(conn, """SELECT state,COUNT(*) AS count FROM orders WHERE state<>'legacy'
+            rows = self.execute(conn, """SELECT state,COUNT(*) AS count FROM orders WHERE state NOT IN ('legacy','deleted')
                 AND document NOT LIKE ? AND document NOT LIKE ? GROUP BY state""",
                 ('%"reason_code": "binding_missing"%', '%İlanın aktif servis eşleştirmesi yok.%')).fetchall()
             return {r["state"]: r["count"] for r in rows}

@@ -135,6 +135,14 @@ def summary(order):
             f"🔗 Hedef: {line(order.get('link') or next(iter(order.get('links', {}).values()), 'Link eksik'))}")
 
 
+def cleanup_actions(order):
+    """Only settled or definitely unsubmitted records can be cleaned up."""
+    safe = all(p.get("state") in {"new", "error", "finished"} and
+               (not p.get("smm_id") or p.get("state") == "finished") for p in order.get("parts", []))
+    close = safe and order.get("state") in {"waiting", "ready", "paused", "review", "error"}
+    return {"close": close, "delete": close or safe and order.get("state") in {"closed", "finished"}}
+
+
 def alert(order, event):
     """Each distinct unsent purchase is reported; routine successes stay quiet."""
     view = order_view(order)

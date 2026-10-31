@@ -63,6 +63,17 @@ tek seferlik bildirim oluşturulur. İptal gerekçesi/iade tutarı tahmin edilme
 
 Telegram'da `/start` veya `/yardim` menüyü açar. `/bekleyen`, `/sorunlar`, `/durum`,
 `/ara kayıt-no` komutları Türkçe cevap verir; eski komut adları da çalışır.
+
+Webde her uygun kayıtta **Kaydı kapat** ve **Sil** düğmeleri bulunur. Seçim kutularıyla
+görüntülenen kayıtlar topluca da temizlenebilir; işlemden önce sayı ve etkisi gösterilir,
+son onay gerekir. Kapatma, gönderilmemiş kaydı Sonuçlananlar'a taşır. Silme, müşteri,
+ürün ve panel ayrıntılarını kaldırır; çift siparişe karşı yalnızca küçük bir kimlik
+kaydı korunur. Bu kayıt normal listelerde, aramada veya dışa aktarımda görünmez.
+Aktif, işlenmekte olan ve sonucu belirsiz kayıtlar kapatılamaz veya silinemez.
+Bir seçimde uygun olmayan veya değişmiş kayıt varsa işlem bütünüyle durur.
+Temizlik panelde iptal/iade isteği veya yeni sipariş göndermez; seçilen kayıtların
+henüz gönderilmemiş uyarıları kaldırılır. Sonraki bekleyen kayıt hazır olursa yine
+manuel onay gerekir. Bu özellik için yeni tablo veya zamanlanmış tarama yoktur.
 Komut cevapları kalıcı bildirim geçmişi oluşturmaz. Eski «gönder» düğmeleri yeni
 sipariş açmak yerine kullanıcıyı web önizlemesine yönlendirir.
 
