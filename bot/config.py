@@ -45,4 +45,5 @@ class Settings:
     public_url: str = field(default_factory=lambda: os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/"))
     workers: int = field(default_factory=lambda: max(1, min(8, int(os.getenv("ORDER_WORKERS", "4")))))
     check_interval: int = field(default_factory=lambda: max(300, int(os.getenv("BLOCKED_CHECK_INTERVAL_SECONDS", "900"))))
+    active_check_interval: int = field(default_factory=lambda: max(900, int(os.getenv("ACTIVE_CHECK_INTERVAL_SECONDS", "1800"))))
     panels: dict = field(default_factory=load_panels)

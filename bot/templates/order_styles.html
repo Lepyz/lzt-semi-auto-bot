@@ -1,0 +1,32 @@
+<style>
+  main{padding-bottom:100px}.order-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:16px}
+  .order-card{margin:0;min-width:0}.order-card h2{margin:12px 0 6px;line-height:1.4;overflow-wrap:anywhere}
+  .order-meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+  .order-card p{margin:9px 0;overflow-wrap:anywhere}.order-id{font-size:13px;color:var(--muted)}
+  .state-badge{display:inline-block;border-radius:7px;padding:6px 10px;font-size:14px;background:#263d53}
+  .tone-success{background:#214b42;color:#b1f5df}.tone-warning{background:#51472c;color:#f5dfa1}
+  .tone-danger{background:#603b31;color:#ffcfbb}.tone-muted{background:#2a303b;color:#bdc5d2}
+  .order-actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:16px;align-items:center}.order-actions>*{max-width:100%}
+  .order-actions form{margin:0}.order-actions button,.order-actions .button{min-height:44px}
+  .order-reason{border-left:3px solid #dda05b;padding:8px 12px;background:#202b3a}
+  .order-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0}.order-tabs a{padding:9px 12px;border:1px solid var(--line);border-radius:8px}
+  .order-tabs a[aria-current="page"]{border-color:var(--accent);background:#1b3433}
+  .order-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0}
+  .order-summary a{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;line-height:1.5}
+  .order-summary strong{display:block;font-size:25px;color:var(--text)}.order-check{font-size:13px;color:var(--muted)}
+  .order-search{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:12px}.order-search label{margin:0}
+  .order-search details{grid-column:1/-1;margin:0}.order-search details label{margin-top:12px}
+  .order-component{padding:16px;border:1px solid var(--line);border-radius:10px;margin:12px 0;overflow-wrap:anywhere}
+  .order-component h3{font-size:16px;margin:0 0 8px}.order-preview{border:2px solid var(--accent)}
+  .order-status{padding:10px;border-left:3px solid var(--accent);background:#1b3433;margin:12px 0}
+  .phone-nav{display:none}.order-copy{padding:6px 12px;font-size:13px}.order-related{list-style:none;padding:0}
+  .order-related li{padding:12px 0;border-bottom:1px solid var(--line)}.order-error{color:#ffcfbb}
+  .order-form input[type=checkbox]{width:auto}.order-form input,.order-form select{font-size:16px}
+  @media(max-width:650px){.order-summary{gap:7px}.order-summary a{padding:10px;font-size:12px}
+    .order-summary strong{font-size:23px}.order-actions{align-items:stretch}.order-actions>.button,.order-actions>form{flex:1 1 140px}
+    .order-actions form button{width:100%}.order-tabs a{flex:1 1 135px;text-align:center}
+    .order-tabs{display:none}.phone-nav{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));position:fixed;bottom:0;left:0;right:0;z-index:5;
+      margin:0;padding:10px 8px calc(10px + env(safe-area-inset-bottom));gap:4px;background:#101925;border-top:1px solid var(--line)}
+    .phone-nav a{font-size:12px;text-align:center;line-height:1.5;padding:5px 0}.phone-nav span{display:block;font-size:18px}}
+</style>
+<nav class="phone-nav" aria-label="Telefon menüsü"><a href="/admin?view=inbox"><span>🛠️</span>İşlemler</a><a href="/admin?view=active"><span>🟢</span>Aktif</a><a href="/admin?view=waiting"><span>⏳</span>Bekletilen</a><a href="/admin?view=finished"><span>📁</span>Sonuçlar</a><a href="/admin?view=all"><span>🔎</span>Ara / tümü</a></nav>

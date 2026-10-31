@@ -8,10 +8,10 @@ Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
 - Webhook, sipariş PostgreSQL'e kaydedildikten sonra başarılı cevap alır.
 - Aynı Itemsatış sipariş kimliği tekrar gelirse ikinci satın alma oluşturulmaz.
 - Aktif sipariş bulunmayan hedefe yeni satın alma otomatik gönderilir.
-- Aynı hedefte aktif sipariş varsa yeni satın alma tutulur ve bir kez haber verilir.
+- Aynı hedefte aktif sipariş varsa yeni satın alma sessizce tutulur ve webde görünür.
 - Önceki sipariş Completed / Partial / Canceled / Refunded vb. sonuçlanınca sıradaki
   satın alma için **gönderebilirsin** bildirimi gelir. **Otomatik gönderilmez.**
-- Gönderim için Telegram butonu veya admin panelindeki buton kullanılır. Aktif
+- Telegram'daki düğme webdeki gönderim önizlemesini açar; son onay webden verilir. Aktif
   sipariş tekrar kontrol edilir; daha eski bekletilmiş satın alma atlanmaz.
 - Panel add isteği zaman aşımına uğrarsa otomatik tekrar yapılmaz. Panelde açılmış
   olabilir: bulunan SMM kimliğini kaydet veya açılmadığını açıkça doğrula.
@@ -27,17 +27,41 @@ Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
 
 ## Kaldırılan işler
 
-Gecikme alarmı, sürekli tamamlanma taraması, otomatik bakiye sorguları, bakiye
+Gecikme alarmı, sık aralıklı tamamlanma taraması, otomatik bakiye sorguları, bakiye
 geçmişi, kur/kâr/zarar/fiyat takibi, boş Redis kuyruk taraması ve çalışmayan
 favori/istatistik ekranları yoktur. Panel hata sayaçları için veritabanı kullanılmaz.
 Sipariş kayıtları tek tek güncellenir. Telegram bildirimi sipariş işleyicisini bekletmez.
 Gönderilmiş bildirimlerin metni tutulmaz; tekrar bildirimi önleyen kısa anahtar kalır.
 Komut cevapları veritabanına yazılmaz.
 
-Yalnızca yeni satın almayı engelleyen aktif panel siparişleri varsayılan 15 dakikada
-bir kontrol edilir. Aynı linkteki bekleyenler tek kontrolü paylaşır. Hiç bekletilen
-satın alma yoksa arka planda **sıfır veritabanı ve panel sorgusu** yapılır.
+Aktif panel siparişleri varsayılan 30 dakikada (`ACTIVE_CHECK_INTERVAL_SECONDS`),
+yeni satın almayı engelleyenler 15 dakikada (`BLOCKED_CHECK_INTERVAL_SECONDS`) kontrol edilir.
+Aynı linkteki bekleyenler tek kontrolü paylaşır. Zamanlama bellektedir; hiçbir
+kontrolün zamanı gelmemişse monitör SQL veya panel sorgusu yapmaz. Açılıştaki tek
+seferlik kurtarma işlemi dışında aktif/bekleyen kayıt yokken arka plan sorgusu yoktur.
 Admin sayfaları kendiliğinden veritabanı yenilemesi yapmaz.
+
+## Mobil yönetim ve az bildirim
+
+Ana ekran İşlem bekleyenler kutusudur. Kayıtlar mobil kartlarda neden ve yapılacak
+işlemle görünür. İsteğe bağlı «İlgileniyorum» işareti, hedefe ait en son 50 kayıt,
+numara/link kopyalama, link düzeltme ve gönderim önizlemesi vardır. Bilgi düzeltmek
+veya eşleştirmek sipariş göndermez. İstenerek eşleştirilmemiş ilanlar işlem kutusu
+ve Telegram dışında, Tüm kayıtlar bölümünde korunur.
+
+Normal gönderim, bekletilme, duraklatma ve sorunsuz tamamlanma Telegram'a yazılmaz.
+Gönderime hazır kayıt için bir uyarı gelir. İptal/kısmi/iade sonuçları Türkçe gösterilir;
+aynı sonuç bekleyen kaydı hazır yaptıysa sonuç ve hazır bildirimi tek mesaj olur.
+Aynı panel/sebepten kaynaklanan retler ve belirsiz cevaplar Türkiye takvim gününde
+tek uyarıda toplanır; her etkilenen sipariş webde ayrı korunur. Yeni günün ilk
+gerçek hatası yeniden uyarabilir; zamanlayıcıyla hatırlatma gönderilmez.
+Panel üç durum kontrolünde cevap vermemişse aktif kilit korunur, webde uyarı ve
+aynı gruplama kuralıyla bildirim oluşturulur. İptal gerekçesi/iade tutarı tahmin edilmez.
+
+Telegram'da `/start` veya `/yardim` menüyü açar. `/bekleyen`, `/sorunlar`, `/durum`,
+`/ara kayıt-no` komutları Türkçe cevap verir; eski komut adları da çalışır.
+Komut cevapları kalıcı bildirim geçmişi oluşturmaz. Eski «gönder» düğmeleri yeni
+sipariş açmak yerine kullanıcıyı web önizlemesine yönlendirir.
 
 ## Yerelde doğrulama
 

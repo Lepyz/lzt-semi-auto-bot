@@ -114,6 +114,7 @@ class Store:
         """Persist transition and its one-off notification in the same transaction."""
         revision = order["revision"]
         document = dict(order, updated_at=int(time.time() * 1_000_000), revision=revision + 1)
+        notified = False
         with self.transaction() as conn:
             cursor = self.execute(conn, """UPDATE orders SET state=?,target=?,revision=?,document=?
                 WHERE id=? AND revision=?""",
@@ -122,17 +123,19 @@ class Store:
             if cursor.rowcount != 1:
                 raise Conflict("Sipariş başka bir işlem tarafından güncellendi; sayfayı yenileyin.")
             if notification:
-                self._notification(conn, notification)
+                notified = self._notification(conn, notification)
         order.update(document)
+        return notified
 
     def _notification(self, conn, notification):
-        self.execute(conn, """INSERT INTO notifications(key,document,state)
+        cursor = self.execute(conn, """INSERT INTO notifications(key,document,state)
             VALUES (?,?,'pending') ON CONFLICT(key) DO NOTHING""",
             (notification["key"], json.dumps(notification, ensure_ascii=False)))
+        return cursor.rowcount == 1
 
     def notify(self, notification):
         with self.transaction() as conn:
-            self._notification(conn, notification)
+            return self._notification(conn, notification)
 
     def pending_notifications(self):
         with self.transaction() as conn:
@@ -168,7 +171,7 @@ class Store:
             self.execute(conn, """UPDATE notifications SET state='pending'
                 WHERE key=? AND state='failed' AND attempts<3""", (key,))
 
-    def orders(self, states=None, target=None, limit=200, search="", newest=False):
+    def orders(self, states=None, target=None, limit=200, search="", newest=False, exclude_unmapped=False):
         sql, params = "SELECT * FROM orders WHERE 1=1", []
         if states:
             sql += " AND state IN (" + ",".join("?" for _ in states) + ")"
@@ -176,6 +179,9 @@ class Store:
         if target is not None:
             sql += " AND target=?"
             params.append(target)
+        if exclude_unmapped:
+            sql += " AND document NOT LIKE ? AND document NOT LIKE ?"
+            params.extend(('%"reason_code": "binding_missing"%', '%İlanın aktif servis eşleştirmesi yok.%'))
         if search:
             sql += " AND LOWER(document) LIKE ? ESCAPE '!'"
             escaped = search.lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
@@ -184,6 +190,13 @@ class Store:
         params.append(limit)
         with self.transaction() as conn:
             return [self.decode(r) for r in self.execute(conn, sql, tuple(params)).fetchall()]
+
+    def state_counts(self):
+        with self.transaction() as conn:
+            rows = self.execute(conn, """SELECT state,COUNT(*) AS count FROM orders WHERE state<>'legacy'
+                AND document NOT LIKE ? AND document NOT LIKE ? GROUP BY state""",
+                ('%"reason_code": "binding_missing"%', '%İlanın aktif servis eşleştirmesi yok.%')).fetchall()
+            return {r["state"]: r["count"] for r in rows}
 
     def acquire_target(self, target, owner):
         with self.transaction() as conn:

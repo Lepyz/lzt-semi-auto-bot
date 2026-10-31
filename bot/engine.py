@@ -9,6 +9,7 @@ from .config import panel_key
 from .payloads import classify, extract_links, get_advert_id, get_order_id, get_product_name
 from .payloads import legacy_payload_key, normalize_panel_link, source_key, target_key, valid_link
 from .store import Conflict
+from .presentation import alert, panel_label, reason_code, summary
 
 logger = logging.getLogger(__name__)
 MANUAL_STATES = {"waiting", "ready", "paused", "review", "error"}
@@ -52,6 +53,9 @@ class Engine:
         self.guard = threading.RLock()
         self.stop_event = threading.Event()
         self.watch = {}
+        self.active_checks = {}
+        self.check_results = {}
+        self.check_failures = {}
         self.recent_checks = {}
         self.running = set()
         self.recover_at = None
@@ -64,15 +68,14 @@ class Engine:
                 "text": text[:3500], "order_id": order["id"], "action": action}
 
     def save(self, order, event="", text="", action=False):
-        notification = self.notice(order, event, text, action) if event else None
-        self.store.save(order, notification)
-        if notification:
+        order["reason_code"] = reason_code(order.get("error"), order["state"]) if order.get("error") else ""
+        notification = alert(order, event) if event else None
+        notified = self.store.save(order, notification)
+        if notified:
             self.notifier.enqueue(notification)
 
     def summary(self, order):
-        return (f"Itemsatış: {order.get('itemsatis_id') or 'Bildirim kaydı ' + order['id'][:10]}\n"
-                f"Ürün: {order.get('product_name') or order.get('advert_id')}\n"
-                f"Link: {order.get('link') or '-'}")
+        return summary(order)
 
     def receive(self, payload):
         kind = classify(payload)
@@ -91,14 +94,14 @@ class Engine:
                  "manual_required": kind != "order", "error": "", "created_at": now, "updated_at": now}
         if kind != "order":
             order["error"] = "Sipariş bilgisi eksik veya webhook türü tanınmadı. Kontrol edip gönderin."
+            order["reason_code"] = "review"
         saved, created = self.store.create(order)
         if created:
             if saved["state"] == "queued":
                 self.enqueue(saved["id"])
             else:
-                n = self.notice(saved, "review", "Sipariş kontrol gerekiyor.\n" + self.summary(saved))
-                self.store.notify(n)
-                self.notifier.enqueue(n)
+                # Unknown formats are kept for web review; never flood Telegram.
+                pass
         return saved, created
 
     def enqueue(self, order_id):
@@ -250,6 +253,7 @@ class Engine:
         order.update(state="submitted", error="")
         ids = ", ".join(p["panel"] + ":" + p["smm_id"] for p in order["parts"])
         self.save(order, "submitted", "Sipariş panele iletildi.\n" + self.summary(order) + "\nSMM: " + ids)
+        self.schedule_active(order)
         if self.store.orders(states={"waiting"}, target=order["target"], limit=1):
             with self.guard:
                 self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
@@ -264,29 +268,59 @@ class Engine:
                 return order
             self.recent_checks[order_id] = now
         changed = False
+        checked = False
+        successes = 0
+        attempted = sum(p["state"] == "submitted" for p in order["parts"])
+        previous_state = order["state"]
         for part in order["parts"]:
             if part["state"] != "submitted":
                 continue
             result = self.panels.status(part)
             if not result:
                 continue
+            checked = True
+            successes += 1
             if part.get("status") != result["status"]:
                 part["status"] = result["status"]
                 changed = True
             if result["terminal"]:
                 part["state"] = "finished"
                 changed = True
+        if checked and successes == attempted:
+            self.check_failures.pop(order_id, None)
+            self.check_results[order_id] = {"at": time.time(), "ok": True}
+            if order.pop("status_error", ""):
+                changed = True
+        elif attempted:
+            self.check_results[order_id] = {"at": time.time(), "ok": False}
+            self.check_failures[order_id] = self.check_failures.get(order_id, 0) + 1
+            if self.check_failures[order_id] >= 3 and not order.get("status_error"):
+                order["status_error"] = "Panelden güncel durum alınamadı. Son doğrulanmış durum gösteriliyor."
+                problem = dict(order, state="error", reason_code="status_unavailable", manual_approved=False,
+                               alert_panel=next((p["panel"] for p in order["parts"] if p["state"] == "submitted"), ""))
+                notification = alert(problem, "status_error")
+                notified = self.store.save(order, notification)
+                if notified:
+                    self.notifier.enqueue(notification)
         active = any(p["state"] in {"submitted", "sending", "uncertain"} for p in order["parts"])
         if order["parts"] and not active:
             if all(p["state"] == "finished" for p in order["parts"]):
                 changed = changed or order["state"] != "finished"
                 order["state"] = "finished"
             if changed:
+                order["last_checked"] = time.time() if checked else order.get("last_checked", 0)
                 self.store.save(order)
             self.store.release_target(order["target"], order["id"])
-            self.make_ready(order["target"], order)
+            ready = self.make_ready(order["target"], order)
+            if previous_state != "finished" and not ready:
+                notification = alert(order, "outcome")
+                if notification:
+                    if self.store.notify(notification):
+                        self.notifier.enqueue(notification)
         elif changed:
+            order["last_checked"] = time.time() if checked else order.get("last_checked", 0)
             self.store.save(order)
+        self.schedule_active(order)
         return order
 
     def make_ready(self, target, previous=None):
@@ -296,11 +330,13 @@ class Engine:
             if self.active_owner(target) or self.earlier_hold(order):
                 continue
             order.update(state="ready", manual_required=True, error="")
-            statuses = ", ".join(p.get("status", "") for p in (previous or {}).get("parts", []) if p.get("status"))
+            statuses = ", ".join(panel_label(p.get("status", "")) for p in (previous or {}).get("parts", []) if p.get("status"))
+            order["previous_result"] = statuses
             self.save(order, "ready", "Bekletilen siparişi artık kontrol edip gönderebilirsin.\n" +
                       self.summary(order) + ("\nÖnceki sipariş durumu: " + statuses if statuses else ""),
                       action=True)
-            break  # FIFO: only the first waiting purchase becomes ready.
+            return order  # FIFO: only the first waiting purchase becomes ready.
+        return None
 
     def approve(self, order_id, revision=None):
         order = self.store.get(order_id)
@@ -319,7 +355,7 @@ class Engine:
             order = self.store.get(order_id)
             if any(p["state"] == "submitted" for p in order["parts"]):
                 raise ValueError("Bu siparişin aktif paket bileşeni var; sonuçlanmasını bekleyin.")
-        order.update(state="queued", manual_required=True, error="")
+        order.update(state="queued", manual_required=True, manual_approved=True, error="", reason_code="")
         self.store.save(order)
         self.enqueue(order_id)
 
@@ -330,7 +366,7 @@ class Engine:
         if any(p["state"] in {"submitted", "finished", "sending", "uncertain"} for p in order["parts"]):
             raise ValueError("Panele iletilen paket bileşenleri yeniden yazılamaz.")
         order.update(parts=[], link=link.strip(), links={p: link.strip() for p in (*order["links"], "other")},
-                     state="review", manual_required=True, error="")
+                     state="review", manual_required=True, error="", reason_code="")
         # Include all known platforms so a newly added binding can use the corrected link.
         from .payloads import PLATFORMS
         order["links"].update({p: link.strip() for p in PLATFORMS})
@@ -354,7 +390,8 @@ class Engine:
         order = self.store.get(order_id)
         if (order and revision == order["revision"] and index == -1 and not order["parts"]
                 and order["state"] == "uncertain" and confirmed_absent):
-            order.update(state="review", manual_required=True, error="Panelde açılmadığı yönetici tarafından doğrulandı.")
+            order.update(state="review", manual_required=True, reason_code="review",
+                         error="Panelde açılmadığı yönetici tarafından doğrulandı.")
             self.store.save(order)
             if order["target"]:
                 self.store.release_target(order["target"], order["id"])
@@ -378,13 +415,34 @@ class Engine:
             order["state"] = "submitted"
         else:
             order["state"] = "error"
-        order.update(error="", manual_required=True)
+        order.update(error="", reason_code="", manual_required=True)
         self.store.save(order)
+        self.schedule_active(order)
         if not any(p["state"] in {"submitted", "uncertain", "sending"} for p in order["parts"]):
             self.store.release_target(order["target"], order["id"])
             self.make_ready(order["target"], order)
 
+    def schedule_active(self, order):
+        with self.guard:
+            if any(p["state"] == "submitted" for p in order["parts"]):
+                self.active_checks[order["id"]] = time.monotonic() + self.settings.active_check_interval
+            else:
+                self.active_checks.pop(order["id"], None)
+
     def check_due(self):
+        # Memory-only scheduling: no database queries when nothing is due.
+        with self.guard:
+            active_due = [key for key, when in self.active_checks.items() if when <= time.monotonic()][:10]
+        for key in active_due:
+            try:
+                self.refresh(key, force=False)
+                with self.guard:
+                    if key in self.active_checks:
+                        self.active_checks[key] = time.monotonic() + self.settings.active_check_interval
+            except Exception as exc:
+                logger.error("active_check_failed type=%s", type(exc).__name__)
+                with self.guard:
+                    self.active_checks[key] = time.monotonic() + self.settings.active_check_interval
         with self.guard:
             due = [t for t, when in self.watch.items() if when <= time.monotonic()]
         for target in due:
@@ -419,6 +477,8 @@ class Engine:
             self.enqueue(order["id"])
         for order in self.store.orders(states={"waiting"}, limit=100000):
             self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
+        for order in self.store.orders(states={"submitted", "error"}, limit=100000):
+            self.schedule_active(order)
         self.recover_at = time.monotonic() + RECOVERY_DELAY
         self.monitor = threading.Thread(target=self._monitor, daemon=True)
         self.monitor.start()
@@ -459,6 +519,10 @@ class Engine:
             self.enqueue(order["id"])
         for item in self.store.pending_notifications():
             self.notifier.enqueue(item)
+        for order in self.store.orders(states={"submitted", "error"}, limit=100000):
+            with self.guard:
+                if order["id"] not in self.active_checks:
+                    self.schedule_active(order)
         return complete
 
     def _monitor(self):

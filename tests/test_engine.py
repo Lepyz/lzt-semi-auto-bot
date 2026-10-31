@@ -7,6 +7,7 @@ from bot.engine import Engine
 from bot.panels import AddResult
 from bot.store import Conflict, Store
 from conftest import payload, receive_and_run
+from bot.presentation import panel_label
 
 
 def test_normal_order_is_saved_before_add_and_has_no_balance_calls(rig):
@@ -21,6 +22,83 @@ def test_normal_order_is_saved_before_add_and_has_no_balance_calls(rig):
     assert not rig.panels.checks
 
 
+def test_one_hundred_successful_orders_produce_no_telegram_rows(rig):
+    for number in range(100):
+        receive_and_run(rig, number + 1, f"https://instagram.com/person{number}")
+    assert len(rig.panels.adds) == 100
+    assert not rig.notices and not rig.store.pending_notifications()
+
+
+def test_unmapped_advert_is_recorded_without_any_notification(rig):
+    rig.store.delete_binding("10")
+    for number in range(10):
+        order = receive_and_run(rig, number + 1)
+        assert order["state"] == "review" and order["reason_code"] == "binding_missing"
+    assert not rig.notices and not rig.store.pending_notifications()
+    assert not rig.panels.adds
+
+
+def test_repeated_panel_rejections_are_grouped_per_reason_and_panel(rig):
+    rig.panels.results = [AddResult("error", error="Insufficient balance")] * 20
+    for number in range(20):
+        receive_and_run(rig, number + 1, f"https://instagram.com/person{number}")
+    assert len(rig.store.orders(states={"error"})) == 20
+    assert len(rig.notices) == len(rig.store.pending_notifications()) == 1
+    assert "bakiye" in rig.notices[0]["text"]
+
+
+def test_many_uncertain_receipts_share_one_alert_but_keep_every_lock(rig):
+    rig.panels.results = [AddResult("uncertain", error="timeout")] * 20
+    for number in range(20):
+        order = receive_and_run(rig, number + 1, f"https://instagram.com/person{number}")
+        assert rig.store.owner(order["target"]) == order["id"]
+    assert len(rig.store.orders(states={"uncertain"})) == 20
+    assert len(rig.notices) == len(rig.store.pending_notifications()) == 1
+    assert len(rig.panels.adds) == 20  # One initial attempt for each distinct real purchase; no retries.
+
+
+@pytest.mark.parametrize("status", ["Canceled", "Partial", "Refunded"])
+def test_nonblocking_terminal_result_notifies_once_in_turkish(rig, status):
+    order = receive_and_run(rig)
+    rig.panels.current = {"status": status, "terminal": True}
+    rig.engine.active_checks[order["id"]] = 0
+    rig.engine.check_due()
+    assert rig.store.get(order["id"])["state"] == "finished"
+    assert len(rig.notices) == 1 and status not in rig.notices[0]["text"]
+    rig.engine.refresh(order["id"])
+    assert len(rig.notices) == 1
+    assert order["id"] not in rig.engine.active_checks
+
+
+def test_active_completion_without_waiting_order_is_quiet(rig):
+    order = receive_and_run(rig)
+    rig.panels.current = {"status": "Completed", "terminal": True}
+    rig.engine.active_checks[order["id"]] = 0
+    rig.engine.check_due()
+    assert rig.store.get(order["id"])["state"] == "finished"
+    assert not rig.notices
+
+
+def test_status_failure_never_releases_lock_or_resends_and_warns_once(rig, monkeypatch):
+    order = receive_and_run(rig)
+    monkeypatch.setattr(rig.panels, "status", lambda _: None)
+    for _ in range(5):
+        rig.engine.refresh(order["id"])
+    current = rig.store.get(order["id"])
+    assert current["state"] == "submitted" and current["status_error"]
+    assert rig.store.owner(order["target"]) == order["id"]
+    assert len(rig.panels.adds) == 1 and len(rig.notices) == 1
+
+
+def test_monitor_has_no_sql_until_active_order_is_due(rig, monkeypatch):
+    order = receive_and_run(rig)
+    assert order["id"] in rig.engine.active_checks
+    monkeypatch.setattr(rig.store, "transaction", lambda: pytest.fail("Not-yet-due database query"))
+    for _ in range(100):
+        rig.engine.check_due()
+    assert not rig.panels.checks
+
+
 @pytest.mark.parametrize("status", ["Completed", "Partial", "Canceled", "Refunded"])
 def test_blocked_order_never_automatically_submits_after_terminal_status(rig, status):
     first = receive_and_run(rig)
@@ -32,7 +110,8 @@ def test_blocked_order_never_automatically_submits_after_terminal_status(rig, st
     assert rig.store.get(second["id"])["state"] == "ready"
     assert len(rig.panels.adds) == 1
     ready_notices = [n for n in rig.notices if n["key"].startswith(second["id"] + ":ready:")]
-    assert len(ready_notices) == 1 and status in ready_notices[0]["text"]
+    assert len(ready_notices) == 1 and panel_label(status) in ready_notices[0]["text"]
+    assert status not in ready_notices[0]["text"]
     for _ in range(3):
         rig.engine.refresh(first["id"])
         rig.engine.make_ready(first["target"], rig.store.get(first["id"]))
@@ -258,7 +337,7 @@ def test_restart_during_add_becomes_uncertain_not_retried(rig):
         assert rig.store.get(order["id"])["state"] == "uncertain"
         assert rig.store.get(order["id"])["parts"][0]["state"] == "uncertain"
         assert not rig.panels.adds
-        assert any(n["key"].startswith(order["id"] + ":recovery:") for n in rig.notices)
+        assert any(n["key"].startswith("issue:uncertain:") for n in rig.notices)
     finally:
         restarted.close()
 
@@ -317,13 +396,13 @@ def test_recovery_dispatches_receipts_saved_by_previous_instance(rig):
         restarted.close()
 
 
-def test_manual_send_held_again_notifies_again(rig):
+def test_manual_send_held_again_stays_quiet_on_telegram(rig):
     receive_and_run(rig)
     second = receive_and_run(rig, 2)
     rig.engine.approve(second["id"])
     rig.engine.execute(second["id"])
     waiting = [n for n in rig.notices if n["key"].startswith(second["id"] + ":waiting:")]
-    assert len(waiting) == 2 and len({n["key"] for n in waiting}) == 2
+    assert not waiting
     assert len(rig.panels.adds) == 1
 
 
@@ -342,7 +421,7 @@ def test_only_blocking_orders_are_polled(rig):
     rig.engine.check_due()
     assert len(rig.panels.checks) == 1
     assert rig.panels.checks[0]["smm_id"] == first["parts"][0]["smm_id"]
-    assert len(rig.notices) == 3  # two submitted, one waiting; no delay message
+    assert not rig.notices  # Routine submissions and waiting are web-only.
 
 
 def test_concurrent_duplicate_webhooks_have_one_record_and_add(rig):
