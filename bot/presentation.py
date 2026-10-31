@@ -110,6 +110,8 @@ def order_view(order):
     icon, title, tone = STATES.get(code, STATES["review"])
     issue = order.get("reason_code") or reason_code(order.get("error"), order.get("state"))
     reason, advice = REASONS.get(issue, REASONS["review"])
+    if issue == "status_unavailable":
+        icon, title, tone = "⚠️", "Panel durumu doğrulanamıyor", "warning"
     if not order.get("error") and order.get("state") not in {"review", "error", "uncertain", "waiting", "paused"}:
         reason, advice = "", ""
     if code == "ready":

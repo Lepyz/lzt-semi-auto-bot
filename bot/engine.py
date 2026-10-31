@@ -304,18 +304,25 @@ class Engine:
                     self.notifier.enqueue(notification)
         active = any(p["state"] in {"submitted", "sending", "uncertain"} for p in order["parts"])
         if order["parts"] and not active:
+            notification = None
             if all(p["state"] == "finished" for p in order["parts"]):
                 changed = changed or order["state"] != "finished"
                 order["state"] = "finished"
+                if previous_state != "finished":
+                    notification = alert(order, "outcome")
             if changed:
                 order["last_checked"] = time.time() if checked else order.get("last_checked", 0)
-                self.store.save(order)
-            self.store.release_target(order["target"], order["id"])
-            ready = self.make_ready(order["target"], order)
-            if previous_state != "finished" and not ready:
-                notification = alert(order, "outcome")
+                self.store.save(order, notification)  # Durable outcome + alert before releasing the target.
+            ready = None
+            try:
+                self.store.release_target(order["target"], order["id"])
+                ready = self.make_ready(order["target"], order)
+            finally:
                 if notification:
-                    if self.store.notify(notification):
+                    if ready:
+                        # The ready alert already contains the previous result: keep one message.
+                        self.store.finish_notification(notification["key"], True)
+                    else:
                         self.notifier.enqueue(notification)
         elif changed:
             order["last_checked"] = time.time() if checked else order.get("last_checked", 0)
@@ -418,6 +425,9 @@ class Engine:
         order.update(error="", reason_code="", manual_required=True)
         self.store.save(order)
         self.schedule_active(order)
+        if any(p["state"] == "submitted" for p in order["parts"]) and self.store.orders(states={"waiting"}, target=order["target"], limit=1):
+            with self.guard:
+                self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
         if not any(p["state"] in {"submitted", "uncertain", "sending"} for p in order["parts"]):
             self.store.release_target(order["target"], order["id"])
             self.make_ready(order["target"], order)

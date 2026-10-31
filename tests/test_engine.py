@@ -79,6 +79,18 @@ def test_active_completion_without_waiting_order_is_quiet(rig):
     assert not rig.notices
 
 
+def test_terminal_alert_is_durable_even_if_ready_transition_fails(rig, monkeypatch):
+    order = receive_and_run(rig)
+    rig.panels.current = {"status": "Canceled", "terminal": True}
+    def fail(*args):
+        raise RuntimeError("simulated interruption")
+    monkeypatch.setattr(rig.engine, "make_ready", fail)
+    with pytest.raises(RuntimeError):
+        rig.engine.refresh(order["id"])
+    assert rig.store.get(order["id"])["state"] == "finished"
+    assert len(rig.notices) == len(rig.store.pending_notifications()) == 1
+
+
 def test_status_failure_never_releases_lock_or_resends_and_warns_once(rig, monkeypatch):
     order = receive_and_run(rig)
     monkeypatch.setattr(rig.panels, "status", lambda _: None)
