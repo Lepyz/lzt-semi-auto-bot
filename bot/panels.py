@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import requests
 
 from .payloads import extract_panel_status, normalize_panel_status_text
+from .presentation import REASONS, reason_code
 
 
 TERMINAL = {
@@ -54,8 +55,7 @@ class PanelClient:
             return AddResult("uncertain", error="Panel sipariş cevabı tanınmadı.")
         if data.get("error"):
             # Do not store API keys, raw request exceptions or arbitrary response bodies.
-            return AddResult("error", error=str(data["error"]).replace(
-                self.panels[part["panel"]]["api_key"], "[gizli]")[:300])
+            return AddResult("error", error=REASONS[reason_code(str(data["error"]), "error")][0])
         value = data.get("order") or data.get("order_id") or data.get("id")
         if not value and isinstance(data.get("data"), dict):
             value = data["data"].get("order") or data["data"].get("order_id")

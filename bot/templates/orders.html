@@ -1,26 +1,40 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="toolbar"><h1>Siparişler</h1>
-  <form method="post" action="/admin/pause"><input type="hidden" name="csrf" value="{{ csrf }}">
-    <input type="hidden" name="paused" value="{{ 'false' if paused else 'true' }}">
-    <button class="{{ 'primary' if paused else '' }}">{{ 'Yeni gönderimleri etkinleştir' if paused else 'Yeni gönderimleri duraklat' }}</button>
-  </form><a class="button" href="/admin">Yenile</a>
-</div>
-{% if paused %}<div class="notice">Gönderimler duraklatıldı. Yeni siparişler kaydedilir. Tekrar etkinleştirme, tutulan siparişleri otomatik göndermez.</div>{% endif %}
-<form class="grid card" method="get" action="/admin">
-  <div><label for="state">Durum</label><select id="state" name="state"><option value="">Tüm siparişler</option>
-  {% for key,label in labels.items() %}<option value="{{ key }}" {{ 'selected' if selected==key }}>{{ label }}</option>{% endfor %}</select></div>
-  <div><label for="q">Sipariş, ilan veya link ara</label><input id="q" name="q" value="{{ query }}" placeholder="Itemsatış ID / SMM ID / link"></div>
-  <div style="align-self:end"><button class="primary">Filtrele</button></div>
+{% include "order_styles.html" %}
+<div class="toolbar"><h1>{{ 'İşlem bekleyenler' if section=='inbox' else 'Siparişler' }}</h1><a class="button" href="/admin?{{ {'view':section,'state':selected,'q':query}|urlencode }}">Yenile</a></div>
+<p class="order-status">{{ '⏸️ Yeni otomatik gönderimler duraklatıldı.' if paused else '🟢 Yeni siparişlerin otomatik gönderimi açık.' }} Bekletilmiş kayıtlar sen göndermeden başlamaz.</p>
+<div class="order-summary"><a href="/admin?view=inbox"><strong>{{ totals.inbox }}</strong>İşlem bekleyen</a><a href="/admin?view=active"><strong>{{ totals.active }}</strong>Aktif / hazırlanıyor</a><a href="/admin?view=waiting"><strong>{{ totals.waiting }}</strong>Bekletilen / hazır</a></div>
+<div class="order-tabs" aria-label="Sipariş bölümleri">{% for key,label in [('inbox','🛠️ İşlem bekleyenler'),('active','🟢 Aktif siparişler'),('waiting','⏳ Bekletilenler'),('finished','📁 Sonuçlananlar'),('all','Tüm kayıtlar')] %}<a href="/admin?view={{ key }}" {{ 'aria-current=page' if section==key }}>{{ label }}</a>{% endfor %}</div>
+<form class="card order-form order-search" method="get" action="/admin"><input type="hidden" name="view" value="all">
+  <label>Sipariş, ilan veya hedef link<input name="q" value="{{ query }}" placeholder="Sipariş / panel numarası / müşteri linki"></label>
+  <button class="primary">Ara</button>
+  <details {{ 'open' if selected }}><summary>Duruma göre filtrele</summary><label>Durum<select name="state"><option value="">Bu bölümdeki bütün durumlar</option>{% for key,label in labels.items() if key!='legacy' %}<option value="{{ key }}" {{ 'selected' if selected==key }}>{{ label }}</option>{% endfor %}</select></label><p><button>Filtreyi uygula</button></p></details>
 </form>
-<p class="muted">Filtreye uyan en son 500 kayıt gösterilir. Daha eski bir sipariş için kimliği veya linkiyle arama yapabilirsin.</p>
-<div class="card table-wrap"><table>
-<thead><tr><th>Alınma</th><th>Itemsatış / İlan</th><th>Ürün ve hedef</th><th>Durum</th><th>SMM kimlikleri</th><th></th></tr></thead>
-<tbody>{% for o in orders %}
-<tr><td>{{ o.created_at|date }}</td><td>{{ o.itemsatis_id or 'Bildirim ' ~ o.id[:10] }}<br><small>İlan {{ o.advert_id }}</small></td>
-<td>{{ o.product_name or 'Ürün adı yok' }}<br><small>{{ o.link or o.links.get('other','Link kontrolü gerekiyor') }}</small></td>
-<td><span class="badge {{ o.state }}">{{ labels.get(o.state,o.state) }}</span>{% if o.error %}<br><small class="error-text">{{ o.error }}</small>{% endif %}</td>
-<td>{% for p in o.parts %}{{ panels.get(p.panel,{}).get('name',p.panel) }}: {{ p.smm_id or '—' }}<br>{% if p.status %}<small>{{ p.status }}</small><br>{% endif %}{% endfor %}</td>
-<td><a class="button" href="/admin/orders/{{ o.id }}">Aç</a></td></tr>
-{% else %}<tr><td colspan="6" class="empty">Bu filtrede sipariş bulunamadı.</td></tr>{% endfor %}</tbody></table></div>
+<div class="order-grid">
+{% for o in orders %}{% set v = o.display %}
+<article class="card order-card">
+  <div class="order-meta"><span class="state-badge tone-{{ v.tone }}">{{ v.icon }} {{ v.title }}</span>{% if o.handling %}<small>👀 İlgileniyorum</small>{% endif %}</div>
+  <h2>{{ o.product_name or 'İlan ' ~ o.advert_id }}</h2>
+  <p class="order-id">Kayıt {{ o.itemsatis_id or o.id[:10] }} · İlan {{ o.advert_id }}<br>{{ o.created_at|date }}</p>
+  <p>{{ o.link or o.links.get('other','Hedef link kontrolü gerekiyor') }}</p>
+  {% if v.reason %}<div class="order-reason"><strong>Neden?</strong><br>{{ v.reason }}<p>{{ v.advice }}</p></div>{% endif %}
+  {% for p in o.parts %}<p class="order-check">{{ panels.get(p.panel,{}).get('name',p.panel) }} · {{ p.quantity }} adet · Panel no. {{ p.smm_id or 'Henüz yok' }}<br>{{ p.status|panel_status }}</p>{% endfor %}
+  {% if o.status_error %}<p class="order-error">⚠️ {{ o.status_error }}</p>{% endif %}
+  <div class="order-actions">
+    {% if o.state=='ready' %}<a class="button" href="/admin/orders/{{ o.id }}?preview=1">Kontrol edip gönder</a>
+    {% elif o.state=='review' and o.parts and not o.error %}<a class="button" href="/admin/orders/{{ o.id }}?preview=1">Gönderimi incele</a>
+    {% elif v.issue=='link_missing' %}<a class="button" href="/admin/orders/{{ o.id }}#repair">Linki düzelt</a>
+    {% elif o.state=='uncertain' %}<a class="button" href="/admin/orders/{{ o.id }}#reconcile">Panel kontrolünü tamamla</a>
+    {% elif v.issue=='panel_config' %}<a class="button" href="/admin/integrations">Bağlantıları aç</a>
+    {% elif v.issue in ['service','quantity','package_target'] %}<a class="button" href="/admin/services?edit={{ o.advert_id }}">İlan ayarını düzelt</a>{% endif %}
+    <a class="button" href="/admin/orders/{{ o.id }}">Ayrıntıyı aç</a>
+  </div>
+</article>
+{% else %}<div class="card empty">Bu bölüm ve filtrede kayıt yok.</div>{% endfor %}
+</div>
+<p class="order-check">Filtreye uyan en son 500 kayıt gösterilir. Daha eski bir kayıt için sipariş numarası veya linkiyle arayabilirsin.</p>
+<details class="card"><summary>Otomatik gönderim ayarı</summary><p>Duraklatma yeni gönderimleri tutar. Tekrar açmak, daha önce bekletilmiş kayıtları kendiliğinden göndermez.</p>
+  <p>Aktif işlemler yaklaşık {{ active_minutes }} dakikada bir, başka siparişi bekletenler {{ blocked_minutes }} dakikada bir kontrol edilir. İstersen sipariş ayrıntısından kontrol isteyebilirsin.</p>
+  <form method="post" action="/admin/pause"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="paused" value="{{ 'false' if paused else 'true' }}"><button>{{ 'Yeni gönderimleri etkinleştir' if paused else 'Yeni gönderimleri duraklat' }}</button></form>
+</details>
 {% endblock %}

@@ -77,6 +77,69 @@ def test_all_admin_templates_render_without_secrets(client, rig):
         assert rig.settings.password not in response.text
 
 
+def test_inbox_ignores_intentionally_unmapped_adverts_but_keeps_all_records(client, rig):
+    rig.store.delete_binding("10")
+    order = receive_and_run(rig)
+    path = 'href="/admin/orders/' + order["id"]
+    assert path not in client.get("/admin?view=inbox").text
+    assert path in client.get("/admin?view=all").text
+
+
+def test_preview_and_attention_do_not_send_or_notify(client, rig):
+    rig.store.set_setting("paused", True)
+    order = receive_and_run(rig)
+    path = "/admin/orders/" + order["id"]
+    before = rig.store.get(order["id"])
+    preview = client.get(path + "?preview=1")
+    assert preview.status_code == 200 and "Gönderim önizlemesi" in preview.text
+    assert rig.store.get(order["id"]) == before
+    csrf = token(client, path)
+    assert client.post(path + "/send", data={"csrf": csrf, "revision": before["revision"]}).status_code == 400
+    assert client.post(path + "/attention", data={"csrf": csrf, "revision": before["revision"]}).status_code == 200
+    assert rig.store.get(order["id"])["handling"] is True
+    assert not rig.panels.adds and not rig.store.pending_notifications()
+
+
+def test_cancelled_result_is_never_displayed_as_green_completed(client, rig):
+    order = receive_and_run(rig)
+    rig.panels.current = {"status": "Canceled", "terminal": True}
+    rig.engine.refresh(order["id"])
+    for path in ["/admin?view=finished", "/admin/orders/" + order["id"]]:
+        text = client.get(path).text
+        assert "Panel iptal bildirdi" in text and "tone-danger" in text
+        assert "Canceled" not in text
+
+
+def test_turkish_telegram_menu_and_paused_status_are_truthful(client, rig):
+    rig.settings.telegram_secret, rig.settings.chat_id = "secret", "123"
+    rig.store.set_setting("paused", True)
+    headers = {"X-Telegram-Bot-Api-Secret-Token": "secret"}
+    for command in ["/start", "🟢 Bot durumu", "/bekleyen", "/sorunlar", "/ara"]:
+        data = {"message": {"chat": {"id": 123}, "from": {"id": 123}, "text": command}}
+        assert client.post("/telegram-webhook", json=data, headers=headers).status_code == 200
+        notice = client.app.state.notifier.queue.get_nowait()
+        assert notice["ephemeral"]
+        if command == "🟢 Bot durumu":
+            assert "duraklatıldı" in notice["text"]
+        if command == "/start":
+            assert notice["menu"] and "/bekleyen" in notice["text"]
+    assert not rig.store.pending_notifications()
+
+
+def test_old_telegram_send_callback_cannot_skip_web_preview(client, rig):
+    rig.settings.telegram_secret, rig.settings.chat_id = "secret", "123"
+    rig.store.set_setting("paused", True)
+    order = receive_and_run(rig)
+    body = {"callback_query": {"id": "old", "data": "send:" + order["id"],
+            "message": {"chat": {"id": 123}}, "from": {"id": 123}}}
+    response = client.post("/telegram-webhook", json=body,
+                           headers={"X-Telegram-Bot-Api-Secret-Token": "secret"})
+    assert response.status_code == 200 and rig.store.get(order["id"])["state"] == "paused"
+    notice = client.app.state.notifier.queue.get_nowait()
+    assert "eski sürüme ait" in notice["text"] and notice["ephemeral"]
+    assert not rig.panels.adds
+
+
 def test_missing_link_repair_form_and_manual_send(client, rig):
     data = payload()
     del data["post_datas"]
@@ -91,7 +154,7 @@ def test_missing_link_repair_form_and_manual_send(client, rig):
     assert response.status_code == 200
     assert not rig.panels.adds
     revision = rig.store.get(order_id)["revision"]
-    response = client.post(path + "/send", data={"csrf": csrf, "revision": revision})
+    response = client.post(path + "/send", data={"csrf": csrf, "revision": revision, "confirmed": "yes"})
     assert response.status_code == 200
     assert rig.store.get(order_id)["state"] == "queued"
 

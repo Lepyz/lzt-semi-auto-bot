@@ -189,4 +189,6 @@
     applyFilters();
   }));
   applyFilters();
+  const requested = new URLSearchParams(window.location.search).get('edit');
+  if (requested && Object.prototype.hasOwnProperty.call(data.bindings, requested)) openEditor(requested);
 })();

@@ -37,7 +37,7 @@ def test_command_reply_uses_no_database(rig, monkeypatch):
     assert len(calls) == 1
 
 
-def test_secret_needed_for_financial_action_button(rig, monkeypatch):
+def test_ready_button_opens_authenticated_web_preview_instead_of_sending(rig, monkeypatch):
     import requests
     from types import SimpleNamespace
     notifier = Notifier(rig.store, rig.settings)
@@ -48,8 +48,12 @@ def test_secret_needed_for_financial_action_button(rig, monkeypatch):
     notifier.send(notification())
     assert "reply_markup" not in captured[-1]
     rig.settings.telegram_secret = "secret"
+    rig.settings.public_url = "https://example.invalid"
     notifier.send(notification())
-    assert captured[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith("send:")
+    button = captured[-1]["reply_markup"]["inline_keyboard"][0][0]
+    assert "callback_data" not in button
+    assert button["url"].endswith("/admin/orders/" + "a" * 32 + "?preview=1")
+    assert button["text"] == "Kontrol edip gönder"
 
 
 def test_restart_does_not_repeat_ambiguous_inflight_notification(rig):

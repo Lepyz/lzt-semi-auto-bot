@@ -1,5 +1,6 @@
 """Boostera: receive durably, submit once, hold duplicates for manual approval."""
 import asyncio
+import copy
 import csv
 import hashlib
 import hmac
@@ -11,7 +12,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -24,6 +25,7 @@ from bot.migration import MigrationJob
 from bot.notifications import Notifier, callbacks_allowed, register_telegram_webhook, telegram_api
 from bot.panels import PanelClient
 from bot.store import Conflict, Store
+from bot.presentation import order_view, panel_label, summary as order_summary
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,6 +51,10 @@ LABELS = {"queued": "Alındı", "processing": "Hazırlanıyor", "sending": "Gön
           "finished": "Sonuçlandı", "legacy": "Eski işlenmiş sipariş", "closed": "Gönderilmeden kapatıldı"}
 TEMPLATES.filters["date"] = lambda ts: datetime.fromtimestamp(
     ts / 1_000_000, timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+TEMPLATES.filters["panel_status"] = panel_label
+TEMPLATES.filters["order_view"] = order_view
+TEMPLATES.filters["clock"] = lambda ts: datetime.fromtimestamp(
+    ts, timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M") if ts else "Henüz kontrol edilmedi"
 
 
 def create_app(settings=None, store=None, panels=None, start_background=True):
@@ -83,7 +89,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             await asyncio.to_thread(engine.close)
             await asyncio.to_thread(notifier.close)
 
-    app = FastAPI(title="Boostera", version="3.0.0", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Boostera", version="3.1.0", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
 
     def admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -116,7 +122,8 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             token = nonce + "." + signature(nonce)
         html = TEMPLATES.get_template(template).render(
             csrf=token, labels=LABELS, panels=settings.panels, manual_states=MANUAL_STATES,
-            message=request.query_params.get("message", ""), **values)
+            message=request.query_params.get("message", ""),
+            active_minutes=settings.active_check_interval // 60, blocked_minutes=settings.check_interval // 60, **values)
         response = HTMLResponse(html, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY",
                                               "X-Content-Type-Options": "nosniff",
                                               "Referrer-Policy": "same-origin"})
@@ -127,10 +134,20 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
 
     @app.exception_handler(ValueError)
     async def bad_value(request, exc):
+        if request.url.path.startswith("/admin/orders/"):
+            response = page(request, "order_error.html", error=str(exc),
+                            back="/admin/orders/" + request.url.path.split("/")[3])
+            response.status_code = 400
+            return response
         return HTMLResponse("İşlem yapılamadı: " + __import__("html").escape(str(exc)), status_code=400)
 
     @app.exception_handler(Conflict)
     async def conflict(request, exc):
+        if request.url.path.startswith("/admin/orders/"):
+            response = page(request, "order_error.html", error=str(exc),
+                            back="/admin/orders/" + request.url.path.split("/")[3])
+            response.status_code = 409
+            return response
         return HTMLResponse(__import__("html").escape(str(exc)), status_code=409)
 
     @app.api_route("/health", methods=["GET", "HEAD"])
@@ -141,7 +158,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.api_route("/check-panel-health", methods=["GET", "HEAD"])
     def health():
         # Uptime checks must never query a database, panel or Telegram.
-        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.0.0"}
+        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.1.0"}
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):
@@ -190,10 +207,21 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
 
     @app.get("/", dependencies=[Depends(admin)])
     @app.get("/admin", dependencies=[Depends(admin)])
-    def dashboard(request: Request, state: str = "", q: str = ""):
-        rows = app.state.store.orders(states={state} if state else set(LABELS) - {"legacy"},
-                                      search=q, limit=500, newest=True)
-        return page(request, "orders.html", orders=rows, selected=state, query=q,
+    def dashboard(request: Request, state: str = "", q: str = "", view: str = ""):
+        sections = {"inbox": {"ready", "review", "error", "uncertain", "paused"},
+                    "active": {"submitted", "processing", "sending", "queued"},
+                    "waiting": {"waiting", "ready", "paused"}, "finished": {"finished", "closed"},
+                    "all": set(LABELS) - {"legacy"}}
+        view = view if view in sections else "all" if q or state else "inbox"
+        rows = app.state.store.orders(states={state} if state in LABELS else sections[view],
+                                      search=q, limit=500, newest=True, exclude_unmapped=view == "inbox")
+        rows = [dict(o, display=order_view(o)) for o in rows]
+        if view == "inbox":
+            priority = {"ready": 0, "uncertain": 1, "error": 2, "review": 3, "paused": 4}
+            rows.sort(key=lambda o: (bool(o.get("handling")), priority.get(o["state"], 5), o["created_at"]))
+        counts = app.state.store.state_counts()
+        totals = {key: sum(counts.get(state, 0) for state in states) for key, states in sections.items()}
+        return page(request, "orders.html", orders=rows, selected=state, query=q, section=view, totals=totals,
                     paused=app.state.store.setting("paused", False))
 
     @app.get("/admin/orders/{order_id}", dependencies=[Depends(admin)])
@@ -201,17 +229,50 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         order = app.state.store.get(order_id)
         if not order:
             raise HTTPException(404, "Sipariş bulunamadı.")
-        return page(request, "detail.html", order=order)
+        related = app.state.store.orders(target=order["target"], limit=50, newest=True) if order.get("target") else []
+        owner_id = app.state.store.owner(order["target"]) if order.get("target") else None
+        owner = app.state.store.get(owner_id) if owner_id and owner_id != order_id else None
+        preview, preview_error = None, ""
+        if request.query_params.get("preview") == "1":
+            try:
+                if order["state"] not in MANUAL_STATES:
+                    raise ValueError("Bu kayıt şu an gönderime uygun değil.")
+                if any(p["state"] in {"submitted", "sending", "uncertain"} for p in order["parts"]):
+                    raise ValueError("Önce paneldeki aktif veya belirsiz bileşenleri kontrol edin.")
+                prepared = copy.deepcopy(order)
+                app.state.engine.prepare(prepared)
+                preview = prepared
+            except ValueError as exc:
+                preview_error = str(exc)
+        homes = {}
+        for key, panel in settings.panels.items():
+            url = urlsplit(panel.get("api_url", ""))
+            if url.scheme == "https" and url.hostname:
+                homes[key] = "https://" + url.hostname
+        checks = app.state.engine.check_results.get(order_id, {"at": order.get("last_checked", 0), "ok": True})
+        return page(request, "detail.html", order=order, display=order_view(order), related=related,
+                    owner=owner, preview=preview, preview_error=preview_error, checks=checks, panel_homes=homes)
 
     @app.post("/admin/orders/{order_id}/send", dependencies=[Depends(mutation)])
-    def send(order_id: str, revision: int = Form(...)):
+    def send(order_id: str, revision: int = Form(...), confirmed: str = Form("")):
+        if confirmed != "yes":
+            raise ValueError("Gönderim özetindeki ürün, adet ve hedefi kontrol edip onaylayın.")
         app.state.engine.approve(order_id, revision)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Gönderim isteği alındı. Aktif hedef kontrolü tekrar yapılacak."}), 303)
+
+    @app.post("/admin/orders/{order_id}/attention", dependencies=[Depends(mutation)])
+    def attention(order_id: str, revision: int = Form(...), handling: str = Form("yes")):
+        order = app.state.store.get(order_id)
+        if not order or order["revision"] != revision:
+            raise Conflict("Kayıt değişti; sayfayı yenileyin.")
+        order["handling"] = handling == "yes"
+        app.state.store.save(order)
         return RedirectResponse("/admin/orders/" + order_id, 303)
 
     @app.post("/admin/orders/{order_id}/repair", dependencies=[Depends(mutation)])
     def repair(order_id: str, link: str = Form(...), revision: int = Form(...)):
         app.state.engine.repair(order_id, link, revision)
-        return RedirectResponse("/admin/orders/" + order_id, 303)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Bilgiler kaydedildi. Henüz sipariş gönderilmedi; gönderim özetinden devam edebilirsin."}), 303)
 
     @app.post("/admin/orders/{order_id}/refresh", dependencies=[Depends(mutation)])
     def refresh(order_id: str):
@@ -223,13 +284,13 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         if confirmed != "yes":
             raise ValueError("Kapatma işlemini doğrulayın.")
         app.state.engine.close_unsubmitted(order_id, revision)
-        return RedirectResponse("/admin/orders/" + order_id, 303)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Kayıt takipten çıkarıldı. Bu işlem panelde iptal veya iade yapmaz."}), 303)
 
     @app.post("/admin/orders/{order_id}/reconcile", dependencies=[Depends(mutation)])
     def reconcile(order_id: str, index: int = Form(...), revision: int = Form(...),
                   smm_id: str = Form(""), absent: str = Form("")):
         app.state.engine.reconcile(order_id, index, smm_id.strip(), absent == "yes", revision)
-        return RedirectResponse("/admin/orders/" + order_id, 303)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Panel kontrolü sonucu kaydedildi. Bu işlem yeni sipariş oluşturmadı."}), 303)
 
     @app.post("/admin/pause", dependencies=[Depends(mutation)])
     def pause(paused: str = Form(...)):
@@ -266,6 +327,11 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.get("/admin/assets/services.js", dependencies=[Depends(admin)])
     def services_script():
         return Response((Path(__file__).parent / "static" / "services.js").read_text(encoding="utf-8"),
+                        media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
+    @app.get("/admin/assets/orders.js", dependencies=[Depends(admin)])
+    def orders_script():
+        return Response((Path(__file__).parent / "static" / "orders.js").read_text(encoding="utf-8"),
                         media_type="application/javascript", headers={"Cache-Control": "no-cache"})
 
     def binding_version(binding):
@@ -398,7 +464,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     def export():
         result = io.StringIO()
         writer = csv.writer(result, delimiter=";")
-        writer.writerow(["Itemsatis ID", "İlan", "Ürün", "Link", "Durum", "Panel", "SMM ID", "Adet"])
+        writer.writerow(["Itemsatış sipariş numarası", "İlan", "Ürün", "Link", "Durum", "Panel", "Panel sipariş numarası", "Adet"])
         def safe(value):
             text = str(value or "")
             return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
@@ -406,7 +472,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             for part in order["parts"] or [{}]:
                 writer.writerow([safe(v) for v in (
                     order["itemsatis_id"], order["advert_id"], order["product_name"], order["link"],
-                    LABELS.get(order["state"], order["state"]), part.get("panel", ""),
+                    order_view(order)["title"], part.get("panel", ""),
                     part.get("smm_id", ""), part.get("quantity", ""))])
         return Response("\ufeff" + result.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": 'attachment; filename="siparisler.csv"'})
@@ -435,30 +501,44 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         if callback:
             action = str(callback.get("data", ""))
             if action.startswith("send:"):
-                try:
-                    await asyncio.to_thread(app.state.engine.approve, action[5:])
-                    text = "Gönderim isteği alındı. Aktif sipariş kontrolü tekrar yapılacak."
-                except (ValueError, Conflict) as exc:
-                    text = str(exc)
+                text = "Bu düğme eski sürüme ait. Siparişi web panelinde açıp Gönderimi incele düğmesinden devam et. Henüz sipariş gönderilmedi."
             # Stop Telegram's button spinner through the independent notifier.
             notice = {"key": "callback:" + str(callback.get("id")), "text": text,
                       "callback_id": str(callback.get("id")), "order_id": "", "action": False}
         else:
-            command = str(message.get("text", "")).split("@")[0].split(" ")[0]
-            if command in {"/pending", "/failed", "/status"}:
-                states = {"waiting", "ready", "paused"} if command == "/pending" else {"error", "review", "uncertain"}
-                if command == "/status":
-                    text = "Bot çalışıyor. " + text
+            raw = str(message.get("text", "")).strip()
+            command = raw.split(" ")[0].split("@")[0]
+            command = {"/pending": "/bekleyen", "/failed": "/sorunlar", "/status": "/durum",
+                       "📋 Bekleyenler": "/bekleyen", "⚠️ Sorunlar": "/sorunlar",
+                       "🟢 Bot durumu": "/durum", "🔎 Sipariş ara": "/ara"}.get(raw,
+                       {"/pending": "/bekleyen", "/failed": "/sorunlar", "/status": "/durum"}.get(command, command))
+            if command == "/durum":
+                paused = await asyncio.to_thread(app.state.store.setting, "paused", False)
+                text = ("⏸️ Yeni otomatik gönderimler duraklatıldı." if paused else "🟢 Yeni otomatik gönderimler açık.")
+                text += "\nBekletilmiş siparişler sen göndermeden başlamaz.\n\n" + text_link(settings.public_url)
+            elif command in {"/bekleyen", "/sorunlar", "/ara"}:
+                query = raw.partition(" ")[2].strip() if command == "/ara" and raw.startswith("/") else ""
+                if command == "/ara" and len(query) < 2:
+                    text = "🔎 /ara komutundan sonra kayıt numarası, panel sipariş numarası veya hedef linki yaz.\nÖrnek: /ara 123456"
                 else:
-                    orders = await asyncio.to_thread(app.state.store.orders, states=states, limit=10)
-                    text = "\n\n".join(LABELS[o["state"]] + "\n" + app.state.engine.summary(o) for o in orders) or "Kayıt yok."
+                    states = {"waiting", "ready", "paused"} if command == "/bekleyen" else {"error", "review", "uncertain"} if command == "/sorunlar" else set(LABELS) - {"legacy"}
+                    orders = await asyncio.to_thread(app.state.store.orders, states=states, search=query,
+                                                    limit=10, newest=True, exclude_unmapped=command == "/sorunlar")
+                    text = "\n\n".join(order_view(o)["icon"] + " " + order_view(o)["title"] + "\n" + order_summary(o) for o in orders) or "Bu aramada kayıt yok."
+                    text += "\n\n" + text_link(settings.public_url)
+            else:
+                text = "👋 Sipariş yönetimi\n\n📋 /bekleyen — Bekletilen ve hazır siparişler\n⚠️ /sorunlar — Kontrol gereken kayıtlar\n🟢 /durum — Otomatik gönderim durumu\n🔎 /ara kayıt-no — Sipariş ara\n\n" + text_link(settings.public_url)
             notice = {"key": "telegram:" + str(data.get("update_id")), "text": text[:3500],
-                      "order_id": "", "action": False}
+                      "order_id": "", "action": False, "menu": command in {"/start", "/yardim"}}
         notice["ephemeral"] = True
         app.state.notifier.enqueue(notice)
         return {"ok": True}
 
     return app
+
+
+def text_link(public_url):
+    return "Web paneli: " + public_url + "/admin?view=inbox" if public_url else "Siparişlerini web panelindeki İşlem bekleyenler ekranından yönetebilirsin."
 
 
 app = create_app()
