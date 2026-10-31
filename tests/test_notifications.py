@@ -62,3 +62,20 @@ def test_restart_does_not_repeat_ambiguous_inflight_notification(rig):
     rig.store.recover_notifications()
     assert not rig.store.pending_notifications()
     assert rig.store.notification("order:ready")["state"] == "failed"
+
+
+def test_unsent_policy_waiting_notice_is_delivered_once_not_filtered_as_legacy(rig, monkeypatch):
+    from conftest import receive_and_run
+    receive_and_run(rig, 1)
+    held = receive_and_run(rig, 2)
+    assert held["state"] == "waiting"
+    notices = rig.store.pending_notifications()
+    assert len(notices) == 1 and notices[0]["order_id"] == held["id"]
+    assert notices[0]["policy"] == "unsent-v2"
+    notifier = Notifier(rig.store, rig.settings)
+    calls = []
+    monkeypatch.setattr(notifier, "send", lambda item: calls.append(item) or "sent")
+    for _ in range(3):
+        notifier.deliver(notices[0])
+    assert len(calls) == 1
+    assert "BEKLETİLDİ" in calls[0]["text"] and held["itemsatis_id"] in calls[0]["text"]

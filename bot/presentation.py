@@ -1,9 +1,6 @@
 """Shared Turkish labels, reasons and notification policy. No network or storage."""
-from datetime import datetime, timedelta, timezone
-
 from .payloads import normalize_panel_status_text
 
-TR = timezone(timedelta(hours=3))
 STATES = {
     "queued": ("📥", "Sipariş alındı", "info"),
     "processing": ("🔄", "Gönderim hazırlanıyor", "info"),
@@ -139,32 +136,25 @@ def summary(order):
 
 
 def alert(order, event):
-    """Routine events produce no outbox writes. Rejections group per reason/panel/day."""
+    """Each distinct unsent purchase is reported; routine successes stay quiet."""
     view = order_view(order)
     state = order.get("state")
-    if state not in {"ready", "uncertain", "error", "review"} and view["code"] not in {"cancelled", "partial", "refunded", "failed"}:
+    if state not in {"ready", "waiting", "paused", "uncertain", "error", "review"} and view["code"] not in {"cancelled", "partial", "refunded", "failed"}:
         return None
     if view["issue"] == "binding_missing":
         return None
-    if order.get("manual_approved") and state in {"error", "review"}:
-        return None
     panel = order.get("alert_panel") or next((p.get("panel", "") for p in reversed(order.get("parts", []))
-                                             if p.get("state") in {"error", "uncertain", "sending"}), "")
-    grouped = state in {"error", "review"} or state == "uncertain" and bool(panel)
+                                             if p.get("state") in {"error", "uncertain", "sending"}), "") or next((p.get("panel", "") for p in order.get("parts", [])), "")
     key = order["id"] + ":" + event + ":" + str(order.get("revision", 0))
     if state == "finished":
         key = order["id"] + ":outcome:" + view["code"]
-    if grouped:
-        scope = panel or order.get("advert_id") or "general"
-        key = "issue:" + view["issue"] + ":" + scope + ":" + datetime.now(TR).strftime("%Y%m%d")
-        text = f"{view['icon']} {view['title'].replace('i','İ').replace('ı','I').upper()}\n\n{view['reason']}\n"
-        if panel:
-            text += "Panel: " + panel + "\n"
-        text += "\n" + view["advice"] + "\n\nİlgili kayıtları İşlem bekleyenler ekranından inceleyebilirsin. Aynı sorunun bugünkü tekrarları bu ekranda toplanır."
-    else:
-        text = f"{view['icon']} {view['title'].replace('i','İ').replace('ı','I').upper()}\n\n" + summary(order)
-        if order.get("previous_result"):
-            text += "\nÖnceki işlem: " + order["previous_result"]
-        text += "\n\nNeden: " + view["reason"] + "\n👉 " + view["advice"]
-    return {"key": key, "text": text[:3500], "order_id": "" if grouped else order["id"],
-            "action": state == "ready", "grouped": grouped}
+    title = ("Sipariş başlatılmadı — bekletildi" if state == "waiting" else
+             "Sipariş başlatılmadı — duraklatıldı" if state == "paused" else view["title"])
+    text = f"{view['icon']} {title.replace('i','İ').replace('ı','I').upper()}\n\n" + summary(order)
+    if panel:
+        text += "\nPanel: " + panel
+    if order.get("previous_result"):
+        text += "\nÖnceki işlem: " + order["previous_result"]
+    text += "\n\nNeden: " + view["reason"] + "\n👉 " + view["advice"]
+    return {"key": key, "text": text[:3500], "order_id": order["id"],
+            "action": state == "ready", "grouped": False, "policy": "unsent-v2"}
