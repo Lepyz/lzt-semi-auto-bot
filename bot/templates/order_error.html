@@ -1,0 +1,4 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card" role="alert"><h1>⚠️ İşlem tamamlanamadı</h1><p>{{ error }}</p><p>Kaydı güncel haliyle açıp bilgileri kontrol edebilirsin.</p><a class="button" href="{{ back }}">Siparişe dön</a> <a class="button" href="/admin?view=inbox">İşlem bekleyenleri aç</a></section>
+{% endblock %}

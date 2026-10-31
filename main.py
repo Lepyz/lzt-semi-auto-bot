@@ -134,10 +134,20 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
 
     @app.exception_handler(ValueError)
     async def bad_value(request, exc):
+        if request.url.path.startswith("/admin/orders/"):
+            response = page(request, "order_error.html", error=str(exc),
+                            back="/admin/orders/" + request.url.path.split("/")[3])
+            response.status_code = 400
+            return response
         return HTMLResponse("İşlem yapılamadı: " + __import__("html").escape(str(exc)), status_code=400)
 
     @app.exception_handler(Conflict)
     async def conflict(request, exc):
+        if request.url.path.startswith("/admin/orders/"):
+            response = page(request, "order_error.html", error=str(exc),
+                            back="/admin/orders/" + request.url.path.split("/")[3])
+            response.status_code = 409
+            return response
         return HTMLResponse(__import__("html").escape(str(exc)), status_code=409)
 
     @app.api_route("/health", methods=["GET", "HEAD"])
@@ -262,7 +272,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.post("/admin/orders/{order_id}/repair", dependencies=[Depends(mutation)])
     def repair(order_id: str, link: str = Form(...), revision: int = Form(...)):
         app.state.engine.repair(order_id, link, revision)
-        return RedirectResponse("/admin/orders/" + order_id, 303)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Bilgiler kaydedildi. Henüz sipariş gönderilmedi; gönderim özetinden devam edebilirsin."}), 303)
 
     @app.post("/admin/orders/{order_id}/refresh", dependencies=[Depends(mutation)])
     def refresh(order_id: str):
@@ -274,13 +284,13 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         if confirmed != "yes":
             raise ValueError("Kapatma işlemini doğrulayın.")
         app.state.engine.close_unsubmitted(order_id, revision)
-        return RedirectResponse("/admin/orders/" + order_id, 303)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Kayıt takipten çıkarıldı. Bu işlem panelde iptal veya iade yapmaz."}), 303)
 
     @app.post("/admin/orders/{order_id}/reconcile", dependencies=[Depends(mutation)])
     def reconcile(order_id: str, index: int = Form(...), revision: int = Form(...),
                   smm_id: str = Form(""), absent: str = Form("")):
         app.state.engine.reconcile(order_id, index, smm_id.strip(), absent == "yes", revision)
-        return RedirectResponse("/admin/orders/" + order_id, 303)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Panel kontrolü sonucu kaydedildi. Bu işlem yeni sipariş oluşturmadı."}), 303)
 
     @app.post("/admin/pause", dependencies=[Depends(mutation)])
     def pause(paused: str = Form(...)):
