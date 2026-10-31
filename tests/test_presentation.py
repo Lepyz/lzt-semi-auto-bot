@@ -18,6 +18,12 @@ def test_mixed_completed_and_cancelled_package_is_partial():
     assert view["code"] == "partial" and view["tone"] == "warning"
 
 
+def test_repaired_record_is_not_still_described_as_missing_information():
+    view = order_view({"state": "review", "error": "", "parts": [{"state": "new"}]})
+    assert "Bilgiler kaydedildi" in view["title"]
+    assert "yeterli değil" not in view["reason"]
+
+
 @pytest.mark.parametrize("raw,code", [("Insufficient funds", "balance"), ("Invalid service", "service"),
                                       ("Quantity less than minimum", "quantity"), ("Incorrect API key", "panel_config")])
 def test_panel_rejections_are_translated_without_persisting_raw_response(raw, code, monkeypatch):

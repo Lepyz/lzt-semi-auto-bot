@@ -22,6 +22,7 @@
   {% if o.status_error %}<p class="order-error">⚠️ {{ o.status_error }}</p>{% endif %}
   <div class="order-actions">
     {% if o.state=='ready' %}<a class="button" href="/admin/orders/{{ o.id }}?preview=1">Kontrol edip gönder</a>
+    {% elif o.state=='review' and o.parts and not o.error %}<a class="button" href="/admin/orders/{{ o.id }}?preview=1">Gönderimi incele</a>
     {% elif v.issue=='link_missing' %}<a class="button" href="/admin/orders/{{ o.id }}#repair">Linki düzelt</a>
     {% elif o.state=='uncertain' %}<a class="button" href="/admin/orders/{{ o.id }}#reconcile">Panel kontrolünü tamamla</a>
     {% elif v.issue=='panel_config' %}<a class="button" href="/admin/integrations">Bağlantıları aç</a>

@@ -116,6 +116,10 @@ def order_view(order):
         reason, advice = "", ""
     if code == "ready":
         reason, advice = "Önceki engel kalktı. Bu sipariş henüz panele gönderilmedi.", "Ürün, adet ve hedefi kontrol edip gönderimi onayla."
+    if code == "review" and not order.get("error") and order.get("parts") and all(p.get("state") == "new" for p in order["parts"]):
+        icon, title, tone = "📋", "Bilgiler kaydedildi — onayın bekleniyor", "info"
+        reason = "Ürün, servis ve müşteri linki kaydedildi. Henüz yeni sipariş açılmadı."
+        advice = "Gönderim özetini aç. Aktif hedef kontrolü gönderimde yeniden yapılır."
     if code == "closed" and issue != "legacy_duplicate":
         reason, advice = "Bu kayıt yönetici tarafından takipten çıkarıldı.", "Bu işlem yeni sipariş açmadı; panelde daha önce açılmış bileşenleri iptal etmez veya para iadesi yapmaz."
     if code in {"cancelled", "partial", "refunded", "failed"}:
