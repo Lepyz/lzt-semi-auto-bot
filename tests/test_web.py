@@ -276,8 +276,8 @@ def test_services_page_lists_imported_bindings_on_every_database(client, rig):
     text = response.text
     assert text.index("Paket 5") < text.index("Paket 20") < text.index("Paket 100")
     assert set(rig.store.bindings()) == {"5", "10", "20", "100"}
-    # An imported platform outside the default list stays selected when editing.
-    assert "<option selected>spotify</option>" in text
+    # The single JS editor receives imported platforms without replacing them.
+    assert '"platform": "spotify"' in text
 
 
 def test_editing_imported_package_keeps_every_component(client, rig):
@@ -294,6 +294,66 @@ def test_editing_imported_package_keeps_every_component(client, rig):
     bad = client.post("/admin/services", data={"csrf": csrf, "advert_id": "30", "components": "[1]"})
     assert bad.status_code == 400
     assert rig.store.setting("binding:30") == saved
+
+
+def mapping_data(client):
+    import json
+    text = client.get("/admin/services").text
+    return json.loads(re.search(r'<script type="application/json" id="mapping-data">(.*?)</script>',
+                                text, re.S).group(1))
+
+
+def test_mapping_editor_refuses_duplicate_new_advert_without_overwriting(client, rig):
+    before = rig.store.setting("binding:10")
+    response = client.post("/admin/services", data={"csrf": token(client, "/admin/services"),
+                           "mode": "create", "advert_id": "10", "panel": "medyabayim",
+                           "service_id": "999", "quantity": "100"})
+    assert response.status_code == 409
+    assert rig.store.setting("binding:10") == before
+
+
+def test_mapping_editor_rejects_stale_or_deleted_mapping(client, rig):
+    page = mapping_data(client)
+    before = rig.store.setting("binding:10")
+    rig.store.set_setting("binding:10", dict(before, name="Diğer sekmede değişti"))
+    data = {"csrf": token(client, "/admin/services"), "mode": "edit", "advert_id": "10",
+            "version": page["versions"]["10"], "panel": "smmrush", "service_id": "123", "quantity": "200"}
+    assert client.post("/admin/services", data=data).status_code == 409
+    assert rig.store.setting("binding:10")["name"] == "Diğer sekmede değişti"
+    rig.store.delete_binding("10")
+    assert client.post("/admin/services", data=data).status_code == 409
+    assert rig.store.setting("binding:10") is None
+
+
+def test_mapping_editor_copy_and_edit_leave_orders_and_notifications_unchanged(client, rig, monkeypatch):
+    import json
+    order = receive_and_run(rig)
+    before = rig.store.get(order["id"])
+    notices = rig.store.pending_notifications()
+    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("Mapping UI called an external API"))
+    page = mapping_data(client)
+    csrf = token(client, "/admin/services")
+    components = page["bindings"]["10"]["components"] + [{
+        "panel": "medyabayim", "service_id": "456", "quantity": 50, "platform": "instagram"}]
+    data = {"csrf": csrf, "mode": "create", "advert_id": "20", "name": "Yeni paket",
+            "active": "false", "components": json.dumps(components)}
+    assert client.post("/admin/services", data=data).status_code == 200
+    copied = rig.store.setting("binding:20")
+    assert copied["active"] is False and len(copied["components"]) == 2
+    assert rig.store.setting("binding:10") == page["bindings"]["10"]
+    data.update(mode="edit", version=mapping_data(client)["versions"]["20"], name="Düzenlenen paket")
+    assert client.post("/admin/services", data=data).status_code == 200
+    assert rig.store.setting("binding:20")["name"] == "Düzenlenen paket"
+    assert rig.store.get(order["id"]) == before
+    assert rig.store.pending_notifications() == notices
+    assert len(rig.panels.adds) == 1
+
+
+def test_mapping_script_is_authenticated_and_does_not_query_database(client, rig, monkeypatch):
+    monkeypatch.setattr(rig.store, "transaction", lambda: pytest.fail("Script queried database"))
+    response = client.get("/admin/assets/services.js")
+    assert response.status_code == 200 and "application/javascript" in response.headers["content-type"]
+    assert client.get("/admin/assets/services.js", auth=("wrong", "wrong")).status_code == 401
 
 
 def test_search_treats_wildcards_literally(client, rig):

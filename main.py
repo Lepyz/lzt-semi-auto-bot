@@ -258,22 +258,60 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.get("/admin/services", dependencies=[Depends(admin)])
     @app.get("/admin/packages", dependencies=[Depends(admin)])
     def services(request: Request):
-        return page(request, "services.html", bindings=app.state.store.bindings())
+        bindings = app.state.store.bindings()
+        return page(request, "services.html", bindings=bindings,
+                    versions={key: binding_version(value) for key, value in bindings.items()},
+                    saved=request.query_params.get("saved", ""))
+
+    @app.get("/admin/assets/services.js", dependencies=[Depends(admin)])
+    def services_script():
+        return Response((Path(__file__).parent / "static" / "services.js").read_text(encoding="utf-8"),
+                        media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
+    def binding_version(binding):
+        return hashlib.sha256(json.dumps(binding, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     @app.post("/admin/services", dependencies=[Depends(mutation)])
     def save_service(advert_id: str = Form(...), name: str = Form(""),
                      panel: str = Form(""), service_id: str = Form(""), quantity: int = Form(0),
                      platform: str = Form("instagram"), components: str = Form(""),
-                     active: str = Form("true")):
-        if not advert_id.isdigit():
-            raise ValueError("İlan kimliği sadece rakam olmalı.")
+                     active: str = Form("true"), mode: str = Form(""), version: str = Form("")):
+        advert_id = advert_id.strip()
+        if not advert_id.isdigit() or int(advert_id) <= 0:
+            raise ValueError("Geçerli bir ilan numarası girin; yalnızca rakam kullanın.")
+        if mode not in {"", "create", "edit"} or active not in {"true", "false"}:
+            raise ValueError("Eşleştirme işlemi veya durumu geçersiz.")
         data = {"name": name, "active": active == "true"}
         if components.strip():
-            data["components"] = json.loads(components)
+            try:
+                data["components"] = json.loads(components)
+            except ValueError:
+                raise ValueError("Paket servisleri okunamadı; formu kontrol edin.") from None
         else:
             data.update(panel=panel, service_id=service_id, quantity=quantity, platform=platform)
         binding = normalize_binding(data, settings.panels)
-        app.state.store.set_setting("binding:" + advert_id, binding)
+        store = app.state.store
+        if not mode:  # Existing clients keep their upsert behavior.
+            store.set_setting("binding:" + advert_id, binding)
+        else:
+            key, value = "binding:" + advert_id, json.dumps(binding, ensure_ascii=False)
+            with store.transaction() as conn:
+                if mode == "create":
+                    cursor = store.execute(conn, """INSERT INTO settings(key,value) VALUES (?,?)
+                        ON CONFLICT(key) DO NOTHING""", (key, value))
+                    if cursor.rowcount != 1:
+                        raise Conflict("Bu ilan zaten eşleştirilmiş. Mevcut ilan kartından Düzenle'yi seçin.")
+                else:
+                    current = store.execute(conn, "SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                    if not current or not secrets.compare_digest(
+                            binding_version(json.loads(current["value"])).encode(), version.encode()):
+                        raise Conflict("Eşleştirme başka bir ekranda değişmiş veya kaldırılmış. Sayfayı yenileyin.")
+                    cursor = store.execute(conn, "UPDATE settings SET value=? WHERE key=? AND value=?",
+                                           (value, key, current["value"]))
+                    if cursor.rowcount != 1:
+                        raise Conflict("Eşleştirme değişti; sayfayı yenileyip tekrar deneyin.")
+        if mode:
+            return RedirectResponse("/admin/services?saved=" + advert_id, 303)
         return RedirectResponse("/admin/services", 303)
 
     @app.post("/admin/services/delete", dependencies=[Depends(mutation)])
