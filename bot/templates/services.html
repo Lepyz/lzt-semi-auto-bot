@@ -1,59 +1,101 @@
 {% extends "base.html" %}
-{% macro component(p={}) %}
-<div class="component-row"><div class="grid">
-  <label>Panel<select data-field="panel">{% for key,panel in panels.items() %}<option value="{{ key }}" {{ 'selected' if p.get('panel')==key }}>{{ panel.name }}{{ ' · API eksik' if not panel.api_key }}</option>{% endfor %}</select></label>
-  <label>Servis ID<input data-field="service_id" value="{{ p.get('service_id','') }}" required pattern="[0-9]+" inputmode="numeric"></label>
-  <label>Adet<input data-field="quantity" type="number" min="1" max="1000000" value="{{ p.get('quantity',1000) }}" required></label>
-  {% set platforms = ['instagram','tiktok','youtube','x','twitch','kick','facebook','telegram','other'] %}
-  {# Keep an imported value selected; otherwise saving would silently change it. #}
-  {% if p.get('platform') and p.get('platform') not in platforms %}{% set platforms = [p.get('platform')] + platforms %}{% endif %}
-  <label>Platform<select data-field="platform">{% for platform in platforms %}<option {{ 'selected' if p.get('platform')==platform }}>{{ platform }}</option>{% endfor %}</select></label>
-  <label>Servis adı (isteğe bağlı)<input data-field="name" value="{{ p.get('name','') }}" placeholder="Takipçi / Beğeni"></label>
-</div><button type="button" data-remove>Bu servisi çıkar</button></div>
-{% endmacro %}
-{% macro binding_form(id='', b={}) %}
-<form method="post" action="/admin/services" data-binding>
-<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="components">
-<div class="grid">
-  <label>Itemsatış ilan ID<input name="advert_id" value="{{ id }}" required pattern="[0-9]+" inputmode="numeric" {{ 'readonly' if id }}></label>
-  <label>Ürün / paket adı<input name="name" value="{{ b.get('name','') }}"></label>
-  <label>Durum<select name="active"><option value="true" {{ 'selected' if b.get('active',True) }}>Aktif</option><option value="false" {{ 'selected' if not b.get('active',True) }}>Pasif</option></select></label>
-</div>
-<div data-components>{% for p in b.get('components',[{}]) %}{{ component(p) }}{% endfor %}</div>
-<p><button type="button" data-add>+ Servis ekle</button> <button class="primary">{{ 'Değişiklikleri kaydet' if id else 'Eşleştirmeyi kaydet' }}</button></p>
-</form>
-{% endmacro %}
 {% block content %}
-<h1>İlan–servis eşleştirmeleri</h1>
-<p class="muted">Bir ilan için bir servis seç. Paket oluşturmak için aynı ilana birden fazla servis ekleyebilirsin.</p>
-<div class="card"><h2>Yeni eşleştirme</h2>{{ binding_form() }}</div>
+<style>
+  [hidden]{display:none!important}
+  .mapping-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+  .mapping-head h1{margin:0}.mapping-head p{margin:8px 0 0}
+  .mapping-filters{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}
+  .mapping-filters button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:#1b3433}
+  .mapping-tools{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,230px);gap:16px}
+  .mapping-tools label{margin:0}.mapping-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:16px}
+  .mapping-card{margin:0;padding:20px;min-width:0;display:flex;flex-direction:column;gap:12px}
+  .mapping-card h2{margin:0;overflow-wrap:anywhere;line-height:1.4}.mapping-card p{margin:0}
+  .mapping-meta{display:flex;justify-content:space-between;gap:8px;align-items:center}
+  .mapping-parts{list-style:none;margin:0;padding:0;flex:1}
+  .mapping-parts li{padding:10px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+  .mapping-parts small{display:block}.mapping-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .mapping-actions button{flex:1}.mapping-editor{border-color:var(--accent);scroll-margin-top:16px}
+  .mapping-editor h2{margin:0}.mapping-editor header{display:flex;justify-content:space-between;align-items:start;gap:12px}
+  .mapping-editor .grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr))}
+  .mapping-component header{align-items:center}.mapping-component h3{margin:0;font-size:16px}
+  .mapping-component button{font-size:14px;padding:8px 12px}.mapping-editor input:read-only{color:var(--muted)}
+  .mapping-editor .notice{margin-bottom:0}.mapping-help{font-size:13px;margin:4px 0 0}
+  .mapping-preview{border:1px solid var(--accent);border-radius:10px;background:#122a27;padding:16px;margin:18px 0}
+  .mapping-preview h3{margin:0 0 10px}.mapping-preview p{margin:6px 0;overflow-wrap:anywhere}
+  .mapping-error{border-left:4px solid #ee9a85;padding:12px 16px;background:#3d2525;margin:16px 0;overflow-wrap:anywhere}
+  .mapping-saved{outline:2px solid var(--accent);outline-offset:2px}
+  .mapping-footer{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:18px}
+  .mapping-footer button{min-height:46px}.mapping-delete{margin-top:24px;border-top:1px solid var(--line);padding-top:12px}
+  .mapping-delete input{width:auto}.mapping-count{font-size:14px;margin:12px 0}
+  @media(max-width:650px){.mapping-tools{grid-template-columns:1fr}.mapping-editor header{flex-wrap:wrap}
+    .mapping-head>button{width:100%}.mapping-filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.mapping-footer{position:sticky;bottom:0;background:var(--card);padding:12px 0;z-index:2}
+    .mapping-footer button{flex:1}.mapping-card{padding:16px}.mapping-filters button{flex:1;white-space:nowrap}}
+</style>
+<div class="mapping-head">
+  <div><h1>İlan eşleştirmeleri</h1><p class="muted">İlanlarını bul, düzenle veya aynı ayarlarla yeni bir ilan ekle.</p></div>
+  <button type="button" class="primary" id="new-mapping">+ Yeni ilan bağla</button>
+</div>
+{% if saved in bindings %}<div class="notice" role="status">Eşleştirme kaydedildi. Kaydetmek mevcut siparişleri göndermez.</div>{% endif %}
+<noscript><div class="notice">Eşleştirme düzenleyicisini kullanmak için tarayıcında JavaScript'i etkinleştir.</div></noscript>
+<section class="card mapping-editor" id="mapping-editor" aria-labelledby="editor-title" hidden>
+  <header><div><h2 id="editor-title">Yeni ilan bağla</h2><p class="muted" id="editor-help"></p></div><button type="button" id="close-editor">Kapat</button></header>
+  <form method="post" action="/admin/services" id="mapping-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="components">
+    <input type="hidden" name="mode" value="create"><input type="hidden" name="version">
+    <div class="grid">
+      <label>Itemsatış ilan numarası<input name="advert_id" required pattern="[0-9]+" inputmode="numeric" maxlength="30" placeholder="Örn. 5895617"><span class="muted mapping-help">Bağlamak istediğin ilanın numarası.</span></label>
+      <label>İlan / paket adı<input name="name" maxlength="200" placeholder="Örn. Instagram 1.000 takipçi"></label>
+      <label>Eşleştirme durumu<select name="active"><option value="true">Aktif</option><option value="false">Pasif</option></select><span class="muted mapping-help">Pasif eşleştirmeler yeni otomatik gönderimlerde kullanılmaz.</span></label>
+    </div>
+    <div id="component-rows"></div>
+    <button type="button" id="add-component">+ Pakete servis ekle</button>
+    <p class="muted mapping-help">Tek servis yeterliyse ekleme yapmana gerek yok. Paket servisleri aynı hedef linkine uygun olmalı.</p>
+    <div class="mapping-error" id="mapping-error" role="alert" tabindex="-1" hidden></div>
+    <section class="mapping-preview" id="mapping-preview" aria-label="Eşleştirme özeti" hidden></section>
+    <div class="mapping-footer"><button type="button" id="show-preview">Özeti gör</button><button type="submit" class="primary" id="save-mapping">Eşleştirmeyi kaydet</button></div>
+    <p class="muted mapping-help">Bu işlem yalnızca ilan ayarını kaydeder; mevcut panel siparişlerini değiştirmez ve bekleyen siparişleri başlatmaz.</p>
+  </form>
+  <details class="mapping-delete" id="delete-section" hidden><summary>Eşleştirmeyi kaldır</summary>
+    <p>Bu ilanın eşleştirmesi kaldırılır. Kayıtlı siparişler korunur; panelde iptal yapılmaz.</p>
+    <form method="post" action="/admin/services/delete"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="advert_id" id="delete-advert">
+      <label><input type="checkbox" name="confirmed" value="yes" required> Bu eşleştirmeyi kaldırmak istiyorum.</label><button class="danger">Eşleştirmeyi kaldır</button>
+    </form>
+  </details>
+</section>
+<div class="card">
+  <div class="mapping-tools">
+    <label>İlan veya servis ara<input type="search" id="mapping-search" placeholder="İlan numarası, ürün adı veya servis numarası" autocomplete="off"></label>
+    <label>Panel<select id="panel-filter"><option value="">Bütün paneller</option>{% for key,panel in panels.items() %}<option value="{{ key }}">{{ panel.name }}</option>{% endfor %}</select></label>
+  </div>
+  <div class="mapping-filters" role="group" aria-label="Eşleştirme türü">
+    <button type="button" data-filter="all" aria-pressed="true">Tümü ({{ bindings|length }})</button>
+    <button type="button" data-filter="active" aria-pressed="false">Aktif</button><button type="button" data-filter="inactive" aria-pressed="false">Pasif</button><button type="button" data-filter="package" aria-pressed="false">Paketler</button>
+  </div>
+</div>
+<p class="muted mapping-count" id="mapping-count" aria-live="polite">{{ bindings|length }} eşleştirme</p>
+<div class="mapping-list" id="mapping-list">
 {% for id,b in bindings.items() %}
-<div class="card"><h2>{{ b.name or 'İlan ' ~ id }} <small>· {{ id }} · {{ 'Aktif' if b.active else 'Pasif' }}</small></h2>
-<div class="table-wrap"><table><thead><tr><th>Panel</th><th>Servis ID</th><th>Adet</th><th>Platform</th></tr></thead>
-<tbody>{% for p in b.components %}<tr><td>{{ panels.get(p.panel,{}).get('name',p.panel) }}</td><td>{{ p.service_id }}</td><td>{{ p.quantity }}</td><td>{{ p.platform }}</td></tr>{% endfor %}</tbody></table></div>
-<details><summary>Eşleştirmeyi düzenle</summary>{{ binding_form(id,b) }}</details>
-<details><summary>Eşleştirmeyi kaldır</summary><form method="post" action="/admin/services/delete"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="advert_id" value="{{ id }}"><p>Kayıtlı siparişlerin bilgileri korunur.</p><button class="danger">Bu eşleştirmeyi kaldır</button></form></details>
-</div>{% else %}<div class="card empty">Henüz eşleştirme yok. Geçişte mevcut Upstash eşleştirmeleri içe aktarılmalıdır.</div>{% endfor %}
-<template id="component-template">{{ component() }}</template>
-<script>
-document.querySelectorAll('[data-binding]').forEach(form=>{
-  const rows=form.querySelector('[data-components]');
-  const update=()=>rows.querySelectorAll('[data-remove]').forEach(button=>button.disabled=rows.children.length===1);
-  form.querySelector('[data-add]').addEventListener('click',()=>{
-    rows.append(document.getElementById('component-template').content.cloneNode(true));update();
-  });
-  rows.addEventListener('click',event=>{
-    const button=event.target.closest('[data-remove]');
-    if(button&&rows.children.length>1){button.closest('.component-row').remove();update();}
-  });
-  form.addEventListener('submit',()=>{
-    form.querySelector('[name=components]').value=JSON.stringify([...rows.children].map(row=>{
-      const result={};
-      row.querySelectorAll('[data-field]').forEach(input=>result[input.dataset.field]=input.value);
-      return result;
-    }));
-  });
-  update();
-});
-</script>
+  <article class="card mapping-card {{ 'mapping-saved' if saved==id }}" data-advert="{{ id }}">
+    <div class="mapping-meta"><small>İlan {{ id }}</small><span class="badge {{ 'submitted' if b.active else 'paused' }}">{{ 'Aktif' if b.active else 'Pasif' }}{{ ' · Paket' if b.components|length>1 }}</span></div>
+    <h2>{{ b.name or 'İlan ' ~ id }}</h2>
+    <ul class="mapping-parts">{% for p in b.components %}<li><strong>{{ panels.get(p.panel,{}).get('name',p.panel) }}</strong> · {{ p.quantity }} adet<small>Servis {{ p.service_id }} · {{ p.platform }}{% if p.name %} · {{ p.name }}{% endif %}</small></li>{% endfor %}</ul>
+    <div class="mapping-actions"><button type="button" data-edit="{{ id }}" aria-label="İlan {{ id }} eşleştirmesini düzenle">Düzenle</button><button type="button" data-copy="{{ id }}" aria-label="İlan {{ id }} eşleştirmesini kopyala">Kopyala</button></div>
+  </article>
+{% endfor %}
+</div>
+<div class="card empty" id="mapping-empty" {{ 'hidden' if bindings }}>Henüz eşleştirme yok. Yeni ilan bağla düğmesiyle istediğin ilanı ekleyebilirsin.</div>
+<template id="component-template">
+  <section class="component-row mapping-component">
+    <header><h3 data-row-title>Servis</h3><button type="button" data-remove>Servisi çıkar</button></header>
+    <div class="grid">
+      <label>Panel<select data-field="panel">{% for key,panel in panels.items() %}<option value="{{ key }}">{{ panel.name }}{{ ' · API bilgisi eksik' if not panel.api_key }}</option>{% endfor %}</select></label>
+      <label>Servis numarası<input data-field="service_id" required pattern="[0-9]+" inputmode="numeric" placeholder="Paneldeki servis numarası"></label>
+      <label>Adet<input data-field="quantity" type="number" min="1" max="1000000" step="1" value="1000" required inputmode="numeric"></label>
+      <label>Platform<select data-field="platform">{% for platform,label in [('instagram','Instagram'),('tiktok','TikTok'),('youtube','YouTube'),('x','X'),('twitch','Twitch'),('kick','Kick'),('facebook','Facebook'),('telegram','Telegram'),('other','Diğer')] %}<option value="{{ platform }}">{{ label }}</option>{% endfor %}</select></label>
+      <label>Servis adı (isteğe bağlı)<input data-field="name" maxlength="150" placeholder="Örn. Takipçi / Beğeni"></label>
+    </div>
+  </section>
+</template>
+<script type="application/json" id="mapping-data">{{ {'bindings':bindings,'versions':versions}|tojson }}</script>
+<script src="/admin/assets/services.js" defer></script>
 {% endblock %}
