@@ -10,9 +10,15 @@
   <button class="primary">Ara</button>
   <details {{ 'open' if selected }}><summary>Duruma göre filtrele</summary><label>Durum<select name="state"><option value="">Bu bölümdeki bütün durumlar</option>{% for key,label in labels.items() if key!='legacy' %}<option value="{{ key }}" {{ 'selected' if selected==key }}>{{ label }}</option>{% endfor %}</select></label><p><button>Filtreyi uygula</button></p></details>
 </form>
+<section class="card cleanup-toolbar" data-cleanup-ui hidden aria-label="Toplu kayıt temizleme">
+  <div class="order-actions"><strong id="cleanup-count" aria-live="polite">0 kayıt seçili</strong><button type="button" id="cleanup-select">Bu listedeki uygunları seç</button><button type="button" id="cleanup-clear">Seçimi kaldır</button></div>
+  <div class="order-actions"><button type="button" data-cleanup-action="close" data-cleanup-bulk disabled>Seçilenleri kapat</button><button type="button" class="danger" data-cleanup-action="delete" data-cleanup-bulk disabled>🗑️ Seçilenleri sil</button></div>
+  <p class="order-check">Kapat: Gönderimi bırakır, kaydı sonuçlananlara taşır. Sil: Ayrıntıları temizler ve listeden kaldırır. Aktif veya belirsiz siparişler seçilemez. SMM panelinde iptal veya iade yapılmaz.</p>
+</section>
 <div class="order-grid">
 {% for o in orders %}{% set v = o.display %}
 <article class="card order-card">
+  {% if o.cleanup.delete %}<label class="cleanup-choice" data-cleanup-ui hidden><input type="checkbox" class="cleanup-pick" value="{{ o.id }}:{{ o.revision }}" data-can-close="{{ 'yes' if o.cleanup.close else 'no' }}" data-cleanup-label="{{ o.itemsatis_id or o.id[:10] }} · {{ o.product_name or 'İlan ' ~ o.advert_id }}" aria-label="{{ o.itemsatis_id or o.id[:10] }} numaralı kaydı seç"> Bu kaydı seç</label>{% endif %}
   <div class="order-meta"><span class="state-badge tone-{{ v.tone }}">{{ v.icon }} {{ v.title }}</span>{% if o.handling %}<small>👀 İlgileniyorum</small>{% endif %}</div>
   <h2>{{ o.product_name or 'İlan ' ~ o.advert_id }}</h2>
   <p class="order-id">Kayıt {{ o.itemsatis_id or o.id[:10] }} · İlan {{ o.advert_id }}<br>{{ o.created_at|date }}</p>
@@ -28,6 +34,8 @@
     {% elif v.issue=='panel_config' %}<a class="button" href="/admin/integrations">Bağlantıları aç</a>
     {% elif v.issue in ['service','quantity','package_target'] %}<a class="button" href="/admin/services?edit={{ o.advert_id }}">İlan ayarını düzelt</a>{% endif %}
     <a class="button" href="/admin/orders/{{ o.id }}">Ayrıntıyı aç</a>
+    {% if o.cleanup.close %}<button type="button" data-cleanup-ui hidden data-cleanup-action="close" data-cleanup-one="{{ o.id }}:{{ o.revision }}">Kaydı kapat</button>{% endif %}
+    {% if o.cleanup.delete %}<button type="button" class="danger" data-cleanup-ui hidden data-cleanup-action="delete" data-cleanup-one="{{ o.id }}:{{ o.revision }}">🗑️ Sil</button>{% else %}<small>🔒 Aktif veya belirsiz kayıt temizlenemez.</small>{% endif %}
   </div>
 </article>
 {% else %}<div class="card empty">Bu bölüm ve filtrede kayıt yok.</div>{% endfor %}
@@ -37,4 +45,16 @@
   <p>Aktif işlemler yaklaşık {{ active_minutes }} dakikada bir, başka siparişi bekletenler {{ blocked_minutes }} dakikada bir kontrol edilir. İstersen sipariş ayrıntısından kontrol isteyebilirsin.</p>
   <form method="post" action="/admin/pause"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="paused" value="{{ 'false' if paused else 'true' }}"><button>{{ 'Yeni gönderimleri etkinleştir' if paused else 'Yeni gönderimleri duraklat' }}</button></form>
 </details>
+<dialog id="cleanup-dialog" aria-labelledby="cleanup-title">
+  <form method="post" action="/admin/order-cleanup" class="order-form" id="cleanup-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="action" id="cleanup-action">
+    <input type="hidden" name="view" value="{{ section }}"><input type="hidden" name="q" value="{{ query }}"><input type="hidden" name="state" value="{{ selected }}">
+    <div id="cleanup-selection"></div><h2 id="cleanup-title"></h2><p id="cleanup-explanation"></p>
+    <details><summary>Seçilen kayıtları göster</summary><ul id="cleanup-records"></ul></details>
+    <p>SMM panelindeki siparişlere iptal veya iade isteği gönderilmez.</p>
+    <label><input type="checkbox" name="confirmed" value="yes" required> Seçtiğim kayıtlar için bu işlemi onaylıyorum.</label>
+    <div class="order-actions"><button type="button" id="cleanup-cancel">Vazgeç</button><button class="danger" id="cleanup-submit">Onayla</button></div>
+  </form>
+</dialog>
+<p id="copy-feedback" role="status" aria-live="polite"></p><script src="/admin/assets/orders.js" defer></script>
 {% endblock %}

@@ -38,9 +38,13 @@
   <p><a class="button" href="/admin/services?edit={{ order.advert_id }}">İlan ayarını aç</a></p>
   <form method="post" action="/admin/orders/{{ order.id }}/repair" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><label>Müşteri linki<input name="link" value="{{ link }}" required placeholder="https://..."></label><p><button>Bilgileri kaydet ve eşleştirmeyi yenile</button></p></form>
 </section>{% endif %}
-{% if order.state in manual_states and not order.parts|selectattr('state','in',['submitted','sending','uncertain'])|list %}
+{% if cleanup.close %}
 <details class="card"><summary>Bu kaydı göndermeden kapat</summary><p>Bu işlem yalnızca botun kaydı takibini kapatır. Panelde iptal veya para iadesi yapmaz.</p>
   <form method="post" action="/admin/orders/{{ order.id }}/close" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><label><input type="checkbox" name="confirmed" value="yes" required> Kaydı yeni gönderim yapmadan kapatmak istiyorum.</label><p><button class="danger">Göndermeden kapat</button></p></form>
+</details>{% endif %}
+{% if cleanup.delete %}<details class="card"><summary>🗑️ Bu kaydı sil</summary><p>Kayıt listeden kaldırılır; müşteri linki, ürün ve panel ayrıntıları silinir. Bu işlem geri alınamaz. Aynı bildirimden tekrar sipariş açılmasını engelleyen kimlik korunur.</p>
+  <p>Gönderilmemiş bir kayıt silinirse artık gönderilemez. SMM panelinde iptal veya iade yapılmaz.</p>
+  <form method="post" action="/admin/order-cleanup" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="selected" value="{{ order.id }}:{{ order.revision }}"><input type="hidden" name="action" value="delete"><input type="hidden" name="view" value="all"><label><input type="checkbox" name="confirmed" value="yes" required> Bu kaydın ayrıntılarını silmek istiyorum.</label><p><button class="danger">🗑️ Kaydı sil</button></p></form>
 </details>{% endif %}
 <div id="reconcile">
 {% for p in order.parts %}{% if p.state in ['uncertain','sending'] %}

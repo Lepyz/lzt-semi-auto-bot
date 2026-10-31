@@ -385,16 +385,12 @@ class Engine:
         self.store.save(order)
 
     def close_unsubmitted(self, order_id, revision):
-        order = self.store.get(order_id)
-        if not order or order["revision"] != revision or order["state"] not in MANUAL_STATES:
-            raise Conflict("Sipariş değişti veya kapatmaya uygun değil.")
-        if any(p["state"] in {"submitted", "sending", "uncertain"} for p in order["parts"]):
-            raise ValueError("Aktif veya belirsiz panel siparişi varken bu kayıt kapatılamaz.")
-        order.update(state="closed", manual_required=True, error="Yönetici tarafından gönderilmeden kapatıldı.")
-        self.store.save(order)
-        if order["target"]:
-            self.store.release_target(order["target"], order["id"])
-            self.make_ready(order["target"], order)
+        self.cleanup([(order_id, revision)], "close")
+
+    def cleanup(self, selections, action):
+        targets = self.store.cleanup_orders(selections, action)
+        for target in targets:
+            self.make_ready(target)
 
     def reconcile(self, order_id, index, smm_id="", confirmed_absent=False, revision=None):
         order = self.store.get(order_id)
