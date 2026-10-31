@@ -6,12 +6,17 @@ Each order update uses optimistic concurrency. Target locks survive restarts.
 import json
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .presentation import cleanup_actions
+
+# Neon Free suspends compute after 5 idle minutes; every query restarts that timer.
+NEON_IDLE_SECONDS = 300
 
 
 class Conflict(Exception):
@@ -31,9 +36,67 @@ class Store:
                 raise ValueError("Render'da geçici SQLite kullanılamaz; DATABASE_URL PostgreSQL olmalı.")
             self.path = url.removeprefix("sqlite:///")
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        # In-memory estimate of how long these queries keep Neon's compute running.
+        self.usage_lock = threading.Lock()
+        self.usage = {"since": time.time(), "transactions": 0, "wakes": 0,
+                      "awake_seconds": 0.0, "awake_until": 0.0}
+
+    def _touch(self, start):
+        now = time.time()
+        with self.usage_lock:
+            usage = self.usage
+            if start:
+                usage["transactions"] += 1
+                if now >= usage["awake_until"]:
+                    usage["wakes"] += 1
+                    usage["awake_until"] = now  # Compute starts (or resumes) here.
+            # Compute stays up for the whole transaction and 5 idle minutes after it.
+            end = now + NEON_IDLE_SECONDS
+            if end > usage["awake_until"]:
+                usage["awake_seconds"] += end - usage["awake_until"]
+                usage["awake_until"] = end
+
+    def usage_report(self):
+        """Memory only: reading the estimate must not wake the database itself."""
+        now = time.time()
+        with self.usage_lock:
+            usage = dict(self.usage)
+        pending = max(0.0, usage["awake_until"] - now)
+        awake = max(0.0, usage["awake_seconds"] - pending)
+        elapsed = max(1.0, now - usage["since"])
+        return {"postgres": self.postgres, "since": usage["since"], "elapsed": elapsed, "awake": awake,
+                "ratio": min(1.0, awake / elapsed), "wakes": usage["wakes"],
+                "transactions": usage["transactions"], "awake_now": pending > 0}
+
+    def storage_report(self):
+        """One short read, only when the admin opens the usage page."""
+        local = datetime.now(timezone(timedelta(hours=3)))
+        month = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        with self.transaction() as conn:
+            def count(sql, params=()):
+                return int(self.execute(conn, sql, params).fetchone()["count"])
+            counts = {"orders": count("SELECT COUNT(*) AS count FROM orders WHERE state<>'deleted'"),
+                      "this_month": count("SELECT COUNT(*) AS count FROM orders WHERE state<>'deleted' AND created_at>=?",
+                                          (int(month.timestamp() * 1_000_000),)),
+                      "notifications": count("SELECT COUNT(*) AS count FROM notifications"),
+                      "bindings": count("SELECT COUNT(*) AS count FROM settings WHERE key LIKE ?", ("binding:%",))}
+            if self.postgres:
+                size = self.execute(conn, "SELECT pg_database_size(current_database()) AS size").fetchone()["size"]
+            else:
+                size = sum(os.path.getsize(p) for p in (self.path, self.path + "-wal") if os.path.exists(p))
+        return {"bytes": int(size), "counts": counts}
 
     @contextmanager
     def transaction(self):
+        self._touch(start=True)
+        try:
+            with self._connection() as conn:
+                yield conn
+        finally:
+            self._touch(start=False)
+
+    @contextmanager
+    def _connection(self):
         if self.postgres:
             import psycopg
             from psycopg.rows import dict_row

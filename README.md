@@ -36,10 +36,45 @@ Komut cevapları veritabanına yazılmaz.
 
 Aktif panel siparişleri varsayılan 30 dakikada (`ACTIVE_CHECK_INTERVAL_SECONDS`),
 yeni satın almayı engelleyenler 15 dakikada (`BLOCKED_CHECK_INTERVAL_SECONDS`) kontrol edilir.
+Kontroller her siparişin kendi saatinde değil, ortak zaman dilimlerinde toplu yapılır
+(30 dakikalık dilimler 15 dakikalıkların üzerine denk gelir). Panel durumu bellekteki
+son durumla aynıysa veritabanı hiç açılmaz; yalnızca durum değiştiğinde, sipariş
+sonuçlandığında veya panel üç kez cevap vermediğinde kayıt okunup yazılır.
 Aynı linkteki bekleyenler tek kontrolü paylaşır. Zamanlama bellektedir; hiçbir
 kontrolün zamanı gelmemişse monitör SQL veya panel sorgusu yapmaz. Açılıştaki tek
 seferlik kurtarma işlemi dışında aktif/bekleyen kayıt yokken arka plan sorgusu yoktur.
 Admin sayfaları kendiliğinden veritabanı yenilemesi yapmaz.
+
+## Ücretsiz kota (Neon + Render + UptimeRobot)
+
+Yönetim panelindeki **Kota** sayfası (`/admin/usage`) bu açılıştan beri bellekte
+tutulan tahminleri gösterir: Neon compute'unun ne kadar uyanık kaldığı ve ay sonu
+CU-saat tahmini, veritabanı boyutu, UptimeRobot'tan son /health isteği, takipteki
+sipariş sayısı ve sonraki kontrol saati. Sayfa yalnızca açıldığında tek kısa okuma
+yapar. Telegram `/durum` da sonraki kontrolü ve (6 saatlik veriden sonra) Neon tahminini yazar.
+
+- **Neon Free:** proje başına ayda 100 CU-saat, 0.5 GB depolama, 5 GB çıkış trafiği.
+  Compute son sorgudan 5 dakika sonra uyur ve uyurken saat harcamaz. Sınır aşılırsa
+  compute ay sonuna kadar durur ve webhooklar kaydedilemez. 0.25 CU sürekli açık
+  kalırsa ayda ~182 CU-saat eder; bu yüzden her sorgu önemlidir.
+  - Compute boyutunu 0.25 CU'ya sabitle (autoscaling en az/en çok 0.25).
+  - Neon bölgesini Render'a yakın seç (ör. ikisi de Frankfurt).
+  - Neon SQL Editor gibi dış sorgular da compute'u uyandırır ve tahmine dahil değildir.
+  - Kota sayfasında oran %60'ı geçerse kontrol aralıklarını uzat
+    (örn. `ACTIVE_CHECK_INTERVAL_SECONDS=3600`, `BLOCKED_CHECK_INTERVAL_SECONDS=1800`;
+    biri diğerinin katı olursa dilimler çakışır).
+- **Render Free:** çalışma alanı başına ayda 750 saat; tek servis 7/24 açık ≈ 720–744 saat.
+  İkinci bir ücretsiz servisi sürekli açık tutma: saatler ortak harcanır ve bitince
+  bütün ücretsiz servisler ay sonuna kadar durur. 15 dakika trafik almayan servis uyur.
+- **UptimeRobot Free:** 5 dakikalık aralık. Tek HTTP(s) monitörü yeterli: adres
+  `/health`, yöntem HEAD. /health veritabanına veya panele gitmez. Arka plan işleri
+  (kontrol veya Telegram iş parçacığı) durmuşsa 503 döner; UptimeRobot e-postası gelir.
+  Render'da Health Check Path olarak da `/health` girilebilir. UptimeRobot'un ücretsiz
+  planı kişisel kullanım için tanımlanıyor; ticari kullanım koşullarını kendi
+  sözleşmesinden kontrol et.
+
+Sipariş listesi varsayılan olarak son 100 kaydı gösterir; «Daha fazla kayıt göster»
+500 kayda çıkar. Böylece her yenilemede Neon'dan ve Render'dan daha az veri taşınır.
 
 ## Mobil yönetim ve az bildirim
 
@@ -115,9 +150,10 @@ garantisi yoktur. Güncel koşullar: https://neon.com/pricing
    webhookları tekrar göndermesi doğrulanmadan uçtan uca sipariş kaybı garantisi verilemez.
 6. İlan-servis/paket eşleştirmelerini ve içe alınan SMM kimliklerini kontrol et.
    Ardından yeni gönderimleri admin panelinden etkinleştir.
-7. UptimeRobot adresi /health veya /test olsun. Eski check-orders /
+7. UptimeRobot adresi /health veya /test olsun (HEAD, 5 dakika). Eski check-orders /
    check-services / check-balances adresleri de artık yalnızca hafif ayakta olma
-   cevabı verir. Bu adresler veritabanı veya panel çağırmaz.
+   cevabı verir. Bu adresler veritabanı veya panel çağırmaz; arka plan işleri
+   durmuşsa 503 döner.
 8. Telegram için aşağıdaki kurulumu tamamla. Geçiş doğrulandıktan sonra Render'dan
    Upstash değişkenlerini kaldırabilirsin. Kaynak verileri hemen silme.
 

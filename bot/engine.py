@@ -1,5 +1,6 @@
 import copy
 import logging
+import math
 import threading
 import time
 import uuid
@@ -57,9 +58,23 @@ class Engine:
         self.check_results = {}
         self.check_failures = {}
         self.recent_checks = {}
+        # Submitted parts of each active order, so a due check can ask the panel
+        # first and read the database only when the answer changes something.
+        self.snapshots = {}
+        self.stats = {"panel_checks": 0, "quiet_checks": 0}
         self.running = set()
         self.recover_at = None
         self.monitor = None
+
+    @staticmethod
+    def slot(interval):
+        """Next shared boundary at least half an interval away.
+
+        Neon keeps compute running for 5 minutes after every query. Orders checked
+        on their own timers would keep it awake all day; on shared boundaries
+        every due check happens in one wake-up.
+        """
+        return math.ceil((time.monotonic() + interval / 2) / interval) * interval
 
     def notice(self, order, event, text, action=False):
         # The revision makes each transition notify once, including a re-entry
@@ -182,7 +197,7 @@ class Engine:
                   self.summary(order) + "\n" + reason)
         if monitor:
             with self.guard:
-                self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
+                self.watch.setdefault(order["target"], self.slot(self.settings.check_interval))
 
     def execute(self, order_id):
         order = self.store.get(order_id)
@@ -259,9 +274,14 @@ class Engine:
         self.schedule_active(order)
         if self.store.orders(states={"waiting"}, target=order["target"], limit=1):
             with self.guard:
-                self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
+                self.watch.setdefault(order["target"], self.slot(self.settings.check_interval))
 
-    def refresh(self, order_id, force=True):
+    def refresh(self, order_id, force=True, results=None):
+        """Apply panel statuses to the stored order.
+
+        ``results`` holds answers already fetched by poll(), keyed by
+        (panel, smm_id), so a changed status is not requested twice.
+        """
         order = self.store.get(order_id)
         if not order:
             raise ValueError("Sipariş bulunamadı.")
@@ -278,7 +298,12 @@ class Engine:
         for part in order["parts"]:
             if part["state"] != "submitted":
                 continue
-            result = self.panels.status(part)
+            known = (part["panel"], part["smm_id"])
+            if results is not None and known in results:
+                result = results[known]
+            else:
+                result = self.panels.status(part)
+                self.stats["panel_checks"] += 1
             if not result:
                 continue
             checked = True
@@ -375,6 +400,7 @@ class Engine:
             raise Conflict("Sipariş değişti veya düzenlemeye uygun değil.")
         if any(p["state"] in {"submitted", "finished", "sending", "uncertain"} for p in order["parts"]):
             raise ValueError("Panele iletilen paket bileşenleri yeniden yazılamaz.")
+        previous_target = order.get("target", "")
         order.update(parts=[], link=link.strip(), links={p: link.strip() for p in (*order["links"], "other")},
                      state="review", manual_required=True, error="", reason_code="")
         # Include all known platforms so a newly added binding can use the corrected link.
@@ -383,6 +409,13 @@ class Engine:
         self.prepare(order)
         order["state"] = "review"
         self.store.save(order)
+        self.unwatch_if_idle(previous_target)
+
+    def unwatch_if_idle(self, target):
+        """Blocked-order polling only lasts while a purchase is actually waiting."""
+        if target and not self.store.orders(states={"waiting"}, target=target, limit=1):
+            with self.guard:
+                self.watch.pop(target, None)
 
     def close_unsubmitted(self, order_id, revision):
         self.cleanup([(order_id, revision)], "close")
@@ -391,6 +424,7 @@ class Engine:
         targets = self.store.cleanup_orders(selections, action)
         for target in targets:
             self.make_ready(target)
+            self.unwatch_if_idle(target)
 
     def reconcile(self, order_id, index, smm_id="", confirmed_absent=False, revision=None):
         order = self.store.get(order_id)
@@ -426,17 +460,68 @@ class Engine:
         self.schedule_active(order)
         if any(p["state"] == "submitted" for p in order["parts"]) and self.store.orders(states={"waiting"}, target=order["target"], limit=1):
             with self.guard:
-                self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
+                self.watch.setdefault(order["target"], self.slot(self.settings.check_interval))
         if not any(p["state"] in {"submitted", "uncertain", "sending"} for p in order["parts"]):
             self.store.release_target(order["target"], order["id"])
             self.make_ready(order["target"], order)
 
     def schedule_active(self, order):
         with self.guard:
-            if any(p["state"] == "submitted" for p in order["parts"]):
-                self.active_checks[order["id"]] = time.monotonic() + self.settings.active_check_interval
+            submitted = [copy.deepcopy(p) for p in order["parts"] if p["state"] == "submitted"]
+            if submitted:
+                self.active_checks[order["id"]] = self.slot(self.settings.active_check_interval)
+                self.snapshots[order["id"]] = {"parts": submitted, "target": order.get("target", ""),
+                                               "status_error": bool(order.get("status_error"))}
             else:
                 self.active_checks.pop(order["id"], None)
+                self.snapshots.pop(order["id"], None)
+                self.recent_checks.pop(order["id"], None)
+                self.check_failures.pop(order["id"], None)
+
+    def poll(self, order_id):
+        """Ask the panel using the in-memory snapshot, without any SQL.
+
+        Returns None when the database has nothing to learn (status unchanged,
+        or checked moments ago). Otherwise returns the answers for refresh();
+        an empty dict means there is no snapshot and refresh() must ask itself.
+        """
+        with self.guard:
+            snapshot = self.snapshots.get(order_id)
+            if snapshot is None:
+                return {}
+            now = time.monotonic()
+            if now - self.recent_checks.get(order_id, -1000) < 90:
+                return None
+            self.recent_checks[order_id] = now
+        results, failed, changed = {}, 0, False
+        for part in snapshot["parts"]:
+            result = self.panels.status(part)
+            self.stats["panel_checks"] += 1
+            results[(part["panel"], part["smm_id"])] = result
+            if not result:
+                failed += 1
+            elif result["terminal"] or result["status"] != part.get("status"):
+                changed = True
+        if changed:
+            return results
+        # Same bookkeeping refresh() does, as long as no stored field would change.
+        with self.guard:
+            failures = self.check_failures.get(order_id, 0)
+            if not failed and not snapshot["status_error"]:
+                self.check_failures.pop(order_id, None)
+                self.check_results[order_id] = {"at": time.time(), "ok": True}
+            elif failed and (snapshot["status_error"] or failures + 1 < 3):
+                self.check_failures[order_id] = failures + 1
+                self.check_results[order_id] = {"at": time.time(), "ok": False}
+            else:
+                return results  # A status warning must be stored or cleared.
+            self.stats["quiet_checks"] += 1
+        return None
+
+    def check(self, order_id):
+        results = self.poll(order_id)
+        if results is not None:
+            self.refresh(order_id, force=bool(results), results=results)
 
     def check_due(self):
         # Memory-only scheduling: no database queries when nothing is due.
@@ -444,25 +529,38 @@ class Engine:
             active_due = [key for key, when in self.active_checks.items() if when <= time.monotonic()][:10]
         for key in active_due:
             try:
-                self.refresh(key, force=False)
+                self.check(key)
                 with self.guard:
                     if key in self.active_checks:
-                        self.active_checks[key] = time.monotonic() + self.settings.active_check_interval
+                        self.active_checks[key] = self.slot(self.settings.active_check_interval)
             except Exception as exc:
                 logger.error("active_check_failed type=%s", type(exc).__name__)
                 with self.guard:
-                    self.active_checks[key] = time.monotonic() + self.settings.active_check_interval
+                    self.active_checks[key] = self.slot(self.settings.active_check_interval)
         with self.guard:
             due = [t for t, when in self.watch.items() if when <= time.monotonic()]
         for target in due:
             try:
+                with self.guard:
+                    owners = [key for key, snap in self.snapshots.items() if snap["target"] == target]
+                answers, needs_db = {}, not owners
+                for key in owners:
+                    found = self.poll(key)
+                    if found is not None:
+                        needs_db = True
+                        answers.update(found)
+                if not needs_db:
+                    # The blocking order is still running unchanged: no SQL needed.
+                    with self.guard:
+                        self.watch[target] = self.slot(self.settings.check_interval)
+                    continue
                 if not self.store.orders(states={"waiting"}, target=target, limit=1):
                     with self.guard:
                         self.watch.pop(target, None)
                     continue
                 owner = self.active_owner(target)
                 if owner:
-                    self.refresh(owner, force=False)
+                    self.refresh(owner, force=bool(answers), results=answers or None)
                 else:
                     self.make_ready(target)
                 # Query only while an actual active order blocks another purchase.
@@ -471,13 +569,13 @@ class Engine:
                 owner_order = self.store.get(owner) if owner else None
                 with self.guard:
                     if blocked and owner_order and any(p["state"] == "submitted" for p in owner_order["parts"]):
-                        self.watch[target] = time.monotonic() + self.settings.check_interval
+                        self.watch[target] = self.slot(self.settings.check_interval)
                     else:
                         self.watch.pop(target, None)
             except Exception as exc:
                 logger.error("blocked_check_failed type=%s", type(exc).__name__)
                 with self.guard:
-                    self.watch[target] = time.monotonic() + self.settings.check_interval
+                    self.watch[target] = self.slot(self.settings.check_interval)
 
     def start(self):
         # One Uvicorn worker is required. Queued claims are compare-and-swap, so
@@ -485,11 +583,11 @@ class Engine:
         for order in self.store.orders(states={"queued"}, limit=100000):
             self.enqueue(order["id"])
         for order in self.store.orders(states={"waiting"}, limit=100000):
-            self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
+            self.watch.setdefault(order["target"], self.slot(self.settings.check_interval))
         for order in self.store.orders(states={"submitted", "error"}, limit=100000):
             self.schedule_active(order)
         self.recover_at = time.monotonic() + RECOVERY_DELAY
-        self.monitor = threading.Thread(target=self._monitor, daemon=True)
+        self.monitor = threading.Thread(target=self._monitor, daemon=True, name="monitor")
         self.monitor.start()
 
     def recover(self):
@@ -544,7 +642,19 @@ class Engine:
                 except Exception as exc:
                     logger.error("recovery_failed type=%s", type(exc).__name__)
                     self.recover_at = time.monotonic() + RECOVERY_DELAY
-            self.check_due()  # No SQL at all when self.watch is empty.
+            try:
+                self.check_due()  # No SQL at all when nothing is due.
+            except Exception as exc:
+                # A dead monitor would silently stop every status check.
+                logger.error("monitor_failed type=%s", type(exc).__name__)
+
+    def next_check(self):
+        """Wall-clock time of the next scheduled panel check, from memory only."""
+        with self.guard:
+            pending = list(self.active_checks.values()) + list(self.watch.values())
+        if not pending:
+            return None
+        return time.time() + max(0.0, min(pending) - time.monotonic())
 
     def close(self):
         self.stop_event.set()

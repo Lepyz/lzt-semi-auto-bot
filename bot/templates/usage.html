@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  .quota-bar{height:10px;border-radius:6px;background:#101925;border:1px solid var(--line);overflow:hidden;margin:6px 0 10px}
+  .quota-bar span{display:block;height:100%}.fill-success{background:#3aa58a}.fill-warning{background:#d6a93f}.fill-danger{background:#d0644f}
+  .quota-card ul{padding-left:20px}.quota-card li{margin:6px 0}.quota-card .grid p{margin:4px 0}
+  .quota-card .grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+</style>
+<h1>Ücretsiz kota</h1>
+<p class="muted">Bu sayfa yalnızca sen açtığında tek kısa veritabanı okuması yapar ve kendiliğinden yenilenmez.
+  Tahminler bu açılıştan beri bellekte tutulur; yeniden dağıtımda sıfırlanır.</p>
+
+<section class="card quota-card"><h2>🐘 Neon (PostgreSQL)</h2>
+  {% if not usage.postgres %}<p class="muted">Yerel SQLite kullanılıyor. Neon tahmini yalnızca PostgreSQL ile anlamlıdır.</p>{% endif %}
+  <p><small>Compute — ay sonu tahmini ({{ limits.NEON_MIN_CU }} CU)</small><br>
+  {% if neon.reliable %}
+    <strong>~{{ "%.0f"|format(neon.cu_hours) }} / {{ limits.NEON_FREE_CU_HOURS }} CU-saat</strong> (%{{ "%.0f"|format(neon.percent) }})</p>
+  <div class="quota-bar" role="img" aria-label="Compute kullanımı yüzde {{ '%.0f'|format(neon.percent) }}"><span class="fill-{{ neon.tone }}" style="width:{{ [neon.percent, 100]|min }}%"></span></div>
+  {% else %}
+    <strong>Veri toplanıyor</strong> ({{ "%.1f"|format(neon.elapsed_hours) }} / 6 saat)</p>
+  {% endif %}
+  <p class="order-check">Bu açılıştan beri geçen {{ "%.1f"|format(neon.elapsed_hours) }} saatin yaklaşık
+    {{ "%.1f"|format(neon.awake_hours) }} saatinde veritabanı uyanıktı ({{ usage.wakes }} uyanma, {{ usage.transactions }} işlem).
+    {% if not neon.reliable %}Açılış sorguları ilk saatleri olduğundan yüksek gösterir; aylık tahmin 6 saat sonra çıkar.{% endif %}
+    {% if usage.awake_now %}Şu an uyanık; son sorgudan 5 dakika sonra uyuyacak.{% endif %}</p>
+  {% if counts %}
+  <p><small>Depolama</small><br><strong>{{ "%.1f"|format(neon.storage_mb) }} MB / 512 MB</strong> (%{{ "%.0f"|format(neon.storage_percent) }})</p>
+  <div class="quota-bar" role="img" aria-label="Depolama kullanımı yüzde {{ '%.0f'|format(neon.storage_percent) }}"><span class="fill-{{ neon.storage_tone }}" style="width:{{ [neon.storage_percent, 100]|min }}%"></span></div>
+  <p class="order-check">{{ counts.orders }} kayıt · bu ay {{ counts.this_month }} sipariş · {{ counts.bindings }} ilan eşleştirmesi · {{ counts.notifications }} bildirim anahtarı</p>
+  {% else %}
+  <p class="error-text">⚠️ Veritabanına şu an ulaşılamadı. Neon kotası dolmuş (compute ay sonuna kadar durur) veya bağlantı
+    sorunu olabilir. Neon konsolundaki kullanım ekranını kontrol et; webhooklar kaydedilemiyor olabilir.</p>
+  {% endif %}
+  <details><summary>Neon ayar önerileri</summary><ul>
+    <li>Compute boyutunu {{ limits.NEON_MIN_CU }} CU'ya sabitle (autoscaling en az ve en çok {{ limits.NEON_MIN_CU }}). Daha büyük compute aynı sürede daha çok CU-saat harcar.</li>
+    <li>Neon bölgesini Render bölgesine yakın seç (örneğin ikisi de Frankfurt). Her işlem daha kısa sürer.</li>
+    <li>Neon konsolundaki SQL Editor ve başka araçların sorguları da compute'u uyandırır; bu tahmine dahil değildir.</li>
+    <li>Sınır aşılırsa Neon compute'u ay sonuna kadar durdurur ve yeni webhooklar kaydedilemez. Oran %60'ı geçerse kontrol aralıklarını uzat.</li>
+  </ul></details>
+</section>
+
+<section class="card quota-card"><h2>🚀 Render</h2>
+  <p><small>Bu açılış</small><br><strong>{{ "%.1f"|format(render.uptime_hours) }} saattir çalışıyor</strong></p>
+  <p>Ücretsiz plan çalışma alanı başına ayda {{ limits.RENDER_FREE_HOURS }} saat verir. Bu ay {{ render.full_month_hours }} saat;
+    tek servis 7/24 açık kalırsa {% if render.fits %}{{ render.spare_hours }} saat artar.{% else %}sınır aşılır.{% endif %}</p>
+  <p class="order-check">İkinci bir ücretsiz servisi sürekli açık tutma: saatler ortak harcanır, bitince bütün ücretsiz servisler ay sonuna kadar durur.</p>
+</section>
+
+<section class="card quota-card"><h2>📡 UptimeRobot</h2>
+  <p><small>Son ayakta kontrolü</small><br><strong>{% if uptime.last %}{{ uptime.last|clock }} ({{ "%.0f"|format(uptime.silent_minutes) }} dk önce){% else %}Bu açılıştan beri gelmedi{% endif %}</strong>
+    · {{ uptime.hits }} istek</p>
+  {% if uptime.warning %}<p class="error-text">⚠️ 10 dakikadan uzun süredir /health isteği gelmedi. Render 15 dakika trafik almazsa uyur:
+    o sırada kontroller durur, ilk webhook gecikebilir.</p>{% endif %}
+  <p class="order-check">Önerilen: tek HTTP(s) monitörü, adres /health, yöntem HEAD, aralık 5 dakika. /health veritabanına veya panele gitmez.
+    Arka plan işleri durursa 503 döner; UptimeRobot e-postasıyla haberin olur.</p>
+</section>
+
+<section class="card quota-card"><h2>🔁 Panel kontrol planı</h2>
+  <div class="grid">
+    <p><small>Takipteki aktif sipariş</small><br><strong>{{ checks.active }}</strong></p>
+    <p><small>Bekletilen hedef</small><br><strong>{{ checks.watched }}</strong></p>
+    <p><small>Sonraki kontrol</small><br><strong>{{ checks.next|clock if checks.next else 'Planlı kontrol yok' }}</strong></p>
+    <p><small>Panel durum sorgusu</small><br><strong>{{ checks.panel_checks }}</strong></p>
+    <p><small>Veritabanı açılmadan biten kontrol</small><br><strong>{{ checks.quiet_checks }}</strong></p>
+  </div>
+  <p class="order-check">Kontroller ortak zaman dilimlerinde toplu yapılır (aktif {{ active_minutes }} dk, bekletilen {{ blocked_minutes }} dk);
+    veritabanı her sipariş için ayrı uyanmaz. Panel durumu değişmediyse veritabanı hiç açılmaz.</p>
+</section>
+{% endblock %}
