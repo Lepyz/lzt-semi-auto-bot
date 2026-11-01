@@ -446,3 +446,31 @@ def test_purchase_in_unknown_format_is_saved_once_and_visible(client, rig):
     assert order["state"] == "review" and not rig.panels.adds
     assert not rig.notices  # no advert, so no Telegram alert storm
     assert first["id"] in client.get("/admin").text  # visible in the action inbox
+
+
+def failed_alert(rig, key="abc:review:1", order_id=""):
+    rig.store.notify({"key": key, "text": "🛠️ KONTROL\nKayıt: 1", "order_id": order_id, "action": False})
+    assert rig.store.claim_notification(key)
+    rig.store.finish_notification(key, False)
+
+
+def test_failed_telegram_alerts_are_visible_and_only_resent_on_request(client, rig):
+    order = receive_and_run(rig)
+    failed_alert(rig, order["id"] + ":review:5", order["id"])
+    failed_alert(rig, "other:waiting:2")
+    assert "2 uyarı Telegram'a iletilemedi" in client.get("/admin").text
+    page = client.get("/admin/alerts").text
+    assert "KONTROL" in page and "/admin/orders/" + order["id"] in page
+    rig.notifier.enqueue = lambda item: pytest.fail("Failed alerts must not be resent automatically")
+    sent = []
+    client.app.state.notifier.enqueue = sent.append
+    csrf = token(client, "/admin/alerts")
+    assert client.post("/admin/alerts", data={"csrf": csrf, "action": "resend",
+                                              "key": order["id"] + ":review:5"}).status_code == 200
+    assert len(sent) == 1 and rig.store.notification(order["id"] + ":review:5")["state"] == "pending"
+    # Resending twice can't queue it twice.
+    assert client.post("/admin/alerts", data={"csrf": csrf, "action": "resend",
+                                              "key": order["id"] + ":review:5"}).status_code == 400
+    assert client.post("/admin/alerts", data={"csrf": csrf, "action": "dismiss_all"}).status_code == 200
+    assert rig.store.failed_notification_count() == 0
+    assert "uyarı Telegram'a iletilemedi" not in client.get("/admin").text

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+{% include "order_styles.html" %}
+<a href="/admin">← Siparişlere dön</a>
+<h1>Telegram'a iletilemeyen uyarılar</h1>
+<p class="muted">Bu uyarılar Telegram'a ulaşmadı veya ulaşıp ulaşmadığı kesinleşmedi. Bot bunları kendiliğinden tekrar göndermez. Tekrar gönderdiğinde aynı mesaj iki kez gelebilir.</p>
+{% if items %}
+<form method="post" action="/admin/alerts"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="action" value="dismiss_all">
+  <button>Hepsini listeden kaldır</button></form>
+{% for item in items %}
+<article class="card">
+  <p class="break" style="white-space:pre-line">{{ (item.text or 'Mesaj metni saklanmamış.')[:600] }}</p>
+  <div class="order-actions">
+    {% if item.order_id %}<a class="button" href="/admin/orders/{{ item.order_id }}">Siparişi aç</a>{% endif %}
+    {% if item.text %}<form class="inline" method="post" action="/admin/alerts"><input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="action" value="resend"><input type="hidden" name="key" value="{{ item.key }}"><button class="primary">Tekrar gönder</button></form>{% endif %}
+    <form class="inline" method="post" action="/admin/alerts"><input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="action" value="dismiss"><input type="hidden" name="key" value="{{ item.key }}"><button>Listeden kaldır</button></form>
+  </div>
+</article>
+{% endfor %}
+{% else %}<div class="card empty">İletilemeyen uyarı yok.</div>{% endif %}
+{% endblock %}

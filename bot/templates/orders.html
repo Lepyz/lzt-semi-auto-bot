@@ -2,6 +2,7 @@
 {% block content %}
 {% include "order_styles.html" %}
 <div class="toolbar"><h1>{{ 'İşlem bekleyenler' if section=='inbox' else 'Siparişler' }}</h1><a class="button" href="/admin?{{ {'view':section,'state':selected,'q':query}|urlencode }}">Yenile</a></div>
+{% if failed_alerts %}<a class="notice" style="display:block" href="/admin/alerts">⚠️ {{ failed_alerts }} uyarı Telegram'a iletilemedi. Görmek için dokun.</a>{% endif %}
 <p class="order-status">{{ '⏸️ Yeni otomatik gönderimler duraklatıldı.' if paused else '🟢 Yeni siparişlerin otomatik gönderimi açık.' }} Bekletilmiş kayıtlar sen göndermeden başlamaz.</p>
 <div class="order-summary"><a href="/admin?view=inbox"><strong>{{ totals.inbox }}</strong>İşlem bekleyen</a><a href="/admin?view=active"><strong>{{ totals.active }}</strong>Aktif / hazırlanıyor</a><a href="/admin?view=waiting"><strong>{{ totals.waiting }}</strong>Bekletilen / hazır</a></div>
 <div class="order-tabs" aria-label="Sipariş bölümleri">{% for key,label in [('inbox','🛠️ İşlem bekleyenler'),('active','🟢 Aktif siparişler'),('waiting','⏳ Bekletilenler'),('finished','📁 Sonuçlananlar'),('all','Tüm kayıtlar')] %}<a href="/admin?view={{ key }}" {{ 'aria-current=page' if section==key }}>{{ label }}</a>{% endfor %}</div>
