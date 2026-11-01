@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 {% include "order_styles.html" %}
-<a href="/admin?view=inbox">← İşlem bekleyenlere dön</a><h1>{{ order.product_name or 'Sipariş ayrıntısı' }}</h1>
+<p class="order-actions"><a class="button" href="/admin?view=inbox">← İşlem bekleyenler</a>{% if upcoming %}<a class="button" href="/admin/orders/{{ upcoming }}">Sıradaki işe geç →</a>{% endif %}</p><h1>{{ order.product_name or 'Sipariş ayrıntısı' }}</h1>
 <section class="card order-card">
   <span class="state-badge tone-{{ display.tone }}">{{ display.icon }} {{ display.title }}</span>
   <p class="order-id">Kayıt: {{ order.itemsatis_id or order.id[:10] }} <button class="order-copy" type="button" data-copy-text="{{ order.itemsatis_id or order.id[:10] }}">Numarayı kopyala</button><br>İlan: {{ order.advert_id }} · {{ order.created_at|date }}</p>
@@ -26,6 +26,8 @@
 </section>
 {% if preview_error %}<div class="card order-error" id="preview" role="alert">Gönderim özeti hazırlanamadı: {{ preview_error }}</div>{% endif %}
 {% if preview %}<section class="card order-preview" id="preview"><h2>📋 Gönderim önizlemesi</h2>
+  {% if context and context.twin %}<p class="order-error">⚠️ Aynı ilan ve linke 10 dakika içinde başka bir kayıt da geldi ({{ context.twin }}). Itemsatış'ta iki ayrı satın alma olduğunu doğrulamadan gönderme.</p>{% endif %}
+  {% if context and (context.active or context.ahead) %}<p class="order-check">🔗 Bu linkte {{ context.active }} aktif işlem ve bu kayıttan önce {{ context.ahead }} bekleyen kayıt var.</p>{% endif %}
   <p><strong>Ürün:</strong> {{ preview.product_name or preview.advert_id }}<br><strong>Hedef:</strong> {{ preview.link }}</p>
   {% for p in preview.parts if p.state not in ['submitted','finished'] %}<div class="order-component">{{ panels.get(p.panel,{}).get('name',p.panel) }} · Servis {{ p.service_id }}<br><strong>{{ p.quantity }} adet</strong> · {{ p.platform }}<br>{{ p.link }}</div>{% endfor %}
   {% if preview_profit %}{% set pp = preview_profit %}<div class="order-component"><strong>💰 Güncel kâr hesabı</strong><br>Satış {{ pp.sale|money }} · Komisyon {{ pp.commission|money }} · Maliyet {{ pp.cost|money }}<br><strong>Tahmini kâr: {{ pp.profit|money }}</strong> (sınır {{ pp.min_profit|money }})

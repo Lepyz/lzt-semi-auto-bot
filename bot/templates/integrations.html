@@ -3,6 +3,19 @@
 <h1>Bağlantılar</h1>
 <p class="muted">Bu sayfa kendiliğinden Telegram'a veya Itemsatış'a istek göndermez. Kontroller yalnızca butona bastığında yapılır.</p>
 
+<div class="card"><h2>Sistem durumu</h2>
+  <div class="grid">
+    <p><small>Sürüm</small><br>{{ status.version }}</p>
+    <p><small>Son açılış</small><br>{{ status.started|clock }}</p>
+    <p><small>Yeniden başlatma kontrolü</small><br>{{ 'Tamamlandı' if status.recovered else 'Açılıştan ~2 dk sonra yapılır' }}</p>
+    <p><small>Son Itemsatış bildirimi</small><br>{{ status.last_webhook|clock if status.last_webhook else 'Bu açılıştan beri gelmedi' }}</p>
+    <p><small>Otomatik gönderim</small><br>{{ '⏸️ Duraklatıldı' if status.paused else '🟢 Açık' }}</p>
+    <p><small>Takipteki aktif sipariş</small><br>{{ status.active }} · bekleyen link {{ status.watched }}</p>
+    <p><small>İletilemeyen uyarı</small><br>{% if status.failed %}<a href="/admin/alerts">⚠️ {{ status.failed }}</a>{% else %}Yok{% endif %}</p>
+  </div>
+  <p class="muted">Bu bilgiler sayfayı açtığında okunur; otomatik yenileme veya arka plan sorgusu yapılmaz. Son bildirim zamanı yalnızca bellekte tutulur.</p>
+</div>
+
 <div class="card"><h2>Itemsatış webhook güvenliği</h2>
 {% if key_from_env %}
   <p>Anahtar Render Environment içinde tanımlı (ITEMSATIS_WEBHOOK_SECRET) ve her bildirimde zorunlu.</p>

@@ -474,3 +474,47 @@ def test_failed_telegram_alerts_are_visible_and_only_resent_on_request(client, r
     assert client.post("/admin/alerts", data={"csrf": csrf, "action": "dismiss_all"}).status_code == 200
     assert rig.store.failed_notification_count() == 0
     assert "uyarı Telegram'a iletilemedi" not in client.get("/admin").text
+
+
+def test_same_link_queue_and_possible_repeat_are_shown(client, rig):
+    first = receive_and_run(rig, 1)
+    second = receive_and_run(rig, 2)  # same advert + link within seconds: waits behind the first
+    assert second["state"] == "waiting"
+    rig.panels.current = {"status": "Completed", "terminal": True}
+    rig.engine.refresh(first["id"])
+    third = receive_and_run(rig, 3)
+    receive_and_run(rig, 4, "not a link")  # another item needing attention
+    inbox = client.get("/admin").text
+    assert "bu kayıttan önce 0, sonra 1 bekleyen" in inbox
+    assert "Itemsatış'ta iki ayrı satın alma olduğunu doğrula" in inbox
+    preview = client.get("/admin/orders/" + second["id"] + "?preview=1").text
+    assert "doğrulamadan gönderme" in preview and (third.get("itemsatis_id") or "") in preview
+    assert "Sıradaki işe geç" in preview
+
+
+def test_unmapped_sales_list_hide_and_bind_link(client, rig):
+    rig.store.delete_binding("10")
+    receive_and_run(rig, 1)
+    receive_and_run(rig, 2)
+    page = client.get("/admin/services").text
+    assert "İlan 10" in page and "2 satış" in page and "/admin/services?new=10&name=" in page
+    assert not rig.notices
+    csrf = token(client, "/admin/services")
+    client.post("/admin/services/unmapped", data={"csrf": csrf, "advert_id": "10", "action": "hide"})
+    page = client.get("/admin/services").text
+    assert "2 satış" not in page and "Gizlenen 1 ilanı göster" in page
+    assert "2 satış" in client.get("/admin/services?hidden=1").text
+
+
+def test_old_finished_filter_and_status_card(client, rig, monkeypatch):
+    import time as clock
+    order = receive_and_run(rig, 1)
+    rig.panels.current = {"status": "Completed", "terminal": True}
+    rig.engine.refresh(order["id"])
+    assert "Henüz sonuçlanan" not in client.get("/admin?view=finished&older=30").text
+    assert order["id"] not in client.get("/admin?view=finished&older=30").text
+    assert order["id"] in client.get("/admin?view=finished").text
+    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("Status card called an external API"))
+    client.post("/itemsatis-webhook", json={"event": "message.created"})
+    card = client.get("/admin/integrations").text
+    assert "Sistem durumu" in card and "Bu açılıştan beri gelmedi" not in card and clock.time()

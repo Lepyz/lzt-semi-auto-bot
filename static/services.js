@@ -190,6 +190,14 @@
     applyFilters();
   }));
   applyFilters();
-  const requested = new URLSearchParams(window.location.search).get('edit');
+  const params = new URLSearchParams(window.location.search);
+  const requested = params.get('edit');
   if (requested && Object.prototype.hasOwnProperty.call(data.bindings, requested)) openEditor(requested);
+  const fresh = params.get('new');
+  if (fresh && /^[0-9]+$/.test(fresh) && !Object.prototype.hasOwnProperty.call(data.bindings, fresh)) {
+    openEditor();
+    field('advert_id').value = fresh;
+    field('name').value = (params.get('name') || '').slice(0, 200);
+    dirty = false;
+  }
 })();

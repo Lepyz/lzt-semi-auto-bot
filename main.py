@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -79,6 +80,8 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         engine = Engine(database, panels or PanelClient(settings.panels), notifier, settings)
         app.state.store, app.state.engine, app.state.notifier = database, engine, notifier
         app.state.ready = True
+        app.state.started_at = time.time()
+        app.state.last_webhook = 0
         if start_background:
             notifier.start()
             engine.start()
@@ -185,6 +188,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                 raise HTTPException(400, "Webhook JSON veya form verisi olmalı.")
         if not isinstance(data, dict):
             raise HTTPException(400, "Webhook nesne olmalı.")
+        app.state.last_webhook = time.time()  # Memory only: shown on Bağlantılar.
         try:
             order, created = await asyncio.to_thread(app.state.engine.receive, data)
         except Exception as exc:
@@ -201,23 +205,47 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         return {"ok": True, "status": "ignored" if order is None else ("saved" if created else "already_saved"),
                 "id": order["id"] if order else None}
 
+    def target_context(order, others):
+        """Where an order stands on its link, and whether it looks like a repeated notification."""
+        others = [o for o in others if o["id"] != order["id"] and o.get("target") == order.get("target")]
+        active = sum(any(p["state"] in {"submitted", "sending", "uncertain"} for p in o["parts"]) for o in others)
+        pending = [o for o in others if o["state"] in MANUAL_STATES | {"queued"}]
+        ahead = sum((o["created_at"], o["id"]) < (order["created_at"], order["id"]) for o in pending)
+        twin = next((o for o in others if o.get("advert_id") == order.get("advert_id")
+                     and abs(o["created_at"] - order["created_at"]) <= 600 * 1_000_000), None)
+        return {"active": active, "ahead": ahead, "behind": len(pending) - ahead,
+                "twin": (twin.get("itemsatis_id") or twin["id"][:10]) if twin else ""}
+
+    def inbox_rows(store):
+        rows = store.orders(states={"ready", "review", "error", "uncertain", "paused"}, limit=500,
+                            newest=True, exclude_unmapped=True)
+        priority = {"ready": 0, "uncertain": 1, "error": 2, "review": 3, "paused": 4}
+        rows.sort(key=lambda o: (bool(o.get("handling")), priority.get(o["state"], 5), o["created_at"]))
+        return rows
+
     @app.get("/", dependencies=[Depends(admin)])
     @app.get("/admin", dependencies=[Depends(admin)])
-    def dashboard(request: Request, state: str = "", q: str = "", view: str = ""):
+    def dashboard(request: Request, state: str = "", q: str = "", view: str = "", older: int = 0):
         sections = {"inbox": {"ready", "review", "error", "uncertain", "paused"},
                     "active": {"submitted", "processing", "sending", "queued"},
                     "waiting": {"waiting", "ready", "paused"}, "finished": {"finished", "closed"},
                     "all": set(LABELS) - {"legacy"}}
         view = view if view in sections else "all" if q or state else "inbox"
-        rows = app.state.store.orders(states={state} if state in LABELS else sections[view],
-                                      search=q, limit=500, newest=True, exclude_unmapped=view == "inbox")
-        rows = [dict(o, display=order_view(o), cleanup=cleanup_actions(o)) for o in rows]
-        if view == "inbox":
-            priority = {"ready": 0, "uncertain": 1, "error": 2, "review": 3, "paused": 4}
-            rows.sort(key=lambda o: (bool(o.get("handling")), priority.get(o["state"], 5), o["created_at"]))
+        older = older if older in {30, 90} else 0
+        before = int((datetime.now(timezone.utc) - timedelta(days=older)).timestamp() * 1_000_000) if older else None
+        if view == "inbox" and not state:
+            rows = inbox_rows(app.state.store)
+        else:
+            rows = app.state.store.orders(states={state} if state in LABELS else sections[view],
+                                          search=q, limit=500, newest=True, before=before)
+        targets = {o["target"] for o in rows if o.get("target") and o["state"] not in {"finished", "closed", "legacy"}}
+        others = [o for o in app.state.store.orders(states=MANUAL_STATES | {"queued", "processing", "sending", "submitted",
+                  "uncertain"}, limit=2000) if o.get("target") in targets] if targets else []
+        rows = [dict(o, display=order_view(o), cleanup=cleanup_actions(o),
+                     queue=target_context(o, others) if o.get("target") in targets else None) for o in rows]
         counts = app.state.store.state_counts()
         totals = {key: sum(counts.get(state, 0) for state in states) for key, states in sections.items()}
-        return page(request, "orders.html", orders=rows, selected=state, query=q, section=view, totals=totals,
+        return page(request, "orders.html", orders=rows, selected=state, query=q, section=view, totals=totals, older=older,
                     paused=app.state.store.setting("paused", False),
                     failed_alerts=app.state.store.failed_notification_count())
 
@@ -270,13 +298,15 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             url = urlsplit(panel.get("api_url", ""))
             if url.scheme == "https" and url.hostname:
                 homes[key] = "https://" + url.hostname
+        context = target_context(order, related) if order.get("target") else None
+        upcoming = next((o["id"] for o in inbox_rows(app.state.store) if o["id"] != order_id), None)
         guard = guard_settings(app.state.store)
         # Explicit preview only: fetches current panel prices (cached five minutes).
         preview_profit = evaluate(preview, app.state.engine.panels, guard) if preview and guard["mode"] != "off" else None
         checks = app.state.engine.check_results.get(order_id, {"at": order.get("last_checked", 0), "ok": True})
         return page(request, "detail.html", order=order, display=order_view(order), related=related,
                     owner=owner, preview=preview, preview_error=preview_error, checks=checks, panel_homes=homes,
-                    guard=guard, preview_profit=preview_profit,
+                    guard=guard, preview_profit=preview_profit, context=context, upcoming=upcoming,
                     cleanup=cleanup_actions(order))
 
     @app.post("/admin/order-cleanup", dependencies=[Depends(mutation)])
@@ -344,7 +374,19 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.get("/admin/packages", dependencies=[Depends(admin)])
     def services(request: Request):
         bindings = app.state.store.bindings()
+        hidden = set(app.state.store.setting("unmapped_hidden", []) or [])
+        show_hidden = request.query_params.get("hidden") == "1"
+        unmapped = {}
+        for order in app.state.store.unmapped_sales():
+            advert = order.get("advert_id") or ""
+            if not advert or advert in bindings and bindings[advert].get("active", True):
+                continue
+            entry = unmapped.setdefault(advert, {"advert": advert, "name": order.get("product_name") or "",
+                                                 "count": 0, "last": order["created_at"], "hidden": advert in hidden})
+            entry["count"] += 1
         return page(request, "services.html", bindings=bindings,
+                    unmapped=[u for u in unmapped.values() if show_hidden or not u["hidden"]],
+                    hidden_count=sum(u["hidden"] for u in unmapped.values()), show_hidden=show_hidden,
                     versions={key: binding_version(value) for key, value in bindings.items()},
                     saved=request.query_params.get("saved", ""))
 
@@ -404,6 +446,15 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             return RedirectResponse("/admin/services?saved=" + advert_id, 303)
         return RedirectResponse("/admin/services", 303)
 
+    @app.post("/admin/services/unmapped", dependencies=[Depends(mutation)])
+    def unmapped_visibility(advert_id: str = Form(...), action: str = Form(...)):
+        if not advert_id.isdigit() or action not in {"hide", "show"}:
+            raise ValueError("İlan veya işlem geçersiz.")
+        hidden = set(app.state.store.setting("unmapped_hidden", []) or [])
+        hidden.add(advert_id) if action == "hide" else hidden.discard(advert_id)
+        app.state.store.set_setting("unmapped_hidden", sorted(hidden))
+        return RedirectResponse("/admin/services#unmapped", 303)
+
     @app.post("/admin/services/delete", dependencies=[Depends(mutation)])
     def delete_service(advert_id: str = Form(...), version: str = Form(...), confirmed: str = Form("")):
         if confirmed != "yes":
@@ -432,7 +483,14 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                                   secret_from_env=bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
                                   public=settings.public_url),
                     ignored=list(app.state.engine.ignored), ignored_total=app.state.engine.ignored_total,
-                    guard=guard_settings(app.state.store), modes=MODES)
+                    guard=guard_settings(app.state.store), modes=MODES,
+                    status=dict(version=os.getenv("RENDER_GIT_COMMIT", "")[:7] or "yerel",
+                                started=getattr(app.state, "started_at", 0),
+                                last_webhook=getattr(app.state, "last_webhook", 0),
+                                recovered=app.state.engine.recover_at is None,
+                                active=len(app.state.engine.active_checks), watched=len(app.state.engine.watch),
+                                paused=app.state.store.setting("paused", False),
+                                failed=app.state.store.failed_notification_count()))
 
     @app.post("/admin/integrations/profit", dependencies=[Depends(mutation)])
     def profit_setup(mode: str = Form(...), min_profit: str = Form(...), commission: str = Form(...)):
