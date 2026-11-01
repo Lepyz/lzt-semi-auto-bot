@@ -215,6 +215,37 @@ class Store:
             if success:
                 self.execute(conn, "UPDATE notifications SET document='{}' WHERE key=?", (key,))
 
+    def failed_notification_count(self):
+        with self.transaction() as conn:
+            return self.execute(conn, "SELECT COUNT(*) AS n FROM notifications WHERE state='failed'").fetchone()["n"]
+
+    def failed_notifications(self, limit=100):
+        with self.transaction() as conn:
+            rows = self.execute(conn, """SELECT key,document FROM notifications WHERE state='failed'
+                ORDER BY key LIMIT ?""", (limit,)).fetchall()
+            return [dict(json.loads(r["document"]) if r["document"] not in ("", "{}") else {}, key=r["key"]) for r in rows]
+
+    def resend_failed_notification(self, key):
+        """Admin-requested only: a failed delivery is never repeated automatically."""
+        with self.transaction() as conn:
+            row = self.execute(conn, "SELECT document FROM notifications WHERE key=? AND state='failed'",
+                               (key,)).fetchone()
+            if not row or row["document"] in ("", "{}"):
+                return None
+            self.execute(conn, "UPDATE notifications SET state='pending',attempts=0 WHERE key=? AND state='failed'", (key,))
+            return json.loads(row["document"])
+
+    def dismiss_failed_notifications(self, keys=None):
+        with self.transaction() as conn:
+            if keys is None:
+                return self.execute(conn, """UPDATE notifications SET state='dismissed',document='{}'
+                    WHERE state='failed'""").rowcount
+            count = 0
+            for key in keys:
+                count += self.execute(conn, """UPDATE notifications SET state='dismissed',document='{}'
+                    WHERE key=? AND state='failed'""", (key,)).rowcount
+            return count
+
     def retry_notification(self, key):
         with self.transaction() as conn:
             self.execute(conn, """UPDATE notifications SET state='pending'

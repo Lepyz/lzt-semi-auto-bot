@@ -20,6 +20,14 @@ RECOVERY_DELAY = 120
 STALE_SECONDS = 120
 
 
+class Hold(ValueError):
+    """A reason to keep an order for the admin, with its code set at the source."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 def normalize_binding(data, panels):
     parts = data.get("components") if "components" in data else [data]
     if not isinstance(parts, list) or not parts:
@@ -56,7 +64,6 @@ class Engine:
         self.watch = {}
         self.active_checks = {}
         self.check_results = {}
-        self.check_failures = {}
         self.recent_checks = {}
         self.running = set()
         # Memory only: recent ignored webhooks, so a changed purchase format is noticed.
@@ -71,8 +78,8 @@ class Engine:
         return {"key": order["id"] + ":" + event + ":" + str(order.get("revision", 0)),
                 "text": text[:3500], "order_id": order["id"], "action": action}
 
-    def save(self, order, event="", text="", action=False):
-        order["reason_code"] = reason_code(order.get("error"), order["state"]) if order.get("error") else ""
+    def save(self, order, event="", text="", action=False, code=None):
+        order["reason_code"] = code or (reason_code(order.get("error"), order["state"]) if order.get("error") else "")
         notification = alert(order, event) if event else None
         notified = self.store.save(order, notification)
         if notified:
@@ -151,7 +158,7 @@ class Engine:
             return
         binding = self.store.setting("binding:" + order["advert_id"])
         if not binding or not binding.get("active", True):
-            raise ValueError("İlanın aktif servis eşleştirmesi yok. Eşleştirmeyi ekleyip gönderin.")
+            raise Hold("binding_missing", "İlanın aktif servis eşleştirmesi yok. Eşleştirmeyi ekleyip gönderin.")
         binding = normalize_binding(binding, self.settings.panels)
         if not order["product_name"]:
             order["product_name"] = binding["name"]
@@ -159,11 +166,11 @@ class Engine:
         for part in parts:
             link = order["links"].get(part["platform"]) or order.get("link") or ""
             if not valid_link(link, part["platform"]):
-                raise ValueError("Müşteri linki eksik veya servis platformuyla uyumsuz.")
+                raise Hold("link_missing", "Müşteri linki eksik veya servis platformuyla uyumsuz.")
             part.update(link=normalize_panel_link(link, part["platform"]), state="new", smm_id="", status="")
         targets = {target_key(p["link"], p["platform"]) for p in parts}
         if len(targets) != 1:
-            raise ValueError("Paket bileşenlerinin aynı hedef linki kullanması gerekiyor.")
+            raise Hold("package_target", "Paket bileşenlerinin aynı hedef linki kullanması gerekiyor.")
         order.update(parts=parts, link=parts[0]["link"], target=targets.pop())
 
     def earlier_hold(self, order):
@@ -205,7 +212,8 @@ class Engine:
             self.prepare(order)
         except ValueError as exc:
             order.update(state="review", manual_required=True, error=str(exc))
-            self.save(order, "review", "Sipariş gönderilemedi.\n" + self.summary(order) + "\n" + str(exc))
+            self.save(order, "review", "Sipariş gönderilemedi.\n" + self.summary(order) + "\n" + str(exc),
+                      code=getattr(exc, "code", None))
             return
         if self.store.setting("paused", False):
             order.update(state="paused", manual_required=True, error="Yeni gönderimler duraklatıldı.")
@@ -296,14 +304,18 @@ class Engine:
                 part["state"] = "finished"
                 changed = True
         if checked and successes == attempted:
-            self.check_failures.pop(order_id, None)
             self.check_results[order_id] = {"at": time.time(), "ok": True}
             if order.pop("status_error", ""):
                 changed = True
+            if order.pop("status_failures", 0):
+                changed = True
         elif attempted:
             self.check_results[order_id] = {"at": time.time(), "ok": False}
-            self.check_failures[order_id] = self.check_failures.get(order_id, 0) + 1
-            if self.check_failures[order_id] >= 3 and not order.get("status_error"):
+            # Stored on the order (a write only on failure) so a restart doesn't reset it.
+            order["status_failures"] = order.get("status_failures", 0) + 1
+            if order["status_failures"] < 3 or order.get("status_error"):
+                self.store.save(order)
+            else:
                 order["status_error"] = "Panelden güncel durum alınamadı. Son doğrulanmış durum gösteriliyor."
                 problem = dict(order, state="error", reason_code="status_unavailable", manual_approved=False,
                                alert_panel=next((p["panel"] for p in order["parts"] if p["state"] == "submitted"), ""))
@@ -443,6 +455,9 @@ class Engine:
                 self.active_checks[order["id"]] = time.monotonic() + self.settings.active_check_interval
             else:
                 self.active_checks.pop(order["id"], None)
+                # Settled orders need no in-memory check history.
+                self.recent_checks.pop(order["id"], None)
+                self.check_results.pop(order["id"], None)
 
     def check_due(self):
         # Memory-only scheduling: no database queries when nothing is due.

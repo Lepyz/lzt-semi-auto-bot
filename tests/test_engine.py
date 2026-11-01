@@ -525,3 +525,36 @@ def test_no_status_calls_after_last_waiter_removed(rig):
     rig.engine.watch[first["target"]] = 0
     rig.engine.check_due()
     assert not rig.panels.checks
+
+
+def test_status_failure_count_survives_restart_and_resets_on_success(rig, monkeypatch):
+    order = receive_and_run(rig)
+    monkeypatch.setattr(rig.panels, "status", lambda _: None)
+    rig.engine.refresh(order["id"])
+    rig.engine.refresh(order["id"])
+    assert rig.store.get(order["id"])["status_failures"] == 2 and not rig.notices
+    restarted = Engine(rig.store, rig.panels, rig.notifier, rig.settings)
+    try:
+        restarted.refresh(order["id"])  # third failure after a restart still warns, once
+        assert len(rig.notices) == 1 and rig.store.get(order["id"])["status_error"]
+        restarted.refresh(order["id"])
+        assert len(rig.notices) == 1
+        monkeypatch.setattr(rig.panels, "status", lambda _: {"status": "In progress", "terminal": False})
+        restarted.refresh(order["id"])
+        current = rig.store.get(order["id"])
+        assert "status_failures" not in current and "status_error" not in current
+    finally:
+        restarted.close()
+
+
+def test_hold_reason_is_set_at_source_not_parsed_from_text(rig):
+    rig.store.delete_binding("10")
+    order = receive_and_run(rig)
+    assert order["state"] == "review" and order["reason_code"] == "binding_missing"
+    data = payload(2)
+    del data["post_datas"]
+    rig.store.set_setting("binding:10", {"name": "x", "active": True, "components": [
+        {"panel": "smmrush", "service_id": "1", "quantity": 10, "platform": "instagram"}]})
+    second, _ = rig.engine.receive(data)
+    rig.engine.execute(second["id"])
+    assert rig.store.get(second["id"])["reason_code"] == "link_missing"

@@ -216,7 +216,30 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         counts = app.state.store.state_counts()
         totals = {key: sum(counts.get(state, 0) for state in states) for key, states in sections.items()}
         return page(request, "orders.html", orders=rows, selected=state, query=q, section=view, totals=totals,
-                    paused=app.state.store.setting("paused", False))
+                    paused=app.state.store.setting("paused", False),
+                    failed_alerts=app.state.store.failed_notification_count())
+
+    @app.get("/admin/alerts", dependencies=[Depends(admin)])
+    def alerts(request: Request):
+        return page(request, "alerts.html", items=app.state.store.failed_notifications())
+
+    @app.post("/admin/alerts", dependencies=[Depends(mutation)])
+    def alert_action(action: str = Form(...), key: str = Form("")):
+        store = app.state.store
+        if action == "resend":
+            item = store.resend_failed_notification(key)
+            if not item:
+                raise ValueError("Bu uyarı artık tekrar gönderilebilir durumda değil; sayfayı yenileyin.")
+            app.state.notifier.enqueue(item)
+            message = "Uyarı Telegram'a tekrar gönderilmek üzere sıraya alındı."
+        elif action == "dismiss":
+            store.dismiss_failed_notifications([key])
+            message = "Uyarı listeden kaldırıldı. Sipariş kaydı değişmedi."
+        elif action == "dismiss_all":
+            message = f"{store.dismiss_failed_notifications()} uyarı listeden kaldırıldı. Sipariş kayıtları değişmedi."
+        else:
+            raise ValueError("İşlem tanınmadı.")
+        return RedirectResponse("/admin/alerts?" + urlencode({"message": message}), 303)
 
     @app.get("/admin/orders/{order_id}", dependencies=[Depends(admin)])
     def detail(request: Request, order_id: str):
