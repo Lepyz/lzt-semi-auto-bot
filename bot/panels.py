@@ -1,6 +1,7 @@
 """Panel calls have no balance requests, circuit database writes or add retries."""
 import threading
 import time
+import math
 from dataclasses import dataclass
 
 import requests
@@ -29,7 +30,7 @@ class PanelClient:
         self.panels = panels
         self.limits = {key: threading.BoundedSemaphore(2) for key in panels}
         self.service_cache = {}
-        self.cache_lock = threading.Lock()
+        self.rate_locks = {key: threading.Lock() for key in panels}
 
     def request(self, key, action, **fields):
         panel = self.panels.get(key, {})
@@ -44,18 +45,22 @@ class PanelClient:
         """Current price of a service (per 1000, or per order for package types).
 
         The panel's service list is fetched only when an order is about to be
-        sent or previewed and kept in memory for five minutes. Failures are not
-        cached, and None means the cost is unknown.
+        sent or previewed and kept in memory for five minutes. Failed reads
+        back off for one minute; concurrent orders share the same lookup.
         """
-        with self.cache_lock:
+        if key not in self.rate_locks:
+            return None
+        with self.rate_locks[key]:
             entry = self.service_cache.get(key)
-        if not entry or time.monotonic() - entry[0] > 300:
+            if entry and time.monotonic() - entry[0] < (60 if entry[1] is None else 300):
+                return entry[1].get(str(service_id)) if entry[1] is not None else None
             try:
                 response = self.request(key, "services")
                 data = response.json() if response.status_code == 200 else None
             except (requests.RequestException, ValueError):
                 data = None
             if not isinstance(data, list):
+                self.service_cache[key] = (time.monotonic(), None)
                 return None
             services = {}
             for item in data:
@@ -65,12 +70,11 @@ class PanelClient:
                     rate = float(str(item.get("rate", "")).replace(",", "."))
                 except ValueError:
                     continue
-                if rate >= 0:
+                if math.isfinite(rate) and 0 <= rate <= 1_000_000_000:
                     services[str(item["service"])] = {"rate": rate, "type": str(item.get("type") or "")}
             entry = (time.monotonic(), services)
-            with self.cache_lock:
-                self.service_cache[key] = entry
-        return entry[1].get(str(service_id))
+            self.service_cache[key] = entry
+            return entry[1].get(str(service_id))
 
     def add(self, part, link):
         try:

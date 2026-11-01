@@ -3,6 +3,7 @@ import ast
 import json
 import re
 import hashlib
+import html
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 
@@ -505,13 +506,13 @@ def get_advert_id(data: dict) -> str:
 # Explicit price fields only. Keys such as fee, cost, commission or earning are
 # deliberately not read: they are not what the buyer paid.
 PRICE_PATHS = (
-    "price", "total_price", "order_price", "sale_price", "paid_price", "payment_amount", "product_price",
-    "advert.price", "order.price", "order.total_price", "purchase.price", "purchase.total_price",
-    "payment.price", "payment.amount", "payment.total", "total", "amount",
+    "sale_price", "paid_price", "total_price", "order_price", "payment_amount",
+    "order.total_price", "order.price", "purchase.total_price", "purchase.price",
+    "payment.total", "payment.amount", "payment.price", "price", "total", "amount",
     "details.price", "details.total_price", "details.order_price", "details.sale_price", "details.paid_price",
-    "details.advert.price", "details.payment.amount", "details.total", "details.amount",
+    "details.payment.amount", "details.total", "details.amount",
     "data.price", "data.total_price", "data.order_price", "data.sale_price", "data.paid_price",
-    "data.advert.price", "data.payment.amount", "data.total", "data.amount",
+    "data.payment.amount", "data.total", "data.amount",
 )
 
 
@@ -543,10 +544,26 @@ def get_sale_price(data):
             price = parse_price(value) if not isinstance(value, dict) else None
             if price:
                 return round(price, 2), path
-    for text in collect_strings(data):
-        match = re.search(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:TL|₺)", text)
-        if match and parse_price(match.group(1)):
-            return round(parse_price(match.group(1)), 2), "metin"
+    # Only explicit sale phrases in messages qualify; arbitrary fee/commission
+    # fields and product titles must never supply the buyer's payment amount.
+    amount = r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:tl\b|₺)"
+    patterns = (r"(?:satis|siparis|odeme)\s+(?:bedeli|tutari|fiyati|toplami)\s*[:=\-]?\s*" + amount,
+                amount + r"\s*(?:tutarinda|bedelle|karsiliginda|fiyatina)?\s*satil(?:di|mistir)")
+    candidates = {}
+    for item in payload_variants(data):
+        for field in ("content", "message", "description", "body", "text", "details.content", "details.message"):
+            text = get_nested(item, field)
+            if not isinstance(text, str):
+                continue
+            text = re.sub(r"<[^>]*>", " ", html.unescape(text)).casefold().replace("\u0307", "")
+            text = text.translate(str.maketrans("ışğüöç", "isguoc"))
+            for pattern in patterns:
+                for match in re.finditer(pattern, text):
+                    price = parse_price(match.group(1))
+                    if price:
+                        candidates[round(price, 2)] = "metin:" + field
+    if len(candidates) == 1:
+        return next(iter(candidates.items()))
     return None, ""
 
 

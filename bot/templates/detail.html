@@ -19,10 +19,14 @@
   {% if display.actionable %}<form class="order-actions" method="post" action="/admin/orders/{{ order.id }}/attention"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><input type="hidden" name="handling" value="{{ 'no' if order.handling else 'yes' }}"><button>{{ 'İlgileniyorum işaretini kaldır' if order.handling else '👀 Bu kayıtla ilgileniyorum' }}</button></form>{% endif %}
 </section>
 <section class="card"><h2>💰 Kâr hesabı</h2>
-  <p>Satış fiyatı: <strong>{{ order.sale_price|money if order.sale_price else 'Bildirimde bulunamadı' }}</strong>{% if order.price_source %}<br><small>Bildirimdeki alan: {{ order.price_source }}</small>{% endif %}</p>
-  {% set pc = order.profit %}
-  {% if pc %}<p>Komisyon: {{ pc.commission|money }} · Panel maliyeti: {{ pc.cost|money }}<br><strong>Tahmini kâr: {{ pc.profit|money }}</strong> (sınır {{ pc.min_profit|money }})<br><small>Gönderim anında hesaplandı: {{ pc.at|clock }}</small></p>
+  <p>Satış fiyatı: <strong>{{ order.sale_price|money if order.sale_price else 'Bildirimde bulunamadı' }}</strong>{% if order.price_source %}<br><small>Fiyat kaynağı: {{ 'Senin doğruladığın tutar' if order.price_source=='manual' else 'Itemsatış bildirimi' if sale_verified else 'Doğrulama bekliyor' }}</small>{% endif %}</p>
+  {% if order.sale_price and not sale_verified %}<p class="order-error">Önceki sürümün bulduğu satış tutarı doğrulanmalı. Komisyon veya kesinti tutarı olabilir.</p>{% endif %}
+  {% set pc = record_profit %}
+  {% if pc %}<p>Itemsatış komisyonu (%7): {{ pc.commission|money }}<br>Komisyondan sonra kalan: <strong>{{ pc.net_sale|money }}</strong><br>Panel maliyeti: {{ pc.cost|money }}<br><strong>Tahmini kâr: {{ pc.profit|money }}</strong> (sınır {{ pc.min_profit|money }}){% if pc.margin is not none %} · Marj %{{ ('%g' % pc.margin)|replace('.',',') }}{% endif %}<br><small>Panel maliyeti kontrolü: {{ pc.at|clock }}</small></p>
+  {% if pc.cost is not none %}<p>Başa baş satış: {{ pc.break_even_sale|money }}<br>{{ pc.min_profit|money }} kâr hedefi için satış: <strong>{{ pc.target_sale|money }}</strong></p>{% endif %}
   {% if pc.message %}<p class="order-error">{{ pc.message }}</p>{% endif %}{% else %}<p class="muted">Kâr, sipariş gönderilirken o anki panel fiyatıyla hesaplanır.</p>{% endif %}
+  <p class="order-check">Hesap: satış − %7 komisyon − panel maliyeti. İptal veya kısmi iadenin gerçekleşen tutarı bu tahmine dahil değildir.</p>
+  <details><summary>Satış tutarını doğrula / düzelt</summary><form class="order-form" method="post" action="/admin/orders/{{ order.id }}/price"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><label>Itemsatış satış tutarı (TL)<input name="price" inputmode="decimal" value="{{ order.sale_price or '' }}" required></label><label><input type="checkbox" name="confirmed" value="yes" required> Tutarı Itemsatış'taki satın almadan kontrol ettim.</label><p>Kaydetmek sipariş göndermez. Mevcut panel maliyetiyle tahmin güncellenir; gönderim öncesinde fiyatlar tekrar kontrol edilir.</p><button>Satış tutarını kaydet</button></form></details>
 </section>
 {% if preview_error %}<div class="card order-error" id="preview" role="alert">Gönderim özeti hazırlanamadı: {{ preview_error }}</div>{% endif %}
 {% if preview %}<section class="card order-preview" id="preview"><h2>📋 Gönderim önizlemesi</h2>
@@ -30,7 +34,8 @@
   {% if context and (context.active or context.ahead) %}<p class="order-check">🔗 Bu linkte {{ context.active }} aktif işlem ve bu kayıttan önce {{ context.ahead }} bekleyen kayıt var.</p>{% endif %}
   <p><strong>Ürün:</strong> {{ preview.product_name or preview.advert_id }}<br><strong>Hedef:</strong> {{ preview.link }}</p>
   {% for p in preview.parts if p.state not in ['submitted','finished'] %}<div class="order-component">{{ panels.get(p.panel,{}).get('name',p.panel) }} · Servis {{ p.service_id }}<br><strong>{{ p.quantity }} adet</strong> · {{ p.platform }}<br>{{ p.link }}</div>{% endfor %}
-  {% if preview_profit %}{% set pp = preview_profit %}<div class="order-component"><strong>💰 Güncel kâr hesabı</strong><br>Satış {{ pp.sale|money }} · Komisyon {{ pp.commission|money }} · Maliyet {{ pp.cost|money }}<br><strong>Tahmini kâr: {{ pp.profit|money }}</strong> (sınır {{ pp.min_profit|money }})
+  {% if preview_profit %}{% set pp = preview_profit %}<div class="order-component"><strong>💰 Güncel kâr hesabı</strong><br>Satış {{ pp.sale|money }} · Komisyon (%7) {{ pp.commission|money }}<br>Komisyon sonrası {{ pp.net_sale|money }} · Panel maliyeti {{ pp.cost|money }}<br><strong>Tahmini kâr: {{ pp.profit|money }}</strong> (sınır {{ pp.min_profit|money }})
+    {% if pp.target_sale is not none %}<br>Bu kâr hedefi için satış: {{ pp.target_sale|money }}{% endif %}
     {% if not pp.ok %}<p class="order-error">⚠️ {{ pp.message }}{% if guard.mode != 'enforce' %} Koruma gözlem modunda; gönderim engellenmez.{% endif %}</p>{% endif %}</div>{% endif %}
   <p>Henüz yeni sipariş açılmadı. Gönderimde aktif hedef tekrar kontrol edilir. Daha önce panele iletilmiş bileşenler yeniden gönderilmez.</p>
   <form method="post" action="/admin/orders/{{ order.id }}/send" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><label><input type="checkbox" name="confirmed" value="yes" required> Ürün, adet ve hedef linkini kontrol ettim.</label>
@@ -48,7 +53,7 @@
 {% if order.state in manual_states and not order.parts|selectattr('state','in',['submitted','finished','sending','uncertain'])|list %}
 <section class="card" id="repair"><h2>🛠️ Sipariş bilgilerini düzelt</h2><p>İlan ayarı değiştiyse eşleştirmeyi yenileyebilir veya müşteri linkini düzeltebilirsin. Kaydetmek sipariş göndermez.</p>
   <p><a class="button" href="/admin/services?edit={{ order.advert_id }}">İlan ayarını aç</a></p>
-  <form method="post" action="/admin/orders/{{ order.id }}/repair" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><label>Müşteri linki<input name="link" value="{{ link }}" required placeholder="https://..."></label><p><button>Bilgileri kaydet ve eşleştirmeyi yenile</button></p></form>
+  <form method="post" action="/admin/orders/{{ order.id }}/repair" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}">{% if not order.advert_id %}<label>Eksik ilan numarası<input name="advert_id" inputmode="numeric" pattern="[0-9]+" required></label>{% endif %}<label>Müşteri linki<input name="link" value="{{ link }}" required placeholder="https://..."></label><p><button>Bilgileri kaydet ve eşleştirmeyi yenile</button></p></form>
 </section>{% endif %}
 {% if cleanup.close %}
 <details class="card"><summary>Bu kaydı göndermeden kapat</summary><p>Bu işlem yalnızca botun kaydı takibini kapatır. Panelde iptal veya para iadesi yapmaz.</p>

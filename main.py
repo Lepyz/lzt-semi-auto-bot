@@ -25,7 +25,7 @@ from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
 from bot.notifications import Notifier, register_telegram_webhook, telegram_api
 from bot.panels import PanelClient
-from bot.profit import MODES, evaluate, guard_settings, money
+from bot.profit import MODES, evaluate, guard_settings, money, reprice, sale_amount
 from bot.store import Conflict, Store
 from bot.presentation import cleanup_actions, order_view, panel_label, summary as order_summary
 
@@ -93,7 +93,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             await asyncio.to_thread(engine.close)
             await asyncio.to_thread(notifier.close)
 
-    app = FastAPI(title="Boostera", version="3.1.2", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Boostera", version="3.2.0", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
 
     def admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -162,7 +162,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.api_route("/check-panel-health", methods=["GET", "HEAD"])
     def health():
         # Uptime checks must never query a database, panel or Telegram.
-        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.1.2"}
+        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.2.0"}
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):
@@ -304,10 +304,15 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         guard = guard_settings(app.state.store)
         # Explicit preview only: fetches current panel prices (cached five minutes).
         preview_profit = evaluate(preview, app.state.engine.panels, guard) if preview and guard["mode"] != "off" else None
+        record_profit = order.get("profit")
+        if record_profit and record_profit.get("version") != 2:
+            record_profit = reprice(order, guard)
         checks = app.state.engine.check_results.get(order_id, {"at": order.get("last_checked", 0), "ok": True})
         return page(request, "detail.html", order=order, display=order_view(order), related=related,
                     owner=owner, preview=preview, preview_error=preview_error, checks=checks, panel_homes=homes,
-                    guard=guard, preview_profit=preview_profit, context=context, upcoming=upcoming,
+                    guard=guard, preview_profit=preview_profit, record_profit=record_profit,
+                    sale_verified=sale_amount(order) is not None,
+                    context=context, upcoming=upcoming,
                     cleanup=cleanup_actions(order))
 
     @app.post("/admin/order-cleanup", dependencies=[Depends(mutation)])
@@ -344,9 +349,16 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         return RedirectResponse("/admin/orders/" + order_id, 303)
 
     @app.post("/admin/orders/{order_id}/repair", dependencies=[Depends(mutation)])
-    def repair(order_id: str, link: str = Form(...), revision: int = Form(...)):
-        app.state.engine.repair(order_id, link, revision)
+    def repair(order_id: str, link: str = Form(...), revision: int = Form(...), advert_id: str = Form("")):
+        app.state.engine.repair(order_id, link, revision, advert_id.strip())
         return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Bilgiler kaydedildi. Henüz sipariş gönderilmedi; gönderim özetinden devam edebilirsin."}), 303)
+
+    @app.post("/admin/orders/{order_id}/price", dependencies=[Depends(mutation)])
+    def sale_price(order_id: str, price: str = Form(...), revision: int = Form(...), confirmed: str = Form("")):
+        if confirmed != "yes":
+            raise ValueError("Satış tutarını Itemsatış'tan kontrol ettiğini onayla.")
+        app.state.engine.update_sale_price(order_id, price, revision)
+        return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Satış tutarı ve %7 komisyon hesabı güncellendi. Bu işlem sipariş göndermedi."}), 303)
 
     @app.post("/admin/orders/{order_id}/refresh", dependencies=[Depends(mutation)])
     def refresh(order_id: str):
@@ -433,7 +445,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             store.set_setting("binding:" + advert_id, binding)
         else:
             key, value = "binding:" + advert_id, json.dumps(binding, ensure_ascii=False)
-            with store.transaction() as conn:
+            with store.transaction(bindings=True) as conn:
                 if mode == "create":
                     cursor = store.execute(conn, """INSERT INTO settings(key,value) VALUES (?,?)
                         ON CONFLICT(key) DO NOTHING""", (key, value))
@@ -458,8 +470,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                         media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": 'attachment; filename="ilan-eslestirmeleri.csv"'})
 
-    def bulk_preview(request, title, changes, errors=()):
-        current = app.state.store.bindings()
+    def bulk_preview(request, title, changes, current, errors=()):
         return page(request, "services_bulk.html", title=title, changes=changes, errors=list(errors),
                     snapshot=bulk.snapshot_hash(current),
                     payload=json.dumps({c["advert"]: c["after"] for c in changes}, ensure_ascii=False))
@@ -471,14 +482,14 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             raise ValueError("Dosya çok büyük (en fazla 300 KB).")
         current = await asyncio.to_thread(app.state.store.bindings)
         changes, errors = bulk.parse_import(bulk.decode(raw), current, settings.panels)
-        return await asyncio.to_thread(bulk_preview, request, "CSV içe aktarma özeti", changes, errors)
+        return await asyncio.to_thread(bulk_preview, request, "CSV içe aktarma özeti", changes, current, errors)
 
     @app.post("/admin/services/swap", dependencies=[Depends(mutation)])
     def swap_service(request: Request, panel: str = Form(...), old_service: str = Form(...), new_service: str = Form(...)):
-        changes = bulk.service_swap(app.state.store.bindings(), panel, old_service.strip(), new_service.strip(),
-                                    settings.panels)
+        current = app.state.store.bindings()
+        changes = bulk.service_swap(current, panel, old_service.strip(), new_service.strip(), settings.panels)
         title = f"Servis {old_service.strip()} → {new_service.strip()} değişikliği özeti"
-        return bulk_preview(request, title, changes, [] if changes else ["Bu panelde bu servisi kullanan eşleştirme yok."])
+        return bulk_preview(request, title, changes, current, [] if changes else ["Bu panelde bu servisi kullanan eşleştirme yok."])
 
     @app.post("/admin/services/bulk-apply", dependencies=[Depends(mutation)])
     def apply_bulk(payload: str = Form(...), snapshot: str = Form(...), confirmed: str = Form("")):
@@ -492,7 +503,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         if not bindings or len(bindings) != len(items):
             raise ValueError("Uygulanacak geçerli değişiklik yok.")
         store = app.state.store
-        with store.transaction() as conn:
+        with store.transaction(bindings=True) as conn:
             rows = store.execute(conn, "SELECT key,value FROM settings WHERE key LIKE ? ORDER BY LENGTH(key),key",
                                  ("binding:%",)).fetchall()
             current = {r["key"][8:]: json.loads(r["value"]) for r in rows}
@@ -520,7 +531,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             raise ValueError("Eşleştirmeyi kaldırmak için onay kutusunu işaretleyin.")
         store = app.state.store
         key = "binding:" + advert_id.strip()
-        with store.transaction() as conn:
+        with store.transaction(bindings=True) as conn:
             current = store.execute(conn, "SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             if not current or not secrets.compare_digest(
                     binding_version(json.loads(current["value"])).encode(), version.encode()):
@@ -552,16 +563,16 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                                 failed=app.state.store.failed_notification_count()))
 
     @app.post("/admin/integrations/profit", dependencies=[Depends(mutation)])
-    def profit_setup(mode: str = Form(...), min_profit: str = Form(...), commission: str = Form(...)):
+    def profit_setup(mode: str = Form(...), min_profit: str = Form(...), commission: str = Form("7")):
         if mode not in MODES:
             raise ValueError("Koruma modu tanınmadı.")
         try:
             minimum, rate = float(min_profit.replace(",", ".")), float(commission.replace(",", "."))
         except ValueError:
             raise ValueError("Kâr sınırı ve komisyon sayı olmalı.") from None
-        if not 0 <= minimum <= 100000 or not 0 <= rate <= 50:
-            raise ValueError("Kâr sınırı 0 ile 100.000 TL, komisyon %0 ile %50 arasında olmalı.")
-        app.state.store.set_setting("profit_guard", {"mode": mode, "min_profit": minimum, "commission": rate / 100})
+        if not 0 <= minimum <= 100000 or rate != 7:
+            raise ValueError("Kâr sınırı 0 ile 100.000 TL arasında olmalı. Itemsatış komisyonu sabit %7'dir.")
+        app.state.store.set_setting("profit_guard", {"mode": mode, "min_profit": minimum, "commission": 0.07})
         return back(f"Zarar koruması: {MODES[mode]} · sınır {money(minimum)} · komisyon %{rate:g}")
 
     def back(message):
@@ -623,22 +634,27 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         result = io.StringIO()
         writer = csv.writer(result, delimiter=";")
         writer.writerow(["Itemsatış sipariş numarası", "İlan", "Ürün", "Link", "Durum", "Panel", "Panel sipariş numarası", "Adet",
+                         "Komisyon sonrası (TL)", "Kâr marjı (%)", "Başa baş satış (TL)", "Hedef satış (TL)",
                          "Satış (TL)", "Komisyon (TL)", "Panel maliyeti (TL)", "Tahmini kâr (TL)"])
         def amount(value):
             return "" if value is None else f"{value:.2f}".replace(".", ",")
         def safe(value):
             text = str(value or "")
             return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
+        guard = guard_settings(app.state.store)
         for order in app.state.store.orders(states=set(LABELS) - {"legacy"}, limit=100000):
             check = order.get("profit") or {}
+            if check and check.get("version") != 2:
+                check = reprice(order, guard)
             for index, part in enumerate(order["parts"] or [{}]):
                 # Order-level amounts only on the first row, so Excel sums stay correct.
-                money_cells = (amount(order.get("sale_price")), amount(check.get("commission")),
-                               amount(check.get("cost")), amount(check.get("profit"))) if index == 0 else ("",) * 4
+                money_cells = tuple(amount(v) for v in (
+                    check.get("net_sale"), check.get("margin"), check.get("break_even_sale"), check.get("target_sale"),
+                    sale_amount(order), check.get("commission"), check.get("cost"), check.get("profit"))) if index == 0 else ("",) * 8
                 writer.writerow([safe(v) for v in (
                     order["itemsatis_id"], order["advert_id"], order["product_name"], order["link"],
                     order_view(order)["title"], part.get("panel", ""),
-                    part.get("smm_id", ""), part.get("quantity", ""), *money_cells)])
+                    part.get("smm_id", ""), part.get("quantity", ""))] + list(money_cells))
         return Response("\ufeff" + result.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": 'attachment; filename="siparisler.csv"'})
 

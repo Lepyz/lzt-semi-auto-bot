@@ -28,10 +28,19 @@ Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
 ## Zarar koruması
 
 Sipariş panele gönderilmeden hemen önce tahmini kâr hesaplanır:
-satış fiyatı (Itemsatış bildiriminden) − Itemsatış komisyonu (%7) − panelin o anki
+doğrulanmış satış fiyatı − sabit Itemsatış komisyonu (%7) − panelin o anki
 servis fiyatı (panel API `services` listesi; 1000 adet fiyatı, Package türünde sipariş başı).
 Panel fiyat listesi yalnızca gönderim veya gönderim özeti açılırken okunur ve 5 dakika
-bellekte tutulur; boştayken istek yapılmaz. Tüm paneller TL fiyat kullanır.
+bellekte tutulur; başarısız sorguda 1 dakika beklenir ve eşzamanlı siparişler aynı
+fiyat sorgusunu paylaşır. Boştayken istek yapılmaz. Tüm paneller TL fiyat kullanır.
+Tutarlar Decimal ile hesaplanır ve kuruşa yuvarlanır. Örnek: 100 TL satış − 7 TL
+komisyon − 40 TL panel maliyeti = 53 TL tahmini kâr. Web ve CSV'de komisyon sonrası
+kalan, marj, başa baş fiyatı ve seçilen kâr hedefi için satış fiyatı da bulunur.
+Komisyon/kesinti tutarları satış fiyatı olarak okunmaz; mesajdan yalnızca açık satış
+bedeli kalıpları kabul edilir. Çelişkide fiyat bilinmiyor sayılır. Eski sürümün
+belirsiz metin fiyatı onaysız kullanılmaz. Satış fiyatı webden doğrulanıp düzeltilebilir;
+bu işlem sipariş göndermez veya panel sorgulamaz. Hesap tahminidir; iptal/kısmi iade
+tutarının doğrulandığı gerçekleşen kâr raporu değildir.
 
 Bağlantılar sayfasından mod seçilir: Kapalı / Gözlem / Koruma açık. Gözlemde yalnızca
 hesaplanıp siparişte ve CSV'de gösterilir. Koruma açıkken kâr sınırın (varsayılan 10 TL)
@@ -62,12 +71,16 @@ numara/link kopyalama, link düzeltme ve gönderim önizlemesi vardır. Bilgi d�
 veya eşleştirmek sipariş göndermez. İstenerek eşleştirilmemiş ilanlar işlem kutusu
 ve Telegram dışında, Tüm kayıtlar bölümünde korunur.
 
-Normal başarılı gönderim ve sorunsuz tamamlanma Telegram'a yazılmaz.
+Başarılı panel gönderimi, panel sipariş numaraları ve adetleriyle bir kez Telegram'a
+bildirilir. Aynı kaydın tekrarı veya yeniden başlatma ikinci başarı mesajı üretmez.
+Sorunsuz tamamlanma ayrıca bildirilmez. Eski sessiz başarı kayıtları topluca gönderilmez.
 Başlatılamayan, aktif hedef nedeniyle bekletilen veya duraklatılan her ayrı satın alma
 kendi kayıt numarası, hedefi ve sebebiyle bildirilir. Bir ilanın/sorunun gün içinde
 daha önce bildirilmiş olması sonraki satın almanın uyarısını bastırmaz. Aynı kaydın
 değişmeyen durumunu izlemek tekrar bildirim üretmez; açık bir manuel deneme yeniden
 engellenirse o denemenin sonucu bildirilir. İstenerek eşleştirilmemiş ilanlar sessiz kalır.
+Satın alma olduğu anlaşılan fakat ilan numarası okunamayan kayıt ise tek inceleme
+uyarısı üretir; ilan numarası webde düzeltilebilir, kaydetmek otomatik göndermez.
 Gönderime hazır kayıt için bir uyarı gelir. İptal/kısmi/iade sonuçları Türkçe gösterilir;
 aynı sonuç bekleyen kaydı hazır yaptıysa sonuç ve hazır bildirimi tek mesaj olur.
 Ret ve belirsiz cevap uyarıları her sipariş için ayrıdır; zamanlayıcıyla hatırlatma gönderilmez.
@@ -76,6 +89,10 @@ tek seferlik bildirim oluşturulur. İptal gerekçesi/iade tutarı tahmin edilme
 
 Telegram'da `/start` veya `/yardim` menüyü açar. `/bekleyen`, `/sorunlar`, `/durum`,
 `/ara kayıt-no` komutları Türkçe cevap verir; eski komut adları da çalışır.
+
+Toplu eşleştirme önizlemesinin değişiklikleri ve sürüm özeti aynı veriden üretilir.
+Tekli/toplu ekleme, düzenleme ve silme aynı işlem kilidini paylaşır; sürüm kontrolü
+ile kaydetme arasına başka bir eşleştirme yazması giremez. Ek tablo veya tarama yoktur.
 
 Webde her uygun kayıtta **Kaydı kapat** ve **Sil** düğmeleri bulunur. Seçim kutularıyla
 görüntülenen kayıtlar topluca da temizlenebilir; işlemden önce sayı ve etkisi gösterilir,

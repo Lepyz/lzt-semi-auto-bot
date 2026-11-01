@@ -49,7 +49,7 @@ class Notifier:
 
     def send(self, notification):
         if not self.settings.bot_token or not self.settings.chat_id:
-            return "disabled"
+            return "failed"
         if notification.get("callback_id"):
             try:
                 response = requests.post(
@@ -93,13 +93,13 @@ class Notifier:
         if not self.store.claim_notification(key):
             return
         # Old pending routine notices must not reappear after this upgrade.
-        if item.get("policy") != "unsent-v2" and (
+        if item.get("policy") not in {"unsent-v2", "order-events-v3"} and (
                 any(event in key for event in (":submitted:", ":waiting:", ":paused:")) or
                 ":review:" in key and "eşleştirmesi yok" in item.get("text", "")):
             self.store.finish_notification(key, True)
             return
         result = self.send(item)
-        self.store.finish_notification(key, result in {"sent", "disabled"})
+        self.store.finish_notification(key, result == "sent")
         if result == "retry":
             self.store.retry_notification(key)
             row = self.store.notification(key)

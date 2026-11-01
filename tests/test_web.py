@@ -444,7 +444,9 @@ def test_purchase_in_unknown_format_is_saved_once_and_visible(client, rig):
     assert client.post("/itemsatis-webhook", json=data).json()["status"] == "already_saved"
     order = rig.store.get(first["id"])
     assert order["state"] == "review" and not rig.panels.adds
-    assert not rig.notices  # no advert, so no Telegram alert storm
+    notices = rig.store.pending_notifications()
+    assert len(notices) == 1 and notices[0]["order_id"] == first["id"]
+    assert "ilan" in notices[0]["text"]  # One actionable alert for this distinct purchase.
     assert first["id"] in client.get("/admin").text  # visible in the action inbox
 
 
