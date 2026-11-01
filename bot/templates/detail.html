@@ -18,12 +18,22 @@
   </div>
   {% if display.actionable %}<form class="order-actions" method="post" action="/admin/orders/{{ order.id }}/attention"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><input type="hidden" name="handling" value="{{ 'no' if order.handling else 'yes' }}"><button>{{ 'İlgileniyorum işaretini kaldır' if order.handling else '👀 Bu kayıtla ilgileniyorum' }}</button></form>{% endif %}
 </section>
+<section class="card"><h2>💰 Kâr hesabı</h2>
+  <p>Satış fiyatı: <strong>{{ order.sale_price|money if order.sale_price else 'Bildirimde bulunamadı' }}</strong>{% if order.price_source %}<br><small>Bildirimdeki alan: {{ order.price_source }}</small>{% endif %}</p>
+  {% set pc = order.profit %}
+  {% if pc %}<p>Komisyon: {{ pc.commission|money }} · Panel maliyeti: {{ pc.cost|money }}<br><strong>Tahmini kâr: {{ pc.profit|money }}</strong> (sınır {{ pc.min_profit|money }})<br><small>Gönderim anında hesaplandı: {{ pc.at|clock }}</small></p>
+  {% if pc.message %}<p class="order-error">{{ pc.message }}</p>{% endif %}{% else %}<p class="muted">Kâr, sipariş gönderilirken o anki panel fiyatıyla hesaplanır.</p>{% endif %}
+</section>
 {% if preview_error %}<div class="card order-error" id="preview" role="alert">Gönderim özeti hazırlanamadı: {{ preview_error }}</div>{% endif %}
 {% if preview %}<section class="card order-preview" id="preview"><h2>📋 Gönderim önizlemesi</h2>
   <p><strong>Ürün:</strong> {{ preview.product_name or preview.advert_id }}<br><strong>Hedef:</strong> {{ preview.link }}</p>
   {% for p in preview.parts if p.state not in ['submitted','finished'] %}<div class="order-component">{{ panels.get(p.panel,{}).get('name',p.panel) }} · Servis {{ p.service_id }}<br><strong>{{ p.quantity }} adet</strong> · {{ p.platform }}<br>{{ p.link }}</div>{% endfor %}
+  {% if preview_profit %}{% set pp = preview_profit %}<div class="order-component"><strong>💰 Güncel kâr hesabı</strong><br>Satış {{ pp.sale|money }} · Komisyon {{ pp.commission|money }} · Maliyet {{ pp.cost|money }}<br><strong>Tahmini kâr: {{ pp.profit|money }}</strong> (sınır {{ pp.min_profit|money }})
+    {% if not pp.ok %}<p class="order-error">⚠️ {{ pp.message }}{% if guard.mode != 'enforce' %} Koruma gözlem modunda; gönderim engellenmez.{% endif %}</p>{% endif %}</div>{% endif %}
   <p>Henüz yeni sipariş açılmadı. Gönderimde aktif hedef tekrar kontrol edilir. Daha önce panele iletilmiş bileşenler yeniden gönderilmez.</p>
-  <form method="post" action="/admin/orders/{{ order.id }}/send" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><label><input type="checkbox" name="confirmed" value="yes" required> Ürün, adet ve hedef linkini kontrol ettim.</label><p><button class="primary">Onayla ve gönder</button></p></form>
+  <form method="post" action="/admin/orders/{{ order.id }}/send" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><label><input type="checkbox" name="confirmed" value="yes" required> Ürün, adet ve hedef linkini kontrol ettim.</label>
+    {% if guard.mode == 'enforce' and preview_profit and not preview_profit.ok %}<label><input type="checkbox" name="profit_override" value="yes" required> Kâr sınırının altında veya kâr hesaplanamadan göndermeyi onaylıyorum.</label>{% endif %}
+    <p><button class="primary">Onayla ve gönder</button></p></form>
 </section>{% endif %}
 <section class="card"><h2>Panel siparişleri</h2>
 {% for p in order.parts %}<div class="order-component"><h3>{{ panels.get(p.panel,{}).get('name',p.panel) }} · Servis {{ p.service_id }}</h3>

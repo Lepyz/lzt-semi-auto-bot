@@ -25,6 +25,19 @@ Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
 - İlk kurulumda gönderimler duraklatılmıştır. Eşleştirme ve geçiş doğrulandıktan
   sonra admin panelinden etkinleştirilir. Duraklatılmış kayıtlar elle gönderilir.
 
+## Zarar koruması
+
+Sipariş panele gönderilmeden hemen önce tahmini kâr hesaplanır:
+satış fiyatı (Itemsatış bildiriminden) − Itemsatış komisyonu (%7) − panelin o anki
+servis fiyatı (panel API `services` listesi; 1000 adet fiyatı, Package türünde sipariş başı).
+Panel fiyat listesi yalnızca gönderim veya gönderim özeti açılırken okunur ve 5 dakika
+bellekte tutulur; boştayken istek yapılmaz. Tüm paneller TL fiyat kullanır.
+
+Bağlantılar sayfasından mod seçilir: Kapalı / Gözlem / Koruma açık. Gözlemde yalnızca
+hesaplanıp siparişte ve CSV'de gösterilir. Koruma açıkken kâr sınırın (varsayılan 10 TL)
+altındaysa, panel fiyatı alınamazsa veya satış fiyatı yoksa sipariş bekletilir ve bir kez
+bildirilir. Gönderim özetinde kâr onayı işaretlenerek o tek gönderim için geçilebilir.
+
 ## Kaldırılan işler
 
 Gecikme alarmı, sık aralıklı tamamlanma taraması, otomatik bakiye sorguları, bakiye

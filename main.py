@@ -23,6 +23,7 @@ from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
 from bot.notifications import Notifier, register_telegram_webhook, telegram_api
 from bot.panels import PanelClient
+from bot.profit import MODES, evaluate, guard_settings, money
 from bot.store import Conflict, Store
 from bot.presentation import cleanup_actions, order_view, panel_label, summary as order_summary
 
@@ -51,6 +52,7 @@ LABELS = {"queued": "Alındı", "processing": "Hazırlanıyor", "sending": "Gön
 TEMPLATES.filters["date"] = lambda ts: datetime.fromtimestamp(
     ts / 1_000_000, timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
 TEMPLATES.filters["panel_status"] = panel_label
+TEMPLATES.filters["money"] = money
 TEMPLATES.filters["order_view"] = order_view
 TEMPLATES.filters["clock"] = lambda ts: datetime.fromtimestamp(
     ts, timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M") if ts else "Henüz kontrol edilmedi"
@@ -268,9 +270,13 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             url = urlsplit(panel.get("api_url", ""))
             if url.scheme == "https" and url.hostname:
                 homes[key] = "https://" + url.hostname
+        guard = guard_settings(app.state.store)
+        # Explicit preview only: fetches current panel prices (cached five minutes).
+        preview_profit = evaluate(preview, app.state.engine.panels, guard) if preview and guard["mode"] != "off" else None
         checks = app.state.engine.check_results.get(order_id, {"at": order.get("last_checked", 0), "ok": True})
         return page(request, "detail.html", order=order, display=order_view(order), related=related,
                     owner=owner, preview=preview, preview_error=preview_error, checks=checks, panel_homes=homes,
+                    guard=guard, preview_profit=preview_profit,
                     cleanup=cleanup_actions(order))
 
     @app.post("/admin/order-cleanup", dependencies=[Depends(mutation)])
@@ -291,10 +297,10 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                                                       "q": q, "state": state if state in LABELS else "", "message": message}), 303)
 
     @app.post("/admin/orders/{order_id}/send", dependencies=[Depends(mutation)])
-    def send(order_id: str, revision: int = Form(...), confirmed: str = Form("")):
+    def send(order_id: str, revision: int = Form(...), confirmed: str = Form(""), profit_override: str = Form("")):
         if confirmed != "yes":
             raise ValueError("Gönderim özetindeki ürün, adet ve hedefi kontrol edip onaylayın.")
-        app.state.engine.approve(order_id, revision)
+        app.state.engine.approve(order_id, revision, profit_override=profit_override == "yes")
         return RedirectResponse("/admin/orders/" + order_id + "?" + urlencode({"message": "Gönderim isteği alındı. Aktif hedef kontrolü tekrar yapılacak."}), 303)
 
     @app.post("/admin/orders/{order_id}/attention", dependencies=[Depends(mutation)])
@@ -425,7 +431,21 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                                   secret=bool(settings.telegram_secret),
                                   secret_from_env=bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
                                   public=settings.public_url),
-                    ignored=list(app.state.engine.ignored), ignored_total=app.state.engine.ignored_total)
+                    ignored=list(app.state.engine.ignored), ignored_total=app.state.engine.ignored_total,
+                    guard=guard_settings(app.state.store), modes=MODES)
+
+    @app.post("/admin/integrations/profit", dependencies=[Depends(mutation)])
+    def profit_setup(mode: str = Form(...), min_profit: str = Form(...), commission: str = Form(...)):
+        if mode not in MODES:
+            raise ValueError("Koruma modu tanınmadı.")
+        try:
+            minimum, rate = float(min_profit.replace(",", ".")), float(commission.replace(",", "."))
+        except ValueError:
+            raise ValueError("Kâr sınırı ve komisyon sayı olmalı.") from None
+        if not 0 <= minimum <= 100000 or not 0 <= rate <= 50:
+            raise ValueError("Kâr sınırı 0 ile 100.000 TL, komisyon %0 ile %50 arasında olmalı.")
+        app.state.store.set_setting("profit_guard", {"mode": mode, "min_profit": minimum, "commission": rate / 100})
+        return back(f"Zarar koruması: {MODES[mode]} · sınır {money(minimum)} · komisyon %{rate:g}")
 
     def back(message):
         return RedirectResponse("/admin/integrations?" + urlencode({"message": message}), 303)
@@ -485,16 +505,23 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     def export():
         result = io.StringIO()
         writer = csv.writer(result, delimiter=";")
-        writer.writerow(["Itemsatış sipariş numarası", "İlan", "Ürün", "Link", "Durum", "Panel", "Panel sipariş numarası", "Adet"])
+        writer.writerow(["Itemsatış sipariş numarası", "İlan", "Ürün", "Link", "Durum", "Panel", "Panel sipariş numarası", "Adet",
+                         "Satış (TL)", "Komisyon (TL)", "Panel maliyeti (TL)", "Tahmini kâr (TL)"])
+        def amount(value):
+            return "" if value is None else f"{value:.2f}".replace(".", ",")
         def safe(value):
             text = str(value or "")
             return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
         for order in app.state.store.orders(states=set(LABELS) - {"legacy"}, limit=100000):
-            for part in order["parts"] or [{}]:
+            check = order.get("profit") or {}
+            for index, part in enumerate(order["parts"] or [{}]):
+                # Order-level amounts only on the first row, so Excel sums stay correct.
+                money_cells = (amount(order.get("sale_price")), amount(check.get("commission")),
+                               amount(check.get("cost")), amount(check.get("profit"))) if index == 0 else ("",) * 4
                 writer.writerow([safe(v) for v in (
                     order["itemsatis_id"], order["advert_id"], order["product_name"], order["link"],
                     order_view(order)["title"], part.get("panel", ""),
-                    part.get("smm_id", ""), part.get("quantity", ""))])
+                    part.get("smm_id", ""), part.get("quantity", ""), *money_cells)])
         return Response("\ufeff" + result.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": 'attachment; filename="siparisler.csv"'})
 

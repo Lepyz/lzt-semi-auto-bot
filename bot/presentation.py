@@ -1,5 +1,7 @@
 """Shared Turkish labels, reasons and notification policy. No network or storage."""
 from .payloads import normalize_panel_status_text
+from .profit import CODES as PROFIT_CODES
+from .profit import lines as profit_lines
 
 STATES = {
     "queued": ("📥", "Sipariş alındı", "info"),
@@ -38,6 +40,9 @@ REASONS = {
     "paused": ("Yeni gönderimler yönetim panelinden duraklatıldı.", "Gönderimleri açmak, daha önce tutulan kayıtları otomatik başlatmaz."),
     "legacy_duplicate": ("Bu bildirim eski sürümde işlenmiş.", "Çift siparişi önlemek için yeniden gönderilmedi."),
     "review": ("Sipariş bilgileri otomatik gönderim için yeterli değil.", "Ürün, hedef link ve servis bilgilerini web panelinden kontrol et."),
+    "low_profit": ("Tahmini kâr belirlediğin sınırın altında; sipariş gönderilmedi.", "Kâr hesabını gönderim özetinde kontrol et. Yine de göndermek için kâr onayını işaretlemen gerekir."),
+    "cost_unknown": ("Panel servis fiyatı alınamadı; kâr hesaplanamadı.", "Panelde servisin açık olduğunu kontrol et. Gönderim özetinden kâr onayıyla gönderebilirsin."),
+    "price_unknown": ("Bildirimde satış fiyatı bulunamadı; kâr hesaplanamadı.", "Itemsatış'taki satış fiyatını kontrol et. Gönderim özetinden kâr onayıyla gönderebilirsin."),
     "status_unavailable": ("Panelden güncel sipariş durumu alınamadı.", "Mevcut sipariş aktif kabul ediliyor. Son doğrulanmış durumu kontrol et."),
 }
 
@@ -47,6 +52,9 @@ def reason_code(text, state=""):
     if state == "uncertain":
         return "uncertain"
     rules = [
+        ("low_profit", ("tahmini kâr",)),
+        ("cost_unknown", ("servis fiyatı alınamadı",)),
+        ("price_unknown", ("satış fiyatı bulunamadı",)),
         ("binding_missing", ("eşleştirmesi yok", "eşleştirme pasif", "aktif servis eşleştirmesi")),
         ("link_missing", ("müşteri linki", "invalid link", "invalid url", "incorrect link", "link format")),
         ("package_target", ("paket bileşenlerinin",)),
@@ -163,6 +171,8 @@ def alert(order, event):
         text += "\nPanel: " + panel
     if order.get("previous_result"):
         text += "\nÖnceki işlem: " + order["previous_result"]
+    if view["issue"] in PROFIT_CODES and order.get("profit"):
+        text += "\n" + profit_lines(order["profit"])
     text += "\n\nNeden: " + view["reason"] + "\n👉 " + view["advice"]
     return {"key": key, "text": text[:3500], "order_id": order["id"],
             "action": state == "ready", "grouped": False, "policy": "unsent-v2"}

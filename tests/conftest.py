@@ -20,6 +20,8 @@ class FakePanels:
         self.checks = []
         self.results = []
         self.current = {"status": "In progress", "terminal": False}
+        self.rates = {}
+        self.rate_calls = []
 
     def add(self, part, link):
         self.adds.append((dict(part), link))
@@ -28,6 +30,10 @@ class FakePanels:
     def status(self, part):
         self.checks.append(dict(part))
         return self.current
+
+    def service_rate(self, panel, service_id):
+        self.rate_calls.append((panel, service_id))
+        return self.rates.get((panel, str(service_id)), {"rate": 10.0, "type": "Default"})
 
 
 def disposable_postgres():

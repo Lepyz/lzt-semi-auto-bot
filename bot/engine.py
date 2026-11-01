@@ -8,8 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import panel_key
 from .payloads import classify, extract_links, get_advert_id, get_order_id, get_product_name
-from .payloads import ignored_summary, legacy_payload_key, normalize_panel_link, source_key, target_key, valid_link
+from .payloads import get_sale_price, ignored_summary, legacy_payload_key, normalize_panel_link, source_key, target_key, valid_link
 from .store import Conflict
+from .profit import evaluate, guard_settings
 from .presentation import alert, panel_label, reason_code, summary
 
 logger = logging.getLogger(__name__)
@@ -99,10 +100,12 @@ class Engine:
         if legacy:
             return legacy, False
         now = int(time.time() * 1_000_000)
+        price, price_source = get_sale_price(payload)
         order = {"id": uuid.uuid4().hex, "source_key": source_key(payload),
                  "legacy_source_key": legacy_key,
                  "itemsatis_id": get_order_id(payload), "advert_id": get_advert_id(payload),
                  "product_name": get_product_name(payload)[:200], "links": extract_links(payload),
+                 "sale_price": price, "price_source": price_source,
                  "link": "", "target": "", "parts": [], "state": "queued" if kind == "order" else "review",
                  "manual_required": kind != "order", "error": "", "created_at": now, "updated_at": now}
         if kind != "order":
@@ -236,6 +239,16 @@ class Engine:
         if earlier:
             self.wait(order, "Bu linkte daha önce alınmış, senin işlemini bekleyen sipariş var.", monitor=False)
             return
+        # Loss guard: checked with current panel prices before anything is sent.
+        override = order.pop("profit_override", False)
+        guard = guard_settings(self.store)
+        if guard["mode"] != "off":
+            check = evaluate(order, self.panels, guard)
+            order["profit"] = check
+            if guard["mode"] == "enforce" and not check["ok"] and not override:
+                order.update(state="review", manual_required=True, error=check["message"])
+                self.save(order, "profit", code=check["code"])
+                return
         lock_owner = self.store.acquire_target(order["target"], order["id"])
         if lock_owner != order["id"]:
             self.wait(order, "Aynı linkte başka bir sipariş işleniyor.")
@@ -366,7 +379,7 @@ class Engine:
             return order  # FIFO: only the first waiting purchase becomes ready.
         return None
 
-    def approve(self, order_id, revision=None):
+    def approve(self, order_id, revision=None, profit_override=False):
         order = self.store.get(order_id)
         if not order or order["state"] not in MANUAL_STATES:
             raise ValueError("Bu sipariş gönderime uygun değil; mevcut durumu kontrol edin.")
@@ -383,7 +396,20 @@ class Engine:
             order = self.store.get(order_id)
             if any(p["state"] == "submitted" for p in order["parts"]):
                 raise ValueError("Bu siparişin aktif paket bileşeni var; sonuçlanmasını bekleyin.")
-        order.update(state="queued", manual_required=True, manual_approved=True, error="", reason_code="")
+        guard = guard_settings(self.store)
+        if guard["mode"] == "enforce" and not profit_override:
+            prepared = copy.deepcopy(order)
+            try:
+                self.prepare(prepared)
+            except ValueError:
+                prepared = None  # execute() reports the missing data as usual.
+            if prepared is not None:
+                check = evaluate(prepared, self.panels, guard)
+                if not check["ok"]:
+                    raise ValueError(check["message"] + " Göndermek için gönderim özetindeki kâr onayını işaretle.")
+        # The override covers this one send only; execute() consumes it.
+        order.update(state="queued", manual_required=True, manual_approved=True, error="", reason_code="",
+                     profit_override=bool(profit_override))
         self.store.save(order)
         self.enqueue(order_id)
 
