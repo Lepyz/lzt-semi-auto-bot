@@ -1,6 +1,6 @@
 # Boostera — sade sipariş işleyicisi
 
-Python 3.12+ / FastAPI / PostgreSQL. Çalışan bot Upstash kullanmaz.
+Python 3.14 (.python-version) / FastAPI / PostgreSQL. Çalışan bot Upstash kullanmaz.
 Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
 
 ## Sipariş davranışı
@@ -106,10 +106,8 @@ garantisi yoktur. Güncel koşullar: https://neon.com/pricing
    Start: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers
    Bir Uvicorn işçisi/tek Render instance kullan. İçeride farklı hedefler için
    varsayılan dört gönderim thread'i vardır; aynı hedef veritabanı kilidiyle korunur.
-4. Yeni sürümü gönderimler duraklatılmış olarak dağıt. Eski sürümün artık çalışmadığını
-   Render dağıtım durumundan doğrula. Ardından aşağıdaki yönetim ekranıyla aktarımı yap.
-   Eski Upstash URL'si ortamda duruyorsa geçiş tamamlanmadan gönderimleri etkinleştirmek
-   engellenir. İlk kurulum duraklatılmış açılır; bunu değiştirme.
+4. Yeni kurulum duraklatılmış açılır. Upstash geçişi tamamlandı; yönetim panelindeki
+   aktarım ekranı kaldırıldı, gerekirse aşağıdaki komut satırı aracı kullanılır.
 5. Itemsatış webhook adresi aynı kalır: /itemsatis-webhook. Geçiş aralığında gelen
    satın almaları Itemsatış sipariş listesiyle karşılaştır. Kaynak platformun başarısız
    webhookları tekrar göndermesi doğrulanmadan uçtan uca sipariş kaybı garantisi verilemez.
@@ -121,23 +119,10 @@ garantisi yoktur. Güncel koşullar: https://neon.com/pricing
 8. Telegram için aşağıdaki kurulumu tamamla. Geçiş doğrulandıktan sonra Render'dan
    Upstash değişkenlerini kaldırabilirsin. Kaynak verileri hemen silme.
 
-### Eski kayıtları aktarma
+### Eski kayıtları aktarma (tamamlandı)
 
-Ücretsiz Render'da terminal veya yerel bağlantı anahtarı gerektirmeyen yol:
-
-1. Yeni sürüm dağıtıldıktan sonra /admin/migration adresini aç veya üst menüden
-   Veri aktarımı bağlantısına tıkla. Mevcut admin kullanıcı adı/parolası kullanılır.
-2. Eski kayıtları kontrol et düğmesine bas. Yalnızca eski kayıt sayıları okunur.
-3. Yeni gönderimler duraklatılmış ve eski sürüm artık çalışmıyorken ilgili kutuyu
-   işaretle, Kayıtları yeni veritabanına aktar düğmesine bas.
-4. Aktarım tamamlandı sonucunu bekle. İşlem sırasında durum göstergesi yalnızca
-   sunucu belleğini okur; Upstash veya PostgreSQL sorgusu üretmez.
-5. Eşleştirmeleri ve eski SMM kimliklerini kontrol et. Bundan sonra yeni gönderimleri
-   etkinleştir. Eski kuyruktan taşınan kayıtlar kendiliğinden gönderilmez.
-
-Bağlantılar Render Environment içinden okunur; HTML veya sonuç ekranında gösterilmez.
-Aktarım çalışırken diğer admin değişiklikleri engellenir. Yarım kalan aktarımda
-gönderimler kapalı tutulur, kaynak kayıtlar korunur; işlem tekrar çalıştırılabilir.
+Geçiş Ekim 2026'da tamamlandı. Yanlışlıkla yeniden çalıştırılıp gönderimleri
+duraklatmasın diye yönetim panelindeki aktarım ekranı kaldırıldı.
 
 Komut satırı alternatifi:
 
@@ -164,19 +149,14 @@ Hatalı/tanınmayan panel eşleştirmesi varsa aktarım tamamlanmış sayılmaz.
 Eski sürümün önceden silmiş olduğu başarısız kayıtlar veya hiç ulaşmamış siparişler
 bu araçla geri getirilemez. Aktarım sırasında manuel karşılaştırma gerekir.
 
-### Telegram gönderme butonu
+### Telegram
 
-- Render'a güçlü, rastgele bir TELEGRAM_WEBHOOK_SECRET ve PUBLIC_BASE_URL ekle.
-- Kişisel sohbette CHAT_ID sahibi gönderme yetkisine sahiptir.
-- Grupta ayrıca TELEGRAM_ADMIN_USER_IDS alanına yetkili kullanıcıların sayısal
-  Telegram kimliklerini ekle. Grup üyelerinin tamamına sipariş açma izni verilmez.
-- Aynı ortam değişkenleriyle açıkça çalıştır:
-
-    python scripts/configure_telegram.py
-
-Bu komut Telegram setWebhook kaydını günceller; bekleyen güncellemeleri silmez.
-Webhook secret kurulmadan Telegram'da para harcatan gönderme butonu gösterilmez.
-Admin panelindeki manuel gönderme her zaman kullanılabilir.
+- Bildirimlerdeki düğmeler ilgili web paneli sayfasını açar. Son gönderim onayı her
+  zaman web panelinden verilir; Telegram'da para harcatan bir düğme yoktur.
+- Komutlar (/bekleyen, /sorunlar, /durum, /ara) için webhook gerekir. Bağlantılar
+  sayfasındaki "Telegram webhook'unu kaydet" düğmesi gizli anahtarı üretip kaydeder.
+- Grupta komut kullanacak kişilerin sayısal Telegram kimlikleri TELEGRAM_ADMIN_USER_IDS
+  alanına eklenir.
 
 ## Kontroller ve sınırlar
 

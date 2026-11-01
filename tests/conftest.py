@@ -51,8 +51,8 @@ def rig(request, tmp_path):
            else "sqlite:///" + str(tmp_path / "test.sqlite"))
     settings = Settings(database_url=url,
                         password="test-admin-password", bot_token="", chat_id="", telegram_secret="",
-                        telegram_admins="", webhook_secret="", webhook_ips="", public_url="",
-                        require_import=False, panels={
+                        telegram_admins="", webhook_secret="", public_url="",
+                        panels={
                             "smmrush": {"name": "SMMRush", "api_url": "https://panel.invalid/api",
                                         "api_key": "test-panel-secret"},
                             "medyabayim": {"name": "MedyaBayim", "api_url": "https://other.invalid/api",

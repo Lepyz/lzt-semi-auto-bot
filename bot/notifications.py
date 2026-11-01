@@ -7,12 +7,6 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-def callbacks_allowed(settings):
-    """Private chat owner, or explicitly listed group admins; secret is mandatory."""
-    return bool(settings.telegram_secret and settings.chat_id and
-                (not settings.chat_id.startswith("-") or settings.telegram_admins.strip()))
-
-
 def telegram_api(settings, method, payload=None):
     """Explicit admin-triggered call. The bot token never appears in errors or logs."""
     if not settings.bot_token:

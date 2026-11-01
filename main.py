@@ -21,8 +21,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
-from bot.migration import MigrationJob
-from bot.notifications import Notifier, callbacks_allowed, register_telegram_webhook, telegram_api
+from bot.notifications import Notifier, register_telegram_webhook, telegram_api
 from bot.panels import PanelClient
 from bot.store import Conflict, Store
 from bot.presentation import cleanup_actions, order_view, panel_label, summary as order_summary
@@ -77,7 +76,6 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         notifier = Notifier(database, settings)
         engine = Engine(database, panels or PanelClient(settings.panels), notifier, settings)
         app.state.store, app.state.engine, app.state.notifier = database, engine, notifier
-        app.state.migration = MigrationJob(database, settings)
         app.state.ready = True
         if start_background:
             notifier.start()
@@ -112,8 +110,6 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         token = str(form.get("csrf", ""))
         if not valid_csrf(token) or not secrets.compare_digest(cookie, token):
             raise HTTPException(403, "İşlem anahtarı geçersiz; sayfayı yenileyin.")
-        if app.state.migration.status()["state"] == "running":
-            raise HTTPException(409, "Geçiş işlemi sürüyor. Tamamlanmasını bekleyin.")
 
     def page(request, template, **values):
         token = request.cookies.get("csrf", "")
@@ -169,10 +165,6 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             supplied.encode(), settings.webhook_secret.encode())
         if settings.webhook_enforced and not authenticated:
             raise HTTPException(401, "Webhook yetkisi doğrulanamadı.")
-        if settings.webhook_ips:
-            allowed = {ip.strip() for ip in settings.webhook_ips.split(",") if ip.strip()}
-            if not request.client or request.client.host not in allowed:
-                raise HTTPException(401, "Webhook IP adresi doğrulanamadı.")
         body = bytearray()
         async for chunk in request.stream():
             body.extend(chunk)
@@ -316,27 +308,8 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
 
     @app.post("/admin/pause", dependencies=[Depends(mutation)])
     def pause(paused: str = Form(...)):
-        if paused == "false" and settings.require_import and not app.state.store.setting("migration_complete", False):
-            raise ValueError("Önce eski Upstash kayıtlarının geçişini tamamlayın.")
         app.state.store.set_setting("paused", paused == "true")
         return RedirectResponse("/admin", 303)
-
-    @app.get("/admin/migration", dependencies=[Depends(admin)])
-    def migration_page(request: Request):
-        return page(request, "migration.html", job=app.state.migration.status(),
-                    configured=app.state.migration.configured(),
-                    paused=app.state.store.setting("paused", True),
-                    complete=app.state.store.setting("migration_complete", False),
-                    inspected=app.state.migration.inspected)
-
-    @app.get("/api/migration-status", dependencies=[Depends(admin)])
-    def migration_status():
-        return app.state.migration.status()  # RAM only: UI progress adds no SQL/Redis queries.
-
-    @app.post("/admin/migration", dependencies=[Depends(mutation)])
-    def run_migration(mode: str = Form(...), confirmed: str = Form("")):
-        app.state.migration.start(mode, confirmed == "yes")
-        return RedirectResponse("/admin/migration", 303)
 
     @app.get("/admin/services", dependencies=[Depends(admin)])
     @app.get("/admin/packages", dependencies=[Depends(admin)])
@@ -403,8 +376,17 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         return RedirectResponse("/admin/services", 303)
 
     @app.post("/admin/services/delete", dependencies=[Depends(mutation)])
-    def delete_service(advert_id: str = Form(...)):
-        app.state.store.delete_binding(advert_id)
+    def delete_service(advert_id: str = Form(...), version: str = Form(...), confirmed: str = Form("")):
+        if confirmed != "yes":
+            raise ValueError("Eşleştirmeyi kaldırmak için onay kutusunu işaretleyin.")
+        store = app.state.store
+        key = "binding:" + advert_id.strip()
+        with store.transaction() as conn:
+            current = store.execute(conn, "SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if not current or not secrets.compare_digest(
+                    binding_version(json.loads(current["value"])).encode(), version.encode()):
+                raise Conflict("Eşleştirme başka bir ekranda değişmiş veya kaldırılmış. Sayfayı yenileyin.")
+            store.execute(conn, "DELETE FROM settings WHERE key=? AND value=?", (key, current["value"]))
         return RedirectResponse("/admin/services", 303)
 
     @app.get("/admin/integrations", dependencies=[Depends(admin)])
@@ -417,11 +399,9 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                     seen=app.state.store.setting("itemsatis_webhook_seen") if key else None,
                     telegram=dict(token=bool(settings.bot_token), chat=bool(settings.chat_id),
                                   group=settings.chat_id.startswith("-"),
-                                  admins=bool(settings.telegram_admins.strip()),
                                   secret=bool(settings.telegram_secret),
                                   secret_from_env=bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
-                                  buttons=callbacks_allowed(settings), public=settings.public_url),
-                    ip_list=bool(settings.webhook_ips),
+                                  public=settings.public_url),
                     ignored=list(app.state.engine.ignored), ignored_total=app.state.engine.ignored_total)
 
     def back(message):
@@ -477,11 +457,6 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             when = datetime.fromtimestamp(info.get("last_error_date", 0), timezone(timedelta(hours=3)))
             parts.append("Son hata (" + when.strftime("%d.%m.%Y %H:%M") + "): " + str(info["last_error_message"])[:200])
         return back(" · ".join(parts))
-
-    @app.get("/api/orders", dependencies=[Depends(admin)])
-    def api_orders(state: str = "", q: str = ""):
-        return {"orders": app.state.store.orders(states={state} if state else set(LABELS) - {"legacy"},
-                                                 search=q, limit=500, newest=True)}
 
     @app.get("/admin/export", dependencies=[Depends(admin)])
     def export():
