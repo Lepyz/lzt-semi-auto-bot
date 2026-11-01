@@ -21,6 +21,7 @@
 <article class="card order-card">
   {% if o.cleanup.delete %}<label class="cleanup-choice" data-cleanup-ui hidden><input type="checkbox" class="cleanup-pick" value="{{ o.id }}:{{ o.revision }}" data-can-close="{{ 'yes' if o.cleanup.close else 'no' }}" data-cleanup-label="{{ o.itemsatis_id or o.id[:10] }} · {{ o.product_name or 'İlan ' ~ o.advert_id }}" aria-label="{{ o.itemsatis_id or o.id[:10] }} numaralı kaydı seç"> Bu kaydı seç</label>{% endif %}
   <div class="order-meta"><span class="state-badge tone-{{ v.tone }}">{{ v.icon }} {{ v.title }}</span>{% if o.handling %}<small>👀 İlgileniyorum</small>{% endif %}</div>
+  {% if o.stalled %}<p class="order-error"><strong>⚠️ En az 5 dakikadır ilerlemiyor</strong><br>Kaydı ve paneli kontrol et; otomatik tekrar gönderim yapılmaz.</p>{% endif %}
   <h2>{{ o.product_name or 'İlan ' ~ o.advert_id }}</h2>
   <p class="order-id">Kayıt {{ o.itemsatis_id or o.id[:10] }} · İlan {{ o.advert_id }}<br>{{ o.created_at|date }}</p>
   {% if o.queue and (o.queue.active or o.queue.ahead or o.queue.behind) %}<p class="order-check">🔗 Aynı linkte: {{ o.queue.active }} aktif · bu kayıttan önce {{ o.queue.ahead }}, sonra {{ o.queue.behind }} bekleyen</p>{% endif %}

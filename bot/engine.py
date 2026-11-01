@@ -10,6 +10,7 @@ from .config import panel_key
 from .payloads import classify, extract_links, get_advert_id, get_order_id, get_product_name
 from .payloads import get_sale_price, ignored_summary, legacy_payload_key, normalize_panel_link, parse_price, source_key, target_key, valid_link
 from .store import Conflict
+from .history import IN_FLIGHT, STALLED_AFTER, is_stalled, phase_since, stalled_notice
 from .profit import CODES as PROFIT_CODES, evaluate, guard_settings, reprice
 from .presentation import alert, panel_label, reason_code, summary
 
@@ -67,6 +68,7 @@ class Engine:
         self.check_results = {}
         self.recent_checks = {}
         self.running = set()
+        self.dispatch_checks = {}
         # Memory only: recent ignored webhooks, so a changed purchase format is noticed.
         self.ignored = collections.deque(maxlen=20)
         self.ignored_total = 0
@@ -117,6 +119,7 @@ class Engine:
         saved, created = self.store.create(order)
         if created:
             if saved["state"] == "queued":
+                self.schedule_dispatch(saved)
                 self.enqueue(saved["id"])
             else:
                 binding = self.store.setting("binding:" + saved["advert_id"]) if saved["advert_id"] else None
@@ -128,7 +131,45 @@ class Engine:
 
     def enqueue(self, order_id):
         if not self.stop_event.is_set():
+            with self.guard:
+                self.dispatch_checks.setdefault(order_id, time.monotonic() + STALLED_AFTER)
             self.pool.submit(self._run, order_id)
+
+    def schedule_dispatch(self, order, grace=0):
+        with self.guard:
+            if order["state"] in IN_FLIGHT:
+                remaining = STALLED_AFTER - (time.time() * 1_000_000 - phase_since(order)) / 1_000_000
+                self.dispatch_checks[order["id"]] = time.monotonic() + max(grace, remaining, 0)
+            else:
+                self.dispatch_checks.pop(order["id"], None)
+
+    def check_stalled(self):
+        with self.guard:
+            due = [key for key, when in self.dispatch_checks.items() if when <= time.monotonic()][:10]
+        for order_id in due:
+            try:
+                order = self.store.get(order_id)
+                if not order or order["state"] not in IN_FLIGHT:
+                    with self.guard:
+                        self.dispatch_checks.pop(order_id, None)
+                    continue
+                now = int(time.time() * 1_000_000)
+                if not is_stalled(order, now):
+                    self.schedule_dispatch(order)
+                    continue
+                notification = stalled_notice(order, now)
+                result = self.store.notify_stalled(notification)
+                with self.guard:
+                    if result == "changed":
+                        self.dispatch_checks[order_id] = time.monotonic() + 60
+                    else:
+                        self.dispatch_checks.pop(order_id, None)
+                if result == "queued":
+                    self.notifier.enqueue(notification)
+            except Exception as exc:
+                logger.error("stalled_check_failed type=%s", type(exc).__name__)
+                with self.guard:
+                    self.dispatch_checks[order_id] = time.monotonic() + 60
 
     def _run(self, order_id):
         with self.guard:
@@ -138,6 +179,13 @@ class Engine:
         finally:
             with self.guard:
                 self.running.discard(order_id)
+            try:
+                current = self.store.get(order_id)
+                if not current or current["state"] not in IN_FLIGHT:
+                    with self.guard:
+                        self.dispatch_checks.pop(order_id, None)
+            except Exception:
+                pass  # The scheduled check remains if the final state couldn't be read.
 
     def _execute_once(self, order_id):
         try:
@@ -414,6 +462,7 @@ class Engine:
         order.update(state="queued", manual_required=True, manual_approved=True, error="", reason_code="",
                      profit_override=bool(profit_override))
         self.store.save(order)
+        self.schedule_dispatch(order)
         self.enqueue(order_id)
 
     def repair(self, order_id, link, revision, advert_id=""):
@@ -507,6 +556,7 @@ class Engine:
 
     def check_due(self):
         # Memory-only scheduling: no database queries when nothing is due.
+        self.check_stalled()
         with self.guard:
             active_due = [key for key, when in self.active_checks.items() if when <= time.monotonic()][:10]
         for key in active_due:
@@ -550,7 +600,10 @@ class Engine:
         # One Uvicorn worker is required. Queued claims are compare-and-swap, so
         # dispatching them while the previous instance drains is safe.
         for order in self.store.orders(states={"queued"}, limit=100000):
+            self.schedule_dispatch(order, grace=RECOVERY_DELAY)
             self.enqueue(order["id"])
+        for order in self.store.orders(states={"processing", "sending"}, limit=100000):
+            self.schedule_dispatch(order, grace=RECOVERY_DELAY)
         for order in self.store.orders(states={"waiting"}, limit=100000):
             self.watch.setdefault(order["target"], time.monotonic() + self.settings.check_interval)
         for order in self.store.orders(states={"submitted", "error"}, limit=100000):

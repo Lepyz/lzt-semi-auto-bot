@@ -4,6 +4,7 @@
 <p class="order-actions"><a class="button" href="/admin?view=inbox">← İşlem bekleyenler</a>{% if upcoming %}<a class="button" href="/admin/orders/{{ upcoming }}">Sıradaki işe geç →</a>{% endif %}</p><h1>{{ order.product_name or 'Sipariş ayrıntısı' }}</h1>
 <section class="card order-card">
   <span class="state-badge tone-{{ display.tone }}">{{ display.icon }} {{ display.title }}</span>
+  {% if stalled %}<div class="order-reason order-error" role="alert"><strong>⚠️ Bu sipariş ilerlemiyor</strong><p>Hazırlık veya gönderim aşaması en az 5 dakikadır değişmedi. Panelde sipariş açılmış olabilir; önce kaydı ve paneli kontrol et. Bu kontrol otomatik tekrar gönderim yapmaz.</p></div>{% endif %}
   <p class="order-id">Kayıt: {{ order.itemsatis_id or order.id[:10] }} <button class="order-copy" type="button" data-copy-text="{{ order.itemsatis_id or order.id[:10] }}">Numarayı kopyala</button><br>İlan: {{ order.advert_id }} · {{ order.created_at|date }}</p>
   {% set link = order.link or order.links.get('other','') %}
   <p><small>Müşteri / hedef linki</small><br>{{ link or 'Henüz belirlenmedi' }}</p>{% if link %}<button class="order-copy" type="button" data-copy-text="{{ link }}">Linki kopyala</button>{% endif %}
@@ -18,6 +19,11 @@
   </div>
   {% if display.actionable %}<form class="order-actions" method="post" action="/admin/orders/{{ order.id }}/attention"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}"><input type="hidden" name="handling" value="{{ 'no' if order.handling else 'yes' }}"><button>{{ 'İlgileniyorum işaretini kaldır' if order.handling else '👀 Bu kayıtla ilgileniyorum' }}</button></form>{% endif %}
 </section>
+<details class="card" id="history" {{ 'open' if stalled or order.state in ['error','review','uncertain'] }}><summary>🕒 İşlem geçmişi (son {{ order.get('history',[])|length }} adım)</summary>
+  {% if order.get('history') %}<ol class="order-history">{% for event in order.history %}<li><time>{{ event.at|moment }}</time><strong>{{ event.title }}</strong>{% if event.panel %}<small>{{ panels.get(event.panel,{}).get('name',event.panel) }}</small>{% endif %}{% if event.detail %}<p>{{ event.detail }}</p>{% endif %}</li>{% endfor %}</ol>
+  {% else %}<p>Bu kayıt için henüz işlem geçmişi yok. Yeni değişiklikler burada görünecek.</p>{% endif %}
+  <p class="order-check">Son 10 önemli değişiklik saklanır. Aynı durumun tekrar kontrol edilmesi yeni adım oluşturmaz.</p>
+</details>
 <section class="card"><h2>💰 Kâr hesabı</h2>
   <p>Satış fiyatı: <strong>{{ order.sale_price|money if order.sale_price else 'Bildirimde bulunamadı' }}</strong>{% if order.price_source %}<br><small>Fiyat kaynağı: {{ 'Senin doğruladığın tutar' if order.price_source=='manual' else 'Itemsatış bildirimi' if sale_verified else 'Doğrulama bekliyor' }}</small>{% endif %}</p>
   {% if order.sale_price and not sale_verified %}<p class="order-error">Önceki sürümün bulduğu satış tutarı doğrulanmalı. Komisyon veya kesinti tutarı olabilir.</p>{% endif %}

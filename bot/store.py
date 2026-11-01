@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .presentation import cleanup_actions
+from .history import annotate, is_stalled
 
 
 class Conflict(Exception):
@@ -109,12 +110,14 @@ class Store:
             return self.decode(self.execute(conn, "SELECT * FROM orders WHERE source_key=?", (source,)).fetchone())
 
     def create(self, order):
+        document = dict(order)
+        annotate(None, document, int(time.time() * 1_000_000))
         with self.transaction() as conn:
             row = self.execute(conn, """INSERT INTO orders
                 (id,source_key,state,target,created_at,revision,document)
                 VALUES (?,?,?,?,?,0,?) ON CONFLICT DO NOTHING RETURNING id""",
                 (order["id"], order["source_key"], order["state"], order.get("target", ""),
-                 order["created_at"], json.dumps(order, ensure_ascii=False))).fetchone()
+                 order["created_at"], json.dumps(document, ensure_ascii=False))).fetchone()
             current = self.decode(self.execute(conn, "SELECT * FROM orders WHERE source_key=?",
                                               (order["source_key"],)).fetchone())
             if current is None:
@@ -127,6 +130,11 @@ class Store:
         document = dict(order, updated_at=int(time.time() * 1_000_000), revision=revision + 1)
         notified = False
         with self.transaction() as conn:
+            previous = self.decode(self.execute(conn, "SELECT * FROM orders WHERE id=? AND revision=?",
+                                                (order["id"], revision)).fetchone())
+            if previous is None:
+                raise Conflict("Sipariş başka bir işlem tarafından güncellendi; sayfayı yenileyin.")
+            annotate(previous, document, document["updated_at"])
             cursor = self.execute(conn, """UPDATE orders SET state=?,target=?,revision=?,document=?
                 WHERE id=? AND revision=?""",
                 (document["state"], document.get("target", ""), revision + 1,
@@ -147,6 +155,40 @@ class Store:
     def notify(self, notification):
         with self.transaction() as conn:
             return self._notification(conn, notification)
+
+    @staticmethod
+    def stall_matches(order, notification):
+        return (is_stalled(order, int(time.time() * 1_000_000)) and
+                order.get("phase_revision", 0) == notification["phase_revision"] and
+                order.get("dispatch_revision", 0) == notification["dispatch_revision"])
+
+    def notify_stalled(self, notification):
+        # A warning must not bump the order revision while an external add is in
+        # flight: its real reply must still be able to commit with the same revision.
+        with self.transaction() as conn:
+            sql = "SELECT * FROM orders WHERE id=?" + (" FOR UPDATE" if self.postgres else "")
+            order = self.decode(self.execute(conn, sql, (notification["order_id"],)).fetchone())
+            if not self.stall_matches(order, notification):
+                return "changed"
+            if not self.stall_eligible(conn, order):
+                return "ignored"
+            return "queued" if self._notification(conn, notification) else "duplicate"
+
+    def stall_eligible(self, conn, order):
+        if order.get("parts") or not order.get("advert_id"):
+            return True
+        row = self.execute(conn, "SELECT value FROM settings WHERE key=?", ("binding:" + order["advert_id"],)).fetchone()
+        return bool(row and json.loads(row["value"]).get("active", True))
+
+    def stalled_current(self, notification):
+        with self.transaction() as conn:
+            order = self.decode(self.execute(conn, "SELECT * FROM orders WHERE id=?", (notification["order_id"],)).fetchone())
+            return self.stall_matches(order, notification) and self.stall_eligible(conn, order)
+
+    def cancel_notification(self, key):
+        with self.transaction() as conn:
+            self.execute(conn, """UPDATE notifications SET state='cancelled',document='{}'
+                WHERE key=? AND state IN ('pending','sending')""", (key,))
 
     def cleanup_orders(self, selections, action):
         """Validate the complete selection before changing anything; keep receipt dedup keys."""
@@ -184,6 +226,8 @@ class Store:
                     document = dict(order, state="closed", manual_required=True, handling=False,
                                     reason_code="", error="Yönetici tarafından gönderilmeden kapatıldı.")
                 document.update(revision=order["revision"] + 1, updated_at=int(time.time() * 1_000_000))
+                if action == "close":
+                    annotate(order, document, document["updated_at"])
                 cursor = self.execute(conn, """UPDATE orders SET state=?,target=?,revision=?,document=?
                     WHERE id=? AND revision=?""", (document["state"], document.get("target", ""),
                     document["revision"], json.dumps(document, ensure_ascii=False), order["id"], order["revision"]))

@@ -92,6 +92,9 @@ class Notifier:
         key = item["key"]
         if not self.store.claim_notification(key):
             return
+        if item.get("kind") == "stalled" and not self.store.stalled_current(item):
+            self.store.cancel_notification(key)
+            return
         # Old pending routine notices must not reappear after this upgrade.
         if item.get("policy") not in {"unsent-v2", "order-events-v3"} and (
                 any(event in key for event in (":submitted:", ":waiting:", ":paused:")) or
