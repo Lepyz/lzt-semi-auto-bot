@@ -112,11 +112,13 @@ class Store:
         with self.transaction() as conn:
             row = self.execute(conn, """INSERT INTO orders
                 (id,source_key,state,target,created_at,revision,document)
-                VALUES (?,?,?,?,?,0,?) ON CONFLICT(source_key) DO NOTHING RETURNING id""",
+                VALUES (?,?,?,?,?,0,?) ON CONFLICT DO NOTHING RETURNING id""",
                 (order["id"], order["source_key"], order["state"], order.get("target", ""),
                  order["created_at"], json.dumps(order, ensure_ascii=False))).fetchone()
             current = self.decode(self.execute(conn, "SELECT * FROM orders WHERE source_key=?",
                                               (order["source_key"],)).fetchone())
+            if current is None:
+                raise Conflict("Kayıt kimliği başka bir satın almaya ait; sipariş yeniden kaydedilmeli.")
             return current, bool(row)
 
     def save(self, order, notification=None):

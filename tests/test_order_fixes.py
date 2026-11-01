@@ -12,6 +12,7 @@ from bot.notifications import Notifier
 from bot.panels import AddResult
 from bot.payloads import get_sale_price
 from bot.profit import evaluate, guard_settings
+from bot.store import Conflict
 from conftest import payload, receive_and_run
 from main import create_app
 
@@ -61,6 +62,16 @@ def test_success_notice_has_panel_id_and_is_actually_sent_only_once(rig, monkeyp
     notifier.deliver(notice)
     assert len(calls) == 1 and '1001' in calls[0]['text']
     assert rig.store.notification(notice['key'])['document'] == '{}'
+
+
+def test_record_id_collision_is_not_acknowledged_as_another_purchase(rig):
+    order, _ = rig.engine.receive(payload())
+    other = dict(order, source_key='different-purchase')
+    with pytest.raises(Conflict):
+        rig.store.create(other)
+    assert rig.store.by_source('different-purchase') is None
+    same, created = rig.store.create(dict(order))
+    assert not created and same['id'] == order['id']
 
 
 def test_package_failure_lists_already_accepted_components(rig):
