@@ -73,3 +73,31 @@ def test_tracking_links_share_target_but_youtube_video_case_preserved():
     assert target_key("https://youtube.com/watch?v=abc", "youtube") != "youtube.com/watch?v=AbC"
     assert target_key("youtu.be/AbC", "youtube") == "youtube.com/watch?v=AbC"
     assert target_key("HTTPS://WWW.INSTAGRAM.COM/Customer/#share", "instagram") == "instagram.com/customer"
+
+
+@pytest.mark.parametrize("data", [
+    {"event": "payment.completed", "order_id": "55"},       # changed event name, no advert
+    {"event": "siparis_odendi"},                             # purchase words, no ids
+    {"type": "new_sale", "purchase": {"id": "77"}},          # purchase id in another envelope
+])
+def test_purchase_like_webhooks_without_advert_are_kept_for_review(data):
+    assert classify(data) == "review"
+
+
+@pytest.mark.parametrize("data", [
+    {"event": "listing_chat_started", "id": "n1"},
+    {"event": "advert_updated", "advert": {"id": "10"}},
+    {"event": "user.login", "id": "notification-only"},     # a generic id is not a purchase id
+    {"ping": "1"},
+])
+def test_non_purchase_webhooks_stay_ignored(data):
+    assert classify(data) == "ignore"
+
+
+def test_ignored_summary_has_no_customer_values():
+    from bot.payloads import ignored_summary
+    summary = ignored_summary({"event": "message.created", "buyer": "secret-buyer",
+                               "post_datas": {"Link": "https://instagram.com/private"}})
+    assert summary["reason"] == "Sohbet / mesaj bildirimi"
+    assert "secret-buyer" not in str(summary) and "private" not in str(summary)
+    assert summary["fields"] == "buyer, event, post_datas"

@@ -1,3 +1,4 @@
+import collections
 import copy
 import logging
 import threading
@@ -7,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import panel_key
 from .payloads import classify, extract_links, get_advert_id, get_order_id, get_product_name
-from .payloads import legacy_payload_key, normalize_panel_link, source_key, target_key, valid_link
+from .payloads import ignored_summary, legacy_payload_key, normalize_panel_link, source_key, target_key, valid_link
 from .store import Conflict
 from .presentation import alert, panel_label, reason_code, summary
 
@@ -58,6 +59,9 @@ class Engine:
         self.check_failures = {}
         self.recent_checks = {}
         self.running = set()
+        # Memory only: recent ignored webhooks, so a changed purchase format is noticed.
+        self.ignored = collections.deque(maxlen=20)
+        self.ignored_total = 0
         self.recover_at = None
         self.monitor = None
 
@@ -80,6 +84,8 @@ class Engine:
     def receive(self, payload):
         kind = classify(payload)
         if kind == "ignore":
+            self.ignored.appendleft(dict(ignored_summary(payload), at=time.time()))
+            self.ignored_total += 1
             return None, False
         legacy_key = legacy_payload_key(payload)
         legacy = self.store.by_source(legacy_key)
