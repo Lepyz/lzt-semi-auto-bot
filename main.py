@@ -15,11 +15,12 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from bot import bulk
 from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
 from bot.notifications import Notifier, register_telegram_webhook, telegram_api
@@ -384,7 +385,12 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             entry = unmapped.setdefault(advert, {"advert": advert, "name": order.get("product_name") or "",
                                                  "count": 0, "last": order["created_at"], "hidden": advert in hidden})
             entry["count"] += 1
-        return page(request, "services.html", bindings=bindings,
+        week = int((time.time() - 7 * 86400) * 1_000_000)
+        rejected = {}
+        for order in app.state.store.orders(states={"error", "review", "closed", "finished"}, limit=5000, since=week):
+            if order.get("reason_code") in {"service", "quantity", "panel_rejected", "duplicate"}:
+                rejected[order.get("advert_id")] = rejected.get(order.get("advert_id"), 0) + 1
+        return page(request, "services.html", bindings=bindings, rejected=rejected,
                     unmapped=[u for u in unmapped.values() if show_hidden or not u["hidden"]],
                     hidden_count=sum(u["hidden"] for u in unmapped.values()), show_hidden=show_hidden,
                     versions={key: binding_version(value) for key, value in bindings.items()},
@@ -445,6 +451,59 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         if mode:
             return RedirectResponse("/admin/services?saved=" + advert_id, 303)
         return RedirectResponse("/admin/services", 303)
+
+    @app.get("/admin/services/export.csv", dependencies=[Depends(admin)])
+    def export_bindings():
+        return Response(bulk.export_csv(app.state.store.bindings(), settings.panels),
+                        media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="ilan-eslestirmeleri.csv"'})
+
+    def bulk_preview(request, title, changes, errors=()):
+        current = app.state.store.bindings()
+        return page(request, "services_bulk.html", title=title, changes=changes, errors=list(errors),
+                    snapshot=bulk.snapshot_hash(current),
+                    payload=json.dumps({c["advert"]: c["after"] for c in changes}, ensure_ascii=False))
+
+    @app.post("/admin/services/import", dependencies=[Depends(mutation)])
+    async def import_bindings(request: Request, file: UploadFile = File(...)):
+        raw = await file.read(300_001)
+        if len(raw) > 300_000:
+            raise ValueError("Dosya çok büyük (en fazla 300 KB).")
+        current = await asyncio.to_thread(app.state.store.bindings)
+        changes, errors = bulk.parse_import(bulk.decode(raw), current, settings.panels)
+        return await asyncio.to_thread(bulk_preview, request, "CSV içe aktarma özeti", changes, errors)
+
+    @app.post("/admin/services/swap", dependencies=[Depends(mutation)])
+    def swap_service(request: Request, panel: str = Form(...), old_service: str = Form(...), new_service: str = Form(...)):
+        changes = bulk.service_swap(app.state.store.bindings(), panel, old_service.strip(), new_service.strip(),
+                                    settings.panels)
+        title = f"Servis {old_service.strip()} → {new_service.strip()} değişikliği özeti"
+        return bulk_preview(request, title, changes, [] if changes else ["Bu panelde bu servisi kullanan eşleştirme yok."])
+
+    @app.post("/admin/services/bulk-apply", dependencies=[Depends(mutation)])
+    def apply_bulk(payload: str = Form(...), snapshot: str = Form(...), confirmed: str = Form("")):
+        if confirmed != "yes":
+            raise ValueError("Değişiklikleri uygulamak için onay kutusunu işaretleyin.")
+        try:
+            items = json.loads(payload)
+            bindings = {str(k): normalize_binding(v, settings.panels) for k, v in items.items() if str(k).isdigit()}
+        except (ValueError, AttributeError, TypeError):
+            raise ValueError("Değişiklik listesi okunamadı; işlemi baştan başlatın.") from None
+        if not bindings or len(bindings) != len(items):
+            raise ValueError("Uygulanacak geçerli değişiklik yok.")
+        store = app.state.store
+        with store.transaction() as conn:
+            rows = store.execute(conn, "SELECT key,value FROM settings WHERE key LIKE ? ORDER BY LENGTH(key),key",
+                                 ("binding:%",)).fetchall()
+            current = {r["key"][8:]: json.loads(r["value"]) for r in rows}
+            if not secrets.compare_digest(bulk.snapshot_hash(current).encode(), snapshot.encode()):
+                raise Conflict("Eşleştirmeler özet hazırlandıktan sonra değişti. Hiçbir değişiklik uygulanmadı; baştan başlatın.")
+            for advert, binding in bindings.items():
+                store.execute(conn, """INSERT INTO settings(key,value) VALUES (?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                    ("binding:" + advert, json.dumps(binding, ensure_ascii=False)))
+        message = f"{len(bindings)} eşleştirme güncellendi. Bekleyen siparişler kendiliğinden gönderilmedi."
+        return RedirectResponse("/admin/services?" + urlencode({"message": message}), 303)
 
     @app.post("/admin/services/unmapped", dependencies=[Depends(mutation)])
     def unmapped_visibility(advert_id: str = Form(...), action: str = Form(...)):
