@@ -23,6 +23,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from bot import bulk
 from bot.config import Settings
 from bot.engine import Engine, MANUAL_STATES, normalize_binding
+from bot.history import IN_FLIGHT, STALLED_AFTER, is_stalled
 from bot.notifications import Notifier, register_telegram_webhook, telegram_api
 from bot.panels import PanelClient
 from bot.profit import MODES, evaluate, guard_settings, money, reprice, sale_amount
@@ -58,6 +59,8 @@ TEMPLATES.filters["money"] = money
 TEMPLATES.filters["order_view"] = order_view
 TEMPLATES.filters["clock"] = lambda ts: datetime.fromtimestamp(
     ts, timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M") if ts else "Henüz kontrol edilmedi"
+TEMPLATES.filters["moment"] = lambda ts: datetime.fromtimestamp(
+    ts / 1_000_000, timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M:%S")
 
 
 def create_app(settings=None, store=None, panels=None, start_background=True):
@@ -93,7 +96,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             await asyncio.to_thread(engine.close)
             await asyncio.to_thread(notifier.close)
 
-    app = FastAPI(title="Boostera", version="3.2.0", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Boostera", version="3.3.0", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
 
     def admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -162,7 +165,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.api_route("/check-panel-health", methods=["GET", "HEAD"])
     def health():
         # Uptime checks must never query a database, panel or Telegram.
-        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.2.0"}
+        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.3.0"}
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):
@@ -217,12 +220,21 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         return {"active": active, "ahead": ahead, "behind": len(pending) - ahead,
                 "twin": (twin.get("itemsatis_id") or twin["id"][:10]) if twin else ""}
 
-    def inbox_rows(store):
+    def stalled_rows(store):
+        now = int(time.time() * 1_000_000)
+        candidates = [o for o in store.orders(states=IN_FLIGHT, limit=500, before=now - STALLED_AFTER * 1_000_000)
+                      if is_stalled(o, now)]
+        bindings = store.bindings() if any(o.get("advert_id") and not o.get("parts") for o in candidates) else {}
+        return [o for o in candidates if o.get("parts") or not o.get("advert_id") or
+                o["advert_id"] in bindings and bindings[o["advert_id"]].get("active", True)]
+
+    def inbox_rows(store, stalled=None):
         rows = store.orders(states={"ready", "review", "error", "uncertain", "paused"}, limit=500,
                             newest=True, exclude_unmapped=True)
-        priority = {"ready": 0, "uncertain": 1, "error": 2, "review": 3, "paused": 4}
+        rows += stalled if stalled is not None else stalled_rows(store)
+        priority = {"queued": -1, "processing": -1, "sending": -1, "ready": 0, "uncertain": 1, "error": 2, "review": 3, "paused": 4}
         rows.sort(key=lambda o: (bool(o.get("handling")), priority.get(o["state"], 5), o["created_at"]))
-        return rows
+        return rows[:500]
 
     @app.get("/", dependencies=[Depends(admin)])
     @app.get("/admin", dependencies=[Depends(admin)])
@@ -234,18 +246,20 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
         view = view if view in sections else "all" if q or state else "inbox"
         older = older if older in {30, 90} else 0
         before = int((datetime.now(timezone.utc) - timedelta(days=older)).timestamp() * 1_000_000) if older else None
+        stalled = stalled_rows(app.state.store)
         if view == "inbox" and not state:
-            rows = inbox_rows(app.state.store)
+            rows = inbox_rows(app.state.store, stalled)
         else:
             rows = app.state.store.orders(states={state} if state in LABELS else sections[view],
                                           search=q, limit=500, newest=True, before=before)
         targets = {o["target"] for o in rows if o.get("target") and o["state"] not in {"finished", "closed", "legacy"}}
         others = [o for o in app.state.store.orders(states=MANUAL_STATES | {"queued", "processing", "sending", "submitted",
                   "uncertain"}, limit=2000) if o.get("target") in targets] if targets else []
-        rows = [dict(o, display=order_view(o), cleanup=cleanup_actions(o),
+        rows = [dict(o, display=order_view(o), cleanup=cleanup_actions(o), stalled=is_stalled(o, int(time.time() * 1_000_000)),
                      queue=target_context(o, others) if o.get("target") in targets else None) for o in rows]
         counts = app.state.store.state_counts()
         totals = {key: sum(counts.get(state, 0) for state in states) for key, states in sections.items()}
+        totals["inbox"] += len(stalled)
         return page(request, "orders.html", orders=rows, selected=state, query=q, section=view, totals=totals, older=older,
                     paused=app.state.store.setting("paused", False),
                     failed_alerts=app.state.store.failed_notification_count())
@@ -313,7 +327,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                     guard=guard, preview_profit=preview_profit, record_profit=record_profit,
                     sale_verified=sale_amount(order) is not None,
                     context=context, upcoming=upcoming,
-                    cleanup=cleanup_actions(order))
+                    cleanup=cleanup_actions(order), stalled=is_stalled(order, int(time.time() * 1_000_000)))
 
     @app.post("/admin/order-cleanup", dependencies=[Depends(mutation)])
     def cleanup_orders(selected: list[str] = Form(...), action: str = Form(...), confirmed: str = Form(""),

@@ -25,6 +25,31 @@ Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
 - İlk kurulumda gönderimler duraklatılmıştır. Eşleştirme ve geçiş doğrulandıktan
   sonra admin panelinden etkinleştirilir. Duraklatılmış kayıtlar elle gönderilir.
 
+## Takılan sipariş ve kısa geçmiş
+
+Botun kaydettiği bir satın alma, işlem sırası / hazırlık / gönderim aşamasında
+5 dakika gerçek ilerleme göstermezse bir Telegram uyarısı oluşturulur. Aktif SMM
+siparişinin uzun sürmesi veya bilerek bekletilmiş bir kayıt bu alarma dahil değildir.
+Bilerek eşleştirilmemiş ilanlar sessiz kalır. Aynı gönderim denemesi için uyarı bir
+kez oluşturulur; yeniden başlatma veya aynı bildirimin tekrarı yeni uyarı üretmez.
+Sen açıkça yeni bir gönderim denemesi başlatırsan o deneme ayrıca izlenir.
+
+Kontrol siparişi yeniden göndermez, durumunu/revizyonunu veya hedef kilidini değiştirmez.
+Geç dönen gerçek panel cevabı kaydedilebilir. Mesaj gönderilmeden önce ilerleme yeniden
+kontrol edilir; çözülmüş uyarı iptal edilir. Takılan kayıtlar web işlem kutusunda ve
+ayrıntıda işaretlenir. Kontrol yalnızca bota ulaşmış kayıtlar içindir.
+
+İzleme zamanları RAM'dedir; yalnızca süresi dolmuş kayıtlar kimlikleriyle okunur.
+Boşta veya süre dolmadan ek SQL sorgusu yoktur. Başlangıçta yarım kayıtlar bir kez
+yüklenir ve eski Render örneğinin işi bitirmesi için mevcut açılış beklemesi korunur.
+Webdeki takılanlar listesi sayfa açıldığında hesaplanır; arka planda tablo taranmaz.
+
+Sipariş ayrıntısındaki İşlem geçmişi, son 10 önemli değişikliği mevcut kayıt içinde
+tutar: kaydedilme, bekletilme, manuel onay, panel numarası, sonuç ve bilgi/fiyat düzeltme.
+Tekrarlanan durum sorguları geçmişi doldurmaz; ham API cevapları veya müşteri linki
+geçmişe kopyalanmaz. Eski kayıtlara uydurma geçmiş eklenmez. Silme geçmişi de temizler.
+Geçmiş, normal kayıt güncellemesiyle aynı işlemde kaydedilir; ek tablo veya servis yoktur.
+
 ## Zarar koruması
 
 Sipariş panele gönderilmeden hemen önce tahmini kâr hesaplanır:
