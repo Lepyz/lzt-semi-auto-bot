@@ -37,6 +37,15 @@ def test_command_reply_uses_no_database(rig, monkeypatch):
     assert len(calls) == 1
 
 
+def test_missing_telegram_configuration_is_shown_as_failed_not_delivered(rig):
+    item = notification()
+    rig.store.notify(item)
+    Notifier(rig.store, rig.settings).deliver(item)
+    row = rig.store.notification(item["key"])
+    assert row["state"] == "failed" and row["document"] != "{}"
+    assert rig.store.failed_notification_count() == 1
+
+
 def test_ready_button_opens_authenticated_web_preview_instead_of_sending(rig, monkeypatch):
     import requests
     from types import SimpleNamespace

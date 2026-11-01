@@ -49,7 +49,7 @@ class Notifier:
 
     def send(self, notification):
         if not self.settings.bot_token or not self.settings.chat_id:
-            return "disabled"
+            return "failed"
         if notification.get("callback_id"):
             try:
                 response = requests.post(
@@ -99,7 +99,7 @@ class Notifier:
             self.store.finish_notification(key, True)
             return
         result = self.send(item)
-        self.store.finish_notification(key, result in {"sent", "disabled"})
+        self.store.finish_notification(key, result == "sent")
         if result == "retry":
             self.store.retry_notification(key)
             row = self.store.notification(key)
