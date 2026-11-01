@@ -518,3 +518,55 @@ def test_old_finished_filter_and_status_card(client, rig, monkeypatch):
     client.post("/itemsatis-webhook", json={"event": "message.created"})
     card = client.get("/admin/integrations").text
     assert "Sistem durumu" in card and "Bu açılıştan beri gelmedi" not in card and clock.time()
+
+
+def bulk_form(page):
+    payload = re.search(r'name="payload" value="([^"]*)"', page)
+    snapshot = re.search(r'name="snapshot" value="([^"]*)"', page)
+    import html
+    return html.unescape(payload.group(1)) if payload else None, snapshot.group(1) if snapshot else None
+
+
+def test_binding_csv_round_trip_preview_and_all_or_nothing(client, rig):
+    exported = client.get("/admin/services/export.csv").text
+    assert exported.lstrip("﻿").splitlines()[0] == "İlan;Ad;Durum;Panel;Servis;Adet;Platform;Servis adı"
+    assert "10;Takipçi;aktif;SMMRush;123;100;instagram;" in exported
+    csrf = token(client, "/admin/services")
+    edited = exported.replace("123;100", "123;250") + "20;Yeni paket;aktif;medyabayim;5;50;tiktok;\n20;Yeni paket;aktif;SMMRush;6;60;tiktok;\n"
+    page = client.post("/admin/services/import", data={"csrf": csrf},
+                       files={"file": ("x.csv", edited.encode("utf-8"), "text/csv")}).text
+    assert "İlan 10 · Değişecek" in page and "İlan 20 · Eklenecek" in page
+    assert rig.store.setting("binding:10")["components"][0]["quantity"] == 100  # nothing written yet
+    payload, snapshot = bulk_form(page)
+    response = client.post("/admin/services/bulk-apply", data={"csrf": csrf, "payload": payload,
+                                                               "snapshot": snapshot, "confirmed": "yes"})
+    assert response.status_code == 200
+    assert rig.store.setting("binding:10")["components"][0]["quantity"] == 250
+    assert len(rig.store.setting("binding:20")["components"]) == 2
+    assert not rig.panels.adds and not rig.jobs
+    # Applying the same (now stale) preview again is refused.
+    assert client.post("/admin/services/bulk-apply", data={"csrf": csrf, "payload": payload,
+                                                           "snapshot": snapshot, "confirmed": "yes"}).status_code == 409
+    # One bad row blocks the whole file.
+    bad = edited.replace("medyabayim;5;50", "medyabayim;5;0")
+    page = client.post("/admin/services/import", data={"csrf": csrf},
+                       files={"file": ("x.csv", bad.encode("utf-8"), "text/csv")}).text
+    assert "değişiklik uygulanamaz" in page and 'name="payload"' not in page
+
+
+def test_bulk_service_swap_and_rejection_badge(client, rig):
+    rig.store.set_setting("binding:30", {"name": "B", "active": True, "components": [
+        {"panel": "smmrush", "service_id": "123", "quantity": 10, "platform": "instagram"}]})
+    csrf = token(client, "/admin/services")
+    page = client.post("/admin/services/swap", data={"csrf": csrf, "panel": "smmrush",
+                                                     "old_service": "123", "new_service": "456"}).text
+    assert "İlan 10 · Değişecek" in page and "İlan 30 · Değişecek" in page
+    payload, snapshot = bulk_form(page)
+    client.post("/admin/services/bulk-apply", data={"csrf": csrf, "payload": payload, "snapshot": snapshot,
+                                                    "confirmed": "yes"})
+    assert rig.store.setting("binding:10")["components"][0]["service_id"] == "456"
+    assert rig.store.setting("binding:30")["components"][0]["service_id"] == "456"
+    from bot.panels import AddResult
+    rig.panels.results = [AddResult("error", error="Invalid service")]
+    receive_and_run(rig, 1)
+    assert "Son 7 günde 1 siparişte panel servisi/adedi reddetti" in client.get("/admin/services").text

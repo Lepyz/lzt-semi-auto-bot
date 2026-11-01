@@ -252,8 +252,11 @@ class Store:
                 WHERE key=? AND state='failed' AND attempts<3""", (key,))
 
     def orders(self, states=None, target=None, limit=200, search="", newest=False, exclude_unmapped=False,
-               before=None):
+               before=None, since=None):
         sql, params = "SELECT * FROM orders WHERE state<>'deleted'", []
+        if since is not None:
+            sql += " AND created_at>=?"
+            params.append(since)
         if before is not None:
             sql += " AND created_at<?"
             params.append(before)

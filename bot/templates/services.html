@@ -78,11 +78,26 @@
   <article class="card mapping-card {{ 'mapping-saved' if saved==id }}" data-advert="{{ id }}">
     <div class="mapping-meta"><small>İlan {{ id }}</small><span class="badge {{ 'submitted' if b.active else 'paused' }}">{{ 'Aktif' if b.active else 'Pasif' }}{{ ' · Paket' if b.components|length>1 }}</span></div>
     <h2>{{ b.name or 'İlan ' ~ id }}</h2>
+    {% if rejected.get(id) %}<p class="error-text"><small>⚠️ Son 7 günde {{ rejected[id] }} siparişte panel servisi/adedi reddetti. Servis numarasını kontrol et.</small></p>{% endif %}
     <ul class="mapping-parts">{% for p in b.components %}<li><strong>{{ panels.get(p.panel,{}).get('name',p.panel) }}</strong> · {{ p.quantity }} adet<small>Servis {{ p.service_id }} · {{ p.platform }}{% if p.name %} · {{ p.name }}{% endif %}</small></li>{% endfor %}</ul>
     <div class="mapping-actions"><button type="button" data-edit="{{ id }}" aria-label="İlan {{ id }} eşleştirmesini düzenle">Düzenle</button><button type="button" data-copy="{{ id }}" aria-label="İlan {{ id }} eşleştirmesini kopyala">Kopyala</button></div>
   </article>
 {% endfor %}
 </div>
+<details class="card" id="bulk"><summary>Toplu işlemler (CSV, servis değiştirme)</summary>
+  <p class="muted">Her toplu işlem önce bir değişiklik özeti gösterir; onaylamadan hiçbir şey değişmez. Ya hepsi uygulanır ya hiçbiri. Bekleyen siparişler başlatılmaz.</p>
+  <p><a class="button" href="/admin/services/export.csv">Eşleştirmeleri indir (CSV)</a></p>
+  <form method="post" action="/admin/services/import" enctype="multipart/form-data" class="grid"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Düzenlenmiş CSV dosyası<input type="file" name="file" accept=".csv,text/csv" required></label>
+    <div style="align-self:end"><button>Özeti gör</button></div></form>
+  <p class="muted"><small>Dosyada olmayan ilanlar değiştirilmez veya silinmez. Aynı ilan numarasının birden fazla satırı paket bileşenleridir.</small></p>
+  <h3>Servis numarasını toplu değiştir</h3>
+  <form method="post" action="/admin/services/swap" class="grid"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Panel<select name="panel">{% for key,panel in panels.items() %}<option value="{{ key }}">{{ panel.name }}</option>{% endfor %}</select></label>
+    <label>Eski servis no<input name="old_service" inputmode="numeric" pattern="[0-9]+" required></label>
+    <label>Yeni servis no<input name="new_service" inputmode="numeric" pattern="[0-9]+" required></label>
+    <div style="align-self:end"><button>Özeti gör</button></div></form>
+</details>
 <section class="card" id="unmapped"><h2>Eşleştirmesiz satışlar</h2>
   <p class="muted">Bağlı olmayan ilanlardan gelen satın almalar. Bunlar için bildirim gönderilmez. Bağlamak bekleyen siparişleri başlatmaz; kayıtları siparişler ekranından sen gönderirsin.</p>
   {% for u in unmapped %}<div class="order-component"><strong>İlan {{ u.advert }}</strong>{% if u.name %} · {{ u.name }}{% endif %}<br><small>{{ u.count }} satış · son: {{ u.last|date }}</small>
