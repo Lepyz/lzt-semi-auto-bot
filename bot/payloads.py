@@ -35,17 +35,29 @@ def payload_variants(data):
                          if isinstance(item.get(key), dict))
 
 
+ORDER_ID_PATHS = ("order_id", "purchaseId", "purchase_id", "sale_id", "transaction_id",
+                  "order.id", "order.order_id", "order.purchase_id", "purchase.id",
+                  "purchase.order_id", "purchase.purchase_id", "details.order_id",
+                  "details.purchaseId", "details.purchase_id", "details.order.id")
+CHAT_WORDS = {"chat", "message", "review", "question", "support", "ticket", "comment"}
+PURCHASE_WORDS = {"order", "siparis", "purchase", "sale", "satis", "satildi", "sold", "payment", "odeme", "paid"}
+
+
+def explicit_order_id(data):
+    """Only fields that name a purchase; a notification's generic id is not one."""
+    for item in payload_variants(data):
+        value = get_nested(item, *ORDER_ID_PATHS)
+        if value not in ("", None, "Bilinmiyor"):
+            return str(value)
+    return ""
+
+
 def get_order_id(data):
     variants = list(payload_variants(data))
     # Explicit order IDs must win over the notification/envelope's generic id.
-    paths = ("order_id", "purchaseId", "purchase_id", "sale_id", "transaction_id",
-             "order.id", "order.order_id", "order.purchase_id", "purchase.id",
-             "purchase.order_id", "purchase.purchase_id", "details.order_id",
-             "details.purchaseId", "details.purchase_id", "details.order.id")
-    for item in variants:
-        value = get_nested(item, *paths)
-        if value not in ("", None, "Bilinmiyor"):
-            return str(value)
+    explicit = explicit_order_id(data)
+    if explicit:
+        return explicit
     for item in variants:
         value = get_nested(item, "details.id", "data.id")
         if value not in ("", None):
@@ -62,7 +74,7 @@ def classify(data):
     event = normalize_panel_status_text(get_event(data))
     words = set(event.split())
     order_id, advert_id = get_order_id(data), get_advert_id(data)
-    if words & {"chat", "message", "review", "question", "support", "ticket", "comment"}:
+    if words & CHAT_WORDS:
         return "ignore"
     if event in {"listing chat started", "listing chat", "chat started", "advert updated"}:
         return "ignore"
@@ -77,7 +89,23 @@ def classify(data):
         return "order" if advert_id else "review"
     if order_id and advert_id:
         return "order" if not event else "review"
-    return "review" if advert_id else "ignore"
+    if advert_id:
+        return "review"
+    # A purchase in a changed format may lack the advert: keep it for review
+    # instead of acknowledging it and losing it silently.
+    if explicit_order_id(data) or words & PURCHASE_WORDS:
+        return "review"
+    return "ignore"
+
+
+def ignored_summary(data):
+    """What an ignored webhook looked like, without customer values."""
+    event = normalize_panel_status_text(get_event(data))
+    reason = ("Sohbet / mesaj bildirimi" if set(event.split()) & CHAT_WORDS or event in {"listing chat started", "listing chat", "chat started"}
+              else "İlan güncelleme bildirimi" if event == "advert updated"
+              else "Sipariş veya ilan bilgisi taşımıyor")
+    return {"event": event[:60], "reason": reason,
+            "fields": ", ".join(sorted(str(key)[:30] for key in data)[:12])}
 
 
 def receipt_payload(data):

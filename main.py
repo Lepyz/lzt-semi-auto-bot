@@ -421,7 +421,8 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
                                   secret=bool(settings.telegram_secret),
                                   secret_from_env=bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
                                   buttons=callbacks_allowed(settings), public=settings.public_url),
-                    ip_list=bool(settings.webhook_ips))
+                    ip_list=bool(settings.webhook_ips),
+                    ignored=list(app.state.engine.ignored), ignored_total=app.state.engine.ignored_total)
 
     def back(message):
         return RedirectResponse("/admin/integrations?" + urlencode({"message": message}), 303)

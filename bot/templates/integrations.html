@@ -45,6 +45,17 @@
 {% if ip_list %}<p class="error-text">WEBHOOK_IP_WHITELIST tanımlı. Render vekil sunucusu arkasında istemci IP'si güvenilir okunamaz; anahtar kullanın ve bu değişkeni kaldırın.</p>{% endif %}
 </div>
 
+<div class="card"><h2>Son yok sayılan bildirimler</h2>
+  <p class="muted">Sipariş veya ilan bilgisi taşımayan Itemsatış bildirimleri (sohbet, ilan güncelleme vb.) kaydedilmez. Sipariş gibi görünen her bildirim ise "Bilgileri kontrol et" kaydı olarak saklanır. Bu liste yalnızca son açılıştan beri tutulur ve müşteri bilgisi içermez.</p>
+  {% if ignored %}
+  <p>Son açılıştan beri <strong>{{ ignored_total }}</strong> bildirim yok sayıldı. Son {{ ignored|length }} tanesi:</p>
+  <div class="table-wrap"><table><thead><tr><th>Zaman</th><th>Olay</th><th>Neden</th><th>Alanlar</th></tr></thead><tbody>
+  {% for item in ignored %}<tr><td>{{ item.at|clock }}</td><td>{{ item.event or 'Olay adı yok' }}</td><td>{{ item.reason }}</td><td><small>{{ item.fields }}</small></td></tr>{% endfor %}
+  </tbody></table></div>
+  <p class="muted">Burada gerçek bir satın alma görürsen Itemsatış bildirim biçimi değişmiş olabilir; bildirim okuma kuralları güncellenmeli.</p>
+  {% else %}<p>Son açılıştan beri yok sayılan bildirim yok.</p>{% endif %}
+</div>
+
 <div class="card"><h2>Telegram</h2>
   <div class="grid">
     <p><small>Bildirim gönderimi</small><br>{{ 'Açık' if telegram.token and telegram.chat else 'Kapalı (BOT_TOKEN / CHAT_ID eksik)' }}</p>

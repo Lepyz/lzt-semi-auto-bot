@@ -535,3 +535,26 @@ def test_telegram_errors_never_expose_token(client, rig, monkeypatch):
     csrf = token(client, "/admin/integrations")
     response = client.post("/admin/integrations/telegram", data={"csrf": csrf, "action": "check"})
     assert response.status_code == 400 and "test-token" not in response.text
+
+
+def test_ignored_webhooks_are_listed_in_memory_without_notifications(client, rig, monkeypatch):
+    before = len(rig.store.orders(limit=1000))
+    for _ in range(25):
+        assert client.post("/itemsatis-webhook", json={"event": "message.created", "buyer": "x"}).json()["status"] == "ignored"
+    assert len(rig.store.orders(limit=1000)) == before  # nothing saved for chat events
+    with monkeypatch.context() as scoped:
+        scoped.setattr("requests.post", lambda *a, **k: pytest.fail("Page view called an external API"))
+        page = client.get("/admin/integrations").text
+    assert "Son açılıştan beri <strong>25</strong>" in page and page.count("Sohbet / mesaj bildirimi") == 20
+    assert not rig.notices
+
+
+def test_purchase_in_unknown_format_is_saved_once_and_visible(client, rig):
+    data = {"event": "payment.completed", "order_id": "9001"}
+    first = client.post("/itemsatis-webhook", json=data).json()
+    assert first["status"] == "saved"
+    assert client.post("/itemsatis-webhook", json=data).json()["status"] == "already_saved"
+    order = rig.store.get(first["id"])
+    assert order["state"] == "review" and not rig.panels.adds
+    assert not rig.notices  # no advert, so no Telegram alert storm
+    assert first["id"] in client.get("/admin").text  # visible in the action inbox
