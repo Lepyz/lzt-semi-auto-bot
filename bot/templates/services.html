@@ -83,6 +83,14 @@
   </article>
 {% endfor %}
 </div>
+<section class="card" id="unmapped"><h2>Eşleştirmesiz satışlar</h2>
+  <p class="muted">Bağlı olmayan ilanlardan gelen satın almalar. Bunlar için bildirim gönderilmez. Bağlamak bekleyen siparişleri başlatmaz; kayıtları siparişler ekranından sen gönderirsin.</p>
+  {% for u in unmapped %}<div class="order-component"><strong>İlan {{ u.advert }}</strong>{% if u.name %} · {{ u.name }}{% endif %}<br><small>{{ u.count }} satış · son: {{ u.last|date }}</small>
+    <div class="mapping-actions"><a class="button" href="/admin/services?new={{ u.advert }}&name={{ u.name|urlencode }}">Bu ilanı bağla</a><a class="button" href="/admin?q={{ u.advert }}">Satışları gör</a>
+      <form method="post" action="/admin/services/unmapped"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="advert_id" value="{{ u.advert }}"><input type="hidden" name="action" value="{{ 'show' if u.hidden else 'hide' }}"><button>{{ 'Listede göster' if u.hidden else 'Listede gizle' }}</button></form></div></div>
+  {% else %}<p>Eşleştirmesiz satış yok{{ ' (gizlenenler hariç)' if hidden_count and not show_hidden }}.</p>{% endfor %}
+  {% if hidden_count and not show_hidden %}<p><a href="/admin/services?hidden=1#unmapped">Gizlenen {{ hidden_count }} ilanı göster</a></p>{% endif %}
+</section>
 <div class="card empty" id="mapping-empty" {{ 'hidden' if bindings }}>Henüz eşleştirme yok. Yeni ilan bağla düğmesiyle istediğin ilanı ekleyebilirsin.</div>
 <template id="component-template">
   <section class="component-row mapping-component">

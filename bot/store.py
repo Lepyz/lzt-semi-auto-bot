@@ -251,8 +251,12 @@ class Store:
             self.execute(conn, """UPDATE notifications SET state='pending'
                 WHERE key=? AND state='failed' AND attempts<3""", (key,))
 
-    def orders(self, states=None, target=None, limit=200, search="", newest=False, exclude_unmapped=False):
+    def orders(self, states=None, target=None, limit=200, search="", newest=False, exclude_unmapped=False,
+               before=None):
         sql, params = "SELECT * FROM orders WHERE state<>'deleted'", []
+        if before is not None:
+            sql += " AND created_at<?"
+            params.append(before)
         if states:
             sql += " AND state IN (" + ",".join("?" for _ in states) + ")"
             params.extend(states)
@@ -270,6 +274,14 @@ class Store:
         params.append(limit)
         with self.transaction() as conn:
             return [self.decode(r) for r in self.execute(conn, sql, tuple(params)).fetchall()]
+
+    def unmapped_sales(self, limit=500):
+        """Purchases of adverts without an active binding, newest first."""
+        with self.transaction() as conn:
+            rows = self.execute(conn, """SELECT * FROM orders WHERE state NOT IN ('legacy','deleted','closed')
+                AND (document LIKE ? OR document LIKE ?) ORDER BY created_at DESC LIMIT ?""",
+                (*('%"reason_code": "binding_missing"%', '%İlanın aktif servis eşleştirmesi yok.%'), limit)).fetchall()
+            return [self.decode(r) for r in rows]
 
     def state_counts(self):
         with self.transaction() as conn:
