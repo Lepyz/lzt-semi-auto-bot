@@ -1,5 +1,6 @@
 """Panel calls have no balance requests, circuit database writes or add retries."""
 import threading
+import time
 from dataclasses import dataclass
 
 import requests
@@ -27,6 +28,8 @@ class PanelClient:
     def __init__(self, panels):
         self.panels = panels
         self.limits = {key: threading.BoundedSemaphore(2) for key in panels}
+        self.service_cache = {}
+        self.cache_lock = threading.Lock()
 
     def request(self, key, action, **fields):
         panel = self.panels.get(key, {})
@@ -36,6 +39,38 @@ class PanelClient:
             return requests.post(panel["api_url"],
                                  data={"key": panel["api_key"], "action": action, **fields},
                                  timeout=(5, 20), allow_redirects=False)
+
+    def service_rate(self, key, service_id):
+        """Current price of a service (per 1000, or per order for package types).
+
+        The panel's service list is fetched only when an order is about to be
+        sent or previewed and kept in memory for five minutes. Failures are not
+        cached, and None means the cost is unknown.
+        """
+        with self.cache_lock:
+            entry = self.service_cache.get(key)
+        if not entry or time.monotonic() - entry[0] > 300:
+            try:
+                response = self.request(key, "services")
+                data = response.json() if response.status_code == 200 else None
+            except (requests.RequestException, ValueError):
+                data = None
+            if not isinstance(data, list):
+                return None
+            services = {}
+            for item in data:
+                if not isinstance(item, dict) or item.get("service") in (None, ""):
+                    continue
+                try:
+                    rate = float(str(item.get("rate", "")).replace(",", "."))
+                except ValueError:
+                    continue
+                if rate >= 0:
+                    services[str(item["service"])] = {"rate": rate, "type": str(item.get("type") or "")}
+            entry = (time.monotonic(), services)
+            with self.cache_lock:
+                self.service_cache[key] = entry
+        return entry[1].get(str(service_id))
 
     def add(self, part, link):
         try:

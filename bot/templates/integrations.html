@@ -44,6 +44,18 @@
 {% endif %}
 </div>
 
+<div class="card"><h2>Zarar koruması</h2>
+  <p class="muted">Sipariş panele gönderilmeden hemen önce: tahmini kâr = satış fiyatı − Itemsatış komisyonu − panelin o anki servis fiyatı. Panel fiyatları gönderim anında panel API'sinden okunur (5 dakika bellekte tutulur); boştayken istek yapılmaz.</p>
+  <p>Şu an: <strong>{{ modes[guard.mode] }}</strong> · sınır {{ guard.min_profit|money }} · komisyon %{{ '%g' % (guard.commission * 100) }}</p>
+  <p class="muted">Koruma açıkken kâr sınırın altındaysa, panel fiyatı alınamazsa veya bildirimde satış fiyatı yoksa sipariş bekletilir ve bir kez bildirilir. Gözlem modunda yalnızca hesaplanıp siparişte gösterilir; birkaç siparişte satış fiyatının doğru okunduğunu gördükten sonra korumayı aç.</p>
+  <form method="post" action="/admin/integrations/profit" class="grid"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Mod<select name="mode">{% for key,label in modes.items() %}<option value="{{ key }}" {{ 'selected' if guard.mode==key }}>{{ label }}</option>{% endfor %}</select></label>
+    <label>En az kâr (TL)<input name="min_profit" inputmode="decimal" value="{{ '%g' % guard.min_profit }}" required></label>
+    <label>Itemsatış komisyonu (%)<input name="commission" inputmode="decimal" value="{{ '%g' % (guard.commission * 100) }}" required></label>
+    <div style="align-self:end"><button class="primary">Kaydet</button></div>
+  </form>
+</div>
+
 <div class="card"><h2>Son yok sayılan bildirimler</h2>
   <p class="muted">Sipariş veya ilan bilgisi taşımayan Itemsatış bildirimleri (sohbet, ilan güncelleme vb.) kaydedilmez. Sipariş gibi görünen her bildirim ise "Bilgileri kontrol et" kaydı olarak saklanır. Bu liste yalnızca son açılıştan beri tutulur ve müşteri bilgisi içermez.</p>
   {% if ignored %}

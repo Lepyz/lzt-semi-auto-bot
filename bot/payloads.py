@@ -502,6 +502,54 @@ def get_advert_id(data: dict) -> str:
     return ""
 
 
+# Explicit price fields only. Keys such as fee, cost, commission or earning are
+# deliberately not read: they are not what the buyer paid.
+PRICE_PATHS = (
+    "price", "total_price", "order_price", "sale_price", "paid_price", "payment_amount", "product_price",
+    "advert.price", "order.price", "order.total_price", "purchase.price", "purchase.total_price",
+    "payment.price", "payment.amount", "payment.total", "total", "amount",
+    "details.price", "details.total_price", "details.order_price", "details.sale_price", "details.paid_price",
+    "details.advert.price", "details.payment.amount", "details.total", "details.amount",
+    "data.price", "data.total_price", "data.order_price", "data.sale_price", "data.paid_price",
+    "data.advert.price", "data.payment.amount", "data.total", "data.amount",
+)
+
+
+def parse_price(value):
+    """'39.90', '39,90 TL', '1.250,00 ₺', 39.9 -> float; anything else -> None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if 0 < value < 1_000_000 else None
+    text = str(value).strip().upper().replace("TL", "").replace("₺", "").replace("TRY", "").replace(" ", "")
+    if not re.fullmatch(r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?", text):
+        return None
+    if "," in text and "." in text:
+        decimal = "," if text.rfind(",") > text.rfind(".") else "."
+        text = text.replace("." if decimal == "," else ",", "").replace(decimal, ".")
+    elif "," in text:
+        text = text.replace(",", ".") if re.search(r",\d{1,2}$", text) else text.replace(",", "")
+    elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", text):
+        text = text.replace(".", "")  # 1.250 = thousands
+    number = float(text)
+    return number if 0 < number < 1_000_000 else None
+
+
+def get_sale_price(data):
+    """The amount the buyer paid and the field it came from; (None, '') when absent."""
+    for item in payload_variants(data):
+        for path in PRICE_PATHS:
+            value = get_nested(item, path)
+            price = parse_price(value) if not isinstance(value, dict) else None
+            if price:
+                return round(price, 2), path
+    for text in collect_strings(data):
+        match = re.search(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:TL|₺)", text)
+        if match and parse_price(match.group(1)):
+            return round(parse_price(match.group(1)), 2), "metin"
+    return None, ""
+
+
 def get_product_name(data: dict) -> str:
     """Itemsatış ilan adını mümkün olan tüm alanlardan yakalar; genel webhook başlıklarını ürün adı sanmaz."""
     candidate_paths = [
