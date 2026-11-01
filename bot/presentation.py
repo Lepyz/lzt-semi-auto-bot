@@ -25,6 +25,7 @@ STATES = {
 }
 
 REASONS = {
+    "advert_missing": ("Satın alma alındı ancak hangi ilana ait olduğu okunamadı.", "Web panelinden ilan numarasını ve müşteri linkini kontrol edip kaydet. Kaydetmek sipariş göndermez."),
     "binding_missing": ("Bu ilan otomasyona bağlı değil veya eşleştirmesi pasif.", "İstersen ilan ayarını web panelinden düzenleyebilirsin."),
     "link_missing": ("Müşteri linki eksik veya seçilen platformla uyumsuz.", "Linki düzeltip bilgileri kaydet. Kaydetmek sipariş göndermez."),
     "package_target": ("Paket bileşenlerinin hedef linkleri birbiriyle uyumlu değil.", "Paket servislerini ve müşteri linkini kontrol et."),
@@ -152,16 +153,18 @@ def cleanup_actions(order):
 
 
 def alert(order, event):
-    """Each distinct unsent purchase is reported; routine successes stay quiet."""
+    """Report each submission once and meaningful unsent/outcome transitions."""
     view = order_view(order)
     state = order.get("state")
-    if state not in {"ready", "waiting", "paused", "uncertain", "error", "review"} and view["code"] not in {"cancelled", "partial", "refunded", "failed"}:
+    if state not in {"submitted", "ready", "waiting", "paused", "uncertain", "error", "review"} and view["code"] not in {"cancelled", "partial", "refunded", "failed"}:
         return None
     if view["issue"] == "binding_missing":
         return None
     panel = order.get("alert_panel") or next((p.get("panel", "") for p in reversed(order.get("parts", []))
                                              if p.get("state") in {"error", "uncertain", "sending"}), "") or next((p.get("panel", "") for p in order.get("parts", [])), "")
     key = order["id"] + ":" + event + ":" + str(order.get("revision", 0))
+    if state == "submitted":
+        key = order["id"] + ":submitted"
     if state == "finished":
         key = order["id"] + ":outcome:" + view["code"]
     title = ("Sipariş başlatılmadı — bekletildi" if state == "waiting" else
@@ -169,10 +172,16 @@ def alert(order, event):
     text = f"{view['icon']} {title.replace('i','İ').replace('ı','I').upper()}\n\n" + summary(order)
     if panel:
         text += "\nPanel: " + panel
+    sent = [p for p in order.get("parts", []) if p.get("smm_id")]
+    for part in sent:
+        text += f"\n🧾 {part.get('panel', '')} · Panel sipariş no: {part['smm_id']} · Adet: {part.get('quantity', '')}"
     if order.get("previous_result"):
         text += "\nÖnceki işlem: " + order["previous_result"]
-    if view["issue"] in PROFIT_CODES and order.get("profit"):
+    if (state == "submitted" or view["issue"] in PROFIT_CODES) and order.get("profit"):
         text += "\n" + profit_lines(order["profit"])
-    text += "\n\nNeden: " + view["reason"] + "\n👉 " + view["advice"]
+    if state == "submitted":
+        text += "\n\n✅ Panel siparişi kabul etti. İşlemin tamamlandığı anlamına gelmez."
+    else:
+        text += "\n\nNeden: " + view["reason"] + "\n👉 " + view["advice"]
     return {"key": key, "text": text[:3500], "order_id": order["id"],
-            "action": state == "ready", "grouped": False, "policy": "unsent-v2"}
+            "action": state == "ready", "grouped": False, "policy": "order-events-v3"}

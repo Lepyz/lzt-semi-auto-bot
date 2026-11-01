@@ -8,9 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import panel_key
 from .payloads import classify, extract_links, get_advert_id, get_order_id, get_product_name
-from .payloads import get_sale_price, ignored_summary, legacy_payload_key, normalize_panel_link, source_key, target_key, valid_link
+from .payloads import get_sale_price, ignored_summary, legacy_payload_key, normalize_panel_link, parse_price, source_key, target_key, valid_link
 from .store import Conflict
-from .profit import evaluate, guard_settings
+from .profit import CODES as PROFIT_CODES, evaluate, guard_settings, reprice
 from .presentation import alert, panel_label, reason_code, summary
 
 logger = logging.getLogger(__name__)
@@ -106,18 +106,21 @@ class Engine:
                  "itemsatis_id": get_order_id(payload), "advert_id": get_advert_id(payload),
                  "product_name": get_product_name(payload)[:200], "links": extract_links(payload),
                  "sale_price": price, "price_source": price_source,
+                 "price_version": 2,
                  "link": "", "target": "", "parts": [], "state": "queued" if kind == "order" else "review",
                  "manual_required": kind != "order", "error": "", "created_at": now, "updated_at": now}
         if kind != "order":
             order["error"] = "Sipariş bilgisi eksik veya webhook türü tanınmadı. Kontrol edip gönderin."
             order["reason_code"] = "review"
+            if not order["advert_id"]:
+                order.update(error="Satın alma alındı ancak ilan numarası okunamadı.", reason_code="advert_missing")
         saved, created = self.store.create(order)
         if created:
             if saved["state"] == "queued":
                 self.enqueue(saved["id"])
             else:
                 binding = self.store.setting("binding:" + saved["advert_id"]) if saved["advert_id"] else None
-                if binding and binding.get("active", True):
+                if not saved["advert_id"] or binding and binding.get("active", True):
                     notification = alert(saved, "review")
                     if notification and self.store.notify(notification):
                         self.notifier.enqueue(notification)
@@ -413,12 +416,16 @@ class Engine:
         self.store.save(order)
         self.enqueue(order_id)
 
-    def repair(self, order_id, link, revision):
+    def repair(self, order_id, link, revision, advert_id=""):
         order = self.store.get(order_id)
         if not order or order["state"] not in MANUAL_STATES or order["revision"] != revision:
             raise Conflict("Sipariş değişti veya düzenlemeye uygun değil.")
         if any(p["state"] in {"submitted", "finished", "sending", "uncertain"} for p in order["parts"]):
             raise ValueError("Panele iletilen paket bileşenleri yeniden yazılamaz.")
+        if advert_id:
+            if order.get("advert_id") or not advert_id.isdigit() or int(advert_id) <= 0:
+                raise ValueError("Eksik ilan numarası için geçerli bir ilan seçin.")
+            order["advert_id"] = advert_id
         order.update(parts=[], link=link.strip(), links={p: link.strip() for p in (*order["links"], "other")},
                      state="review", manual_required=True, error="", reason_code="")
         # Include all known platforms so a newly added binding can use the corrected link.
@@ -430,6 +437,19 @@ class Engine:
 
     def close_unsubmitted(self, order_id, revision):
         self.cleanup([(order_id, revision)], "close")
+
+    def update_sale_price(self, order_id, value, revision):
+        order = self.store.get(order_id)
+        if not order or order["revision"] != revision or order["state"] in {"legacy", "deleted"}:
+            raise Conflict("Kayıt değişti veya fiyat düzeltmeye uygun değil; sayfayı yenileyin.")
+        price = parse_price(value)
+        if price is None:
+            raise ValueError("Itemsatış'taki geçerli satış tutarını TL olarak girin.")
+        order.update(sale_price=price, price_source="manual", price_version=2)
+        order["profit"] = reprice(order, guard_settings(self.store))
+        if order.get("reason_code") in PROFIT_CODES:
+            order.update(reason_code=order["profit"]["code"], error=order["profit"]["message"])
+        self.store.save(order)  # Pure bookkeeping: no enqueue, panel request or Telegram alert.
 
     def cleanup(self, selections, action):
         targets = self.store.cleanup_orders(selections, action)

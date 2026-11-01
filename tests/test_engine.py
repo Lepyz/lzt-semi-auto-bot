@@ -22,11 +22,13 @@ def test_normal_order_is_saved_before_add_and_has_no_balance_calls(rig):
     assert not rig.panels.checks
 
 
-def test_one_hundred_successful_orders_produce_no_telegram_rows(rig):
+def test_each_successful_purchase_has_one_submission_notification(rig):
     for number in range(100):
         receive_and_run(rig, number + 1, f"https://instagram.com/person{number}")
     assert len(rig.panels.adds) == 100
-    assert not rig.notices and not rig.store.pending_notifications()
+    assert len(rig.notices) == len(rig.store.pending_notifications()) == 100
+    assert len({n["key"] for n in rig.notices}) == 100
+    assert all(n["key"].endswith(":submitted") for n in rig.notices)
 
 
 def test_unmapped_advert_is_recorded_without_any_notification(rig):
@@ -43,11 +45,11 @@ def test_back_to_back_same_link_sends_first_and_reports_second_without_repeats(r
     second = receive_and_run(rig, 2)
     assert first["state"] == "submitted" and first["parts"][0]["smm_id"]
     assert second["state"] == "waiting" and not second["parts"][0]["smm_id"]
-    assert len(rig.notices) == 1 and rig.notices[0]["order_id"] == second["id"]
+    assert len(rig.notices) == 2 and rig.notices[1]["order_id"] == second["id"]
     for _ in range(5):
         rig.engine.execute(second["id"])
         rig.engine.receive(payload(2))
-    assert len(rig.panels.adds) == len(rig.notices) == 1
+    assert len(rig.panels.adds) == 1 and len(rig.notices) == 2
 
 
 def test_each_distinct_rejected_purchase_has_its_own_alert(rig):
@@ -76,9 +78,9 @@ def test_nonblocking_terminal_result_notifies_once_in_turkish(rig, status):
     rig.engine.active_checks[order["id"]] = 0
     rig.engine.check_due()
     assert rig.store.get(order["id"])["state"] == "finished"
-    assert len(rig.notices) == 1 and status not in rig.notices[0]["text"]
+    assert len(rig.notices) == 2 and status not in rig.notices[-1]["text"]
     rig.engine.refresh(order["id"])
-    assert len(rig.notices) == 1
+    assert len(rig.notices) == 2
     assert order["id"] not in rig.engine.active_checks
 
 
@@ -88,7 +90,7 @@ def test_active_completion_without_waiting_order_is_quiet(rig):
     rig.engine.active_checks[order["id"]] = 0
     rig.engine.check_due()
     assert rig.store.get(order["id"])["state"] == "finished"
-    assert not rig.notices
+    assert len(rig.notices) == 1 and rig.notices[0]["key"].endswith(":submitted")
 
 
 def test_terminal_alert_is_durable_even_if_ready_transition_fails(rig, monkeypatch):
@@ -100,7 +102,7 @@ def test_terminal_alert_is_durable_even_if_ready_transition_fails(rig, monkeypat
     with pytest.raises(RuntimeError):
         rig.engine.refresh(order["id"])
     assert rig.store.get(order["id"])["state"] == "finished"
-    assert len(rig.notices) == len(rig.store.pending_notifications()) == 1
+    assert len(rig.notices) == len(rig.store.pending_notifications()) == 2
 
 
 def test_status_failure_never_releases_lock_or_resends_and_warns_once(rig, monkeypatch):
@@ -111,7 +113,7 @@ def test_status_failure_never_releases_lock_or_resends_and_warns_once(rig, monke
     current = rig.store.get(order["id"])
     assert current["state"] == "submitted" and current["status_error"]
     assert rig.store.owner(order["target"]) == order["id"]
-    assert len(rig.panels.adds) == 1 and len(rig.notices) == 1
+    assert len(rig.panels.adds) == 1 and len(rig.notices) == 2
 
 
 def test_monitor_has_no_sql_until_active_order_is_due(rig, monkeypatch):
@@ -454,7 +456,7 @@ def test_only_blocking_orders_are_polled(rig):
     rig.engine.check_due()
     assert len(rig.panels.checks) == 1
     assert rig.panels.checks[0]["smm_id"] == first["parts"][0]["smm_id"]
-    assert len(rig.notices) == 1  # Only the held purchase, not the two successes.
+    assert len(rig.notices) == 3  # Two submission receipts and one held purchase.
 
 
 def test_concurrent_duplicate_webhooks_have_one_record_and_add(rig):
@@ -532,13 +534,13 @@ def test_status_failure_count_survives_restart_and_resets_on_success(rig, monkey
     monkeypatch.setattr(rig.panels, "status", lambda _: None)
     rig.engine.refresh(order["id"])
     rig.engine.refresh(order["id"])
-    assert rig.store.get(order["id"])["status_failures"] == 2 and not rig.notices
+    assert rig.store.get(order["id"])["status_failures"] == 2 and len(rig.notices) == 1
     restarted = Engine(rig.store, rig.panels, rig.notifier, rig.settings)
     try:
         restarted.refresh(order["id"])  # third failure after a restart still warns, once
-        assert len(rig.notices) == 1 and rig.store.get(order["id"])["status_error"]
+        assert len(rig.notices) == 2 and rig.store.get(order["id"])["status_error"]
         restarted.refresh(order["id"])
-        assert len(rig.notices) == 1
+        assert len(rig.notices) == 2
         monkeypatch.setattr(rig.panels, "status", lambda _: {"status": "In progress", "terminal": False})
         restarted.refresh(order["id"])
         current = rig.store.get(order["id"])

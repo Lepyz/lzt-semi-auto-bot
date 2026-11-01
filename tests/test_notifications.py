@@ -69,9 +69,9 @@ def test_unsent_policy_waiting_notice_is_delivered_once_not_filtered_as_legacy(r
     receive_and_run(rig, 1)
     held = receive_and_run(rig, 2)
     assert held["state"] == "waiting"
-    notices = rig.store.pending_notifications()
+    notices = [n for n in rig.store.pending_notifications() if n["order_id"] == held["id"]]
     assert len(notices) == 1 and notices[0]["order_id"] == held["id"]
-    assert notices[0]["policy"] == "unsent-v2"
+    assert notices[0]["policy"] == "order-events-v3"
     notifier = Notifier(rig.store, rig.settings)
     calls = []
     monkeypatch.setattr(notifier, "send", lambda item: calls.append(item) or "sent")

@@ -64,7 +64,7 @@
   <form method="post" action="/admin/integrations/profit" class="grid"><input type="hidden" name="csrf" value="{{ csrf }}">
     <label>Mod<select name="mode">{% for key,label in modes.items() %}<option value="{{ key }}" {{ 'selected' if guard.mode==key }}>{{ label }}</option>{% endfor %}</select></label>
     <label>En az kâr (TL)<input name="min_profit" inputmode="decimal" value="{{ '%g' % guard.min_profit }}" required></label>
-    <label>Itemsatış komisyonu (%)<input name="commission" inputmode="decimal" value="{{ '%g' % (guard.commission * 100) }}" required></label>
+    <p>Itemsatış komisyonu: <strong>%7 sabit</strong><br><small>100 TL satıştan panel maliyeti öncesi 93 TL kalır.</small></p>
     <div style="align-self:end"><button class="primary">Kaydet</button></div>
   </form>
 </div>

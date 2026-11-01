@@ -100,14 +100,14 @@ def test_finished_deletion_does_not_remove_new_active_target_lock(client, rig):
 def test_bulk_cleanup_cancels_queued_alerts_and_does_not_send_selected_waiters(client, rig, monkeypatch):
     active = receive_and_run(rig)
     held = [receive_and_run(rig, n) for n in (2, 3)]
-    pending = rig.store.pending_notifications()
+    pending = [n for n in rig.store.pending_notifications() if n["order_id"] != active["id"]]
     assert len(pending) == 2
     assert clean(client, held).status_code == 303
     notifier = Notifier(rig.store, rig.settings)
     monkeypatch.setattr(notifier, 'send', lambda _: pytest.fail('Deleted record sent an alert'))
     for notification in pending:
         notifier.deliver(notification)
-    assert not rig.store.pending_notifications()
+    assert all(n["order_id"] == active["id"] for n in rig.store.pending_notifications())
     assert len(rig.panels.adds) == 1
     assert rig.store.owner(active['target']) == active['id']
 

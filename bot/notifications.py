@@ -93,7 +93,7 @@ class Notifier:
         if not self.store.claim_notification(key):
             return
         # Old pending routine notices must not reappear after this upgrade.
-        if item.get("policy") != "unsent-v2" and (
+        if item.get("policy") not in {"unsent-v2", "order-events-v3"} and (
                 any(event in key for event in (":submitted:", ":waiting:", ":paused:")) or
                 ":review:" in key and "eşleştirmesi yok" in item.get("text", "")):
             self.store.finish_notification(key, True)

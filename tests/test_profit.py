@@ -36,7 +36,7 @@ def test_price_parsing(value, expected):
 def test_sale_price_ignores_fee_and_cost_fields_and_reads_message_text():
     assert get_sale_price({"fee": "5", "cost": "3", "commission": "2"}) == (None, "")
     assert get_sale_price({"data": {"price": "49,90"}}) == (49.9, "data.price")
-    assert get_sale_price({"details": {"content": "Takipçi başlıklı ilanınız 39.90 TL tutarında satıldı"}}) == (39.9, "metin")
+    assert get_sale_price({"details": {"content": "Takipçi başlıklı ilanınız 39.90 TL tutarında satıldı"}}) == (39.9, "metin:details.content")
 
 
 def test_observe_mode_records_profit_but_never_blocks(rig):
@@ -83,7 +83,7 @@ def test_enough_profit_is_sent_automatically(rig):
     rig.panels.rates[("smmrush", "123")] = {"rate": 100.0, "type": "Default"}  # 10 TL
     order = run(rig, priced(price="49,90"))
     assert order["state"] == "submitted" and order["profit"]["profit"] == 36.41
-    assert not [n for n in rig.notices if n["order_id"] == order["id"]]  # success stays quiet
+    assert len(rig.notices) == 1 and rig.notices[0]["key"].endswith(":submitted")
 
 
 def test_package_type_is_priced_per_order_and_components_are_summed(rig):
@@ -114,7 +114,9 @@ def test_waiting_order_is_rechecked_with_current_price_when_sent(rig):
     assert len(rig.panels.adds) == 1
 
 
-def test_panel_service_list_is_cached_and_failures_are_not(monkeypatch):
+def test_panel_service_list_is_cached_and_failures_back_off(monkeypatch):
+    now = [1000]
+    monkeypatch.setattr("bot.panels.time.monotonic", lambda: now[0])
     calls = []
     class Reply:
         status_code = 200
@@ -131,7 +133,9 @@ def test_panel_service_list_is_cached_and_failures_are_not(monkeypatch):
         return Reply(reply)
     monkeypatch.setattr("bot.panels.requests.post", fake_post)
     client = PanelClient({"p": {"name": "P", "api_url": "https://p.invalid/api", "api_key": "k"}})
-    assert client.service_rate("p", "5") is None          # failure is not cached
+    assert client.service_rate("p", "5") is None
+    assert client.service_rate("p", "5") is None          # no repeated request during the outage
+    now[0] += 61
     assert client.service_rate("p", "5") == {"rate": 12.5, "type": "Default"}
     assert client.service_rate("p", 5) == {"rate": 12.5, "type": "Default"}
     assert client.service_rate("p", "6") is None          # unparsable rate = unknown
@@ -161,7 +165,7 @@ def test_settings_preview_override_and_csv(client, rig):
     order = run(rig, priced(price="45,00"))
     page = client.get("/admin/orders/" + order["id"] + "?preview=1").text
     assert "Tahmini kâr: 1,85 TL" in page and 'name="profit_override"' in page
-    assert "Bildirimdeki alan: price" in page
+    assert "Fiyat kaynağı: Itemsatış bildirimi" in page
     csrf = token(client, "/admin/orders/" + order["id"])
     refused = client.post("/admin/orders/" + order["id"] + "/send",
                           data={"csrf": csrf, "revision": order["revision"], "confirmed": "yes"})

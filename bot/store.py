@@ -33,7 +33,7 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, bindings=False):
         if self.postgres:
             import psycopg
             from psycopg.rows import dict_row
@@ -49,6 +49,13 @@ class Store:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=15000")
         try:
+            if bindings:
+                # All binding writers share this transaction lock, including inserts.
+                # Locking only existing rows would leave newly added adverts unprotected.
+                if self.postgres:
+                    conn.execute("SELECT pg_advisory_xact_lock(18678329260920388)")
+                else:
+                    conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except BaseException:
@@ -314,7 +321,7 @@ class Store:
             return json.loads(row["value"]) if row else default
 
     def set_setting(self, key, value):
-        with self.transaction() as conn:
+        with self.transaction(bindings=key.startswith("binding:")) as conn:
             self.execute(conn, """INSERT INTO settings(key,value) VALUES (?,?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                 (key, json.dumps(value, ensure_ascii=False)))
@@ -326,5 +333,5 @@ class Store:
             return {r["key"][8:]: json.loads(r["value"]) for r in rows}
 
     def delete_binding(self, advert_id):
-        with self.transaction() as conn:
+        with self.transaction(bindings=True) as conn:
             self.execute(conn, "DELETE FROM settings WHERE key=?", ("binding:" + advert_id,))
