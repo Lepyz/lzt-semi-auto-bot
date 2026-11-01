@@ -42,7 +42,6 @@
     </details>
   {% endif %}
 {% endif %}
-{% if ip_list %}<p class="error-text">WEBHOOK_IP_WHITELIST tanımlı. Render vekil sunucusu arkasında istemci IP'si güvenilir okunamaz; anahtar kullanın ve bu değişkeni kaldırın.</p>{% endif %}
 </div>
 
 <div class="card"><h2>Son yok sayılan bildirimler</h2>
@@ -61,11 +60,7 @@
     <p><small>Bildirim gönderimi</small><br>{{ 'Açık' if telegram.token and telegram.chat else 'Kapalı (BOT_TOKEN / CHAT_ID eksik)' }}</p>
     <p><small>Sohbet türü</small><br>{{ 'Grup' if telegram.group else 'Özel sohbet' }}</p>
     <p><small>Webhook anahtarı</small><br>{{ 'Var' ~ (' (Render Environment)' if telegram.secret_from_env else '') if telegram.secret else 'Yok' }}</p>
-    <p><small>"Siparişi gönder" düğmesi</small><br><strong>{{ 'Etkin' if telegram.buttons else 'Kapalı' }}</strong></p>
   </div>
-  {% if telegram.group and not telegram.admins %}
-  <p class="error-text">Sohbet bir grup. Gönder düğmesinin çalışması için Render Environment içinde TELEGRAM_ADMIN_USER_IDS (senin Telegram kullanıcı kimliğin) tanımlanmalı.</p>
-  {% endif %}
   <p class="muted">Kayıt işlemi Telegram'a bu uygulamanın /telegram-webhook adresini ve gizli anahtarını bildirir. Bot başka bir adrese bağlıysa o bağlantı bu adresle değiştirilir; önce durumu kontrol et.</p>
   <form class="inline" method="post" action="/admin/integrations/telegram"><input type="hidden" name="csrf" value="{{ csrf }}">
     <input type="hidden" name="action" value="check"><button {{ 'disabled' if not telegram.token }}>Telegram durumunu kontrol et</button></form>

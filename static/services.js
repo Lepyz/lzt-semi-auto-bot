@@ -59,6 +59,7 @@
     deletion.open = false;
     deletion.querySelector('[type=checkbox]').checked = false;
     document.getElementById('delete-advert').value = editing ? id : '';
+    document.getElementById('delete-version').value = editing ? data.versions[id] : '';
     hidePreview();
     dirty = false;
     editor.hidden = false;

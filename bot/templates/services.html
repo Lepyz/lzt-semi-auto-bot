@@ -57,7 +57,7 @@
   </form>
   <details class="mapping-delete" id="delete-section" hidden><summary>Eşleştirmeyi kaldır</summary>
     <p>Bu ilanın eşleştirmesi kaldırılır. Kayıtlı siparişler korunur; panelde iptal yapılmaz.</p>
-    <form method="post" action="/admin/services/delete"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="advert_id" id="delete-advert">
+    <form method="post" action="/admin/services/delete"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="advert_id" id="delete-advert"><input type="hidden" name="version" id="delete-version">
       <label><input type="checkbox" name="confirmed" value="yes" required> Bu eşleştirmeyi kaldırmak istiyorum.</label><button class="danger">Eşleştirmeyi kaldır</button>
     </form>
   </details>
