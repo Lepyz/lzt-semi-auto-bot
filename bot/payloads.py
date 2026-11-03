@@ -520,7 +520,7 @@ def customer_links(data):
                     for label, value in fields.items():
                         label = normalize_panel_status_text(label)
                         if isinstance(value, str) and any(word in label for word in
-                                ("link", "url", "profil", "kullanici", "username", "hesap", "kanal")):
+                                ("link", "url", "profil", "kullanici", "username", "hesap", "kanal", "baglanti", "adres", "hedef")):
                             result.append(value.strip()[:500])
             result.extend(obj[key].strip()[:500] for key in direct if isinstance(obj.get(key), str) and obj[key].strip())
     if not result:

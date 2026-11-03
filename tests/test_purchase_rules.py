@@ -93,6 +93,10 @@ def test_seller_listing_and_image_links_are_not_customer_inputs():
     data = {"advert": {"description": "https://instagram.com/seller", "url": "https://tiktok.com/@seller"},
             "seller": {"instagram": "https://instagram.com/seller"}, "image": "https://instagram.com/p/SELLER"}
     assert extract_links(data) == {}
+
+
+def test_turkish_customer_connection_label_still_reads_the_target():
+    assert extract_links({"post_datas": {"Bağlantı adresiniz": "instagram.com/customer"}})["instagram"] == "https://instagram.com/customer"
     data["post_datas"] = {"Link": "https://evil.invalid/instagram.com/customer"}
     data["content"] = "Satıcı https://instagram.com/seller"
     assert extract_links(data) == {}
