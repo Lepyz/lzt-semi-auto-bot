@@ -36,9 +36,10 @@ def normalize_panel_link(link, platform=""):
             # Only TikTok short links use these subdomains. They remain held below.
             if not (platform in {"tiktok", "other", ""} and host in {"vt.tiktok.com", "vm.tiktok.com"}):
                 return ""
-        host = {"instagr.am": "instagram.com", "www.instagr.am": "instagram.com",
-                "twitter.com": "x.com", "www.twitter.com": "x.com", "tiktok.com": "www.tiktok.com",
-                "m.tiktok.com": "www.tiktok.com", "telegram.me": "t.me", "www.telegram.me": "t.me"}.get(host, host)
+        base = host.removeprefix("www.").removeprefix("m.").removeprefix("mobile.")
+        host = {"instagr.am": "instagram.com", "twitter.com": "x.com", "telegram.me": "t.me"}.get(base, base)
+        if host == "tiktok.com":
+            host = "www.tiktok.com"
         path = unquote(parsed.path).rstrip("/")
         if "%" in path:
             return ""  # Ambiguous repeated encoding must not produce different target locks.

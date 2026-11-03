@@ -114,6 +114,8 @@ def test_canonical_video_ids_preserve_case_and_ignore_tracking():
     assert target_key("https://instagram.com/p/AbC", "instagram") != target_key("https://instagram.com/p/abc", "instagram")
     assert target_key("https://youtube.com/shorts/AbC?si=1", "youtube") == target_key("https://youtu.be/AbC", "youtube")
     assert target_key("https://instagram.com/%63ustomer", "instagram") == target_key("https://instagram.com/customer", "instagram")
+    assert target_key("https://mobile.instagr.am/Customer", "instagram") == target_key("@customer", "instagram")
+    assert target_key("https://mobile.twitter.com/Customer", "x") == target_key("https://x.com/customer", "x")
 
 
 def test_old_instagram_alias_lock_still_blocks_new_canonical_customer(rig):
