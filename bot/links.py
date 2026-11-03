@@ -40,6 +40,8 @@ def normalize_panel_link(link, platform=""):
                 "twitter.com": "x.com", "www.twitter.com": "x.com", "tiktok.com": "www.tiktok.com",
                 "m.tiktok.com": "www.tiktok.com", "telegram.me": "t.me", "www.telegram.me": "t.me"}.get(host, host)
         path = unquote(parsed.path).rstrip("/")
+        if "%" in path:
+            return ""  # Ambiguous repeated encoding must not produce different target locks.
         query = parsed.query
         if host.removeprefix("www.") in {"instagram.com", "tiktok.com"}:
             query = ""

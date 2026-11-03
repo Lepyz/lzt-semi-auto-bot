@@ -94,6 +94,8 @@ def classify(data):
     # instead of acknowledging it and losing it silently.
     if explicit_order_id(data) or words & PURCHASE_WORDS:
         return "review"
+    if advert_id and customer_links(data) and get_sale_price(data)[0] is not None:
+        return "review"  # A changed legacy sale format needs inspection, never auto-dispatch.
     return "ignore"
 
 

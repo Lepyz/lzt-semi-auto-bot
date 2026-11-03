@@ -41,6 +41,7 @@ def test_false_alert_burst_has_no_database_or_panel_calls(rig, monkeypatch):
     ({"event": "changed_format", "order_id": "real", "advert_id": "10"}, "review"),
     ({"event": "payment.completed", "purchase_id": "real"}, "review"),
     ({"event": "siparis_odendi"}, "review"),
+    ({"advert_id": "10", "post_datas": {"Link": "@customer"}, "sale_price": 100}, "review"),
 ])
 def test_positive_purchase_evidence_is_still_kept(data, kind):
     assert classify(data) == kind
@@ -78,6 +79,7 @@ def test_unambiguous_incomplete_customer_links_are_completed(value, platform):
     ("instgram.com/customer", "instagram"), ("https://instagram.com/", "instagram"),
     ("https://instagram.com/accounts/login", "instagram"), ("https://instagram.com/p/", "instagram"),
     ("https://instagram.com/customer photo", "instagram"), ("https://instagram.com/customer/image.jpg", "instagram"),
+    ("https://instagram.com/%2563ustomer", "instagram"),
     ("https://youtube.com/watch", "youtube"), ("https://youtube.com/watch?v=", "youtube"),
     ("https://tiktok.com/@", "tiktok"), ("https://tiktok.com/@customer/video/", "tiktok"),
     ("https://vt.tiktok.com/ABC", "tiktok"), ("https://tiktok.com/@customer", "instagram"),
