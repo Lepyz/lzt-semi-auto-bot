@@ -40,7 +40,7 @@ def test_missing_product_or_price_does_not_discard_purchase():
 def test_known_sale_without_order_id_remains_compatible():
     assert classify({"event": "advert_sold", "advert_id": "10"}) == "order"
     assert classify({"event": "order.created"}) == "review"
-    assert classify({"event": "unknown_notification", "advert_id": "10"}) == "review"
+    assert classify({"event": "unknown_notification", "advert_id": "10"}) == "ignore"
 
 
 def test_legacy_payload_hash_matches_old_bot_and_ignores_queue_fields():

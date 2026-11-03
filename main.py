@@ -96,7 +96,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             await asyncio.to_thread(engine.close)
             await asyncio.to_thread(notifier.close)
 
-    app = FastAPI(title="Boostera", version="3.3.0", docs_url=None, redoc_url=None,
+    app = FastAPI(title="Boostera", version="3.4.0", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
 
     def admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -165,7 +165,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     @app.api_route("/check-panel-health", methods=["GET", "HEAD"])
     def health():
         # Uptime checks must never query a database, panel or Telegram.
-        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.3.0"}
+        return {"ok": bool(getattr(app.state, "ready", False)), "version": "3.4.0"}
 
     @app.post("/itemsatis-webhook")
     async def webhook(request: Request):
@@ -439,6 +439,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
     def save_service(advert_id: str = Form(...), name: str = Form(""),
                      panel: str = Form(""), service_id: str = Form(""), quantity: int = Form(0),
                      platform: str = Form("instagram"), components: str = Form(""),
+                     target_type: str = Form("auto"),
                      active: str = Form("true"), mode: str = Form(""), version: str = Form("")):
         advert_id = advert_id.strip()
         if not advert_id.isdigit() or int(advert_id) <= 0:
@@ -452,7 +453,7 @@ def create_app(settings=None, store=None, panels=None, start_background=True):
             except ValueError:
                 raise ValueError("Paket servisleri okunamadı; formu kontrol edin.") from None
         else:
-            data.update(panel=panel, service_id=service_id, quantity=quantity, platform=platform)
+            data.update(panel=panel, service_id=service_id, quantity=quantity, platform=platform, target_type=target_type)
         binding = normalize_binding(data, settings.panels)
         store = app.state.store
         if not mode:  # Existing clients keep their upsert behavior.

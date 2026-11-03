@@ -7,6 +7,7 @@
   {% if stalled %}<div class="order-reason order-error" role="alert"><strong>⚠️ Bu sipariş ilerlemiyor</strong><p>Hazırlık veya gönderim aşaması en az 5 dakikadır değişmedi. Panelde sipariş açılmış olabilir; önce kaydı ve paneli kontrol et. Bu kontrol otomatik tekrar gönderim yapmaz.</p></div>{% endif %}
   <p class="order-id">Kayıt: {{ order.itemsatis_id or order.id[:10] }} <button class="order-copy" type="button" data-copy-text="{{ order.itemsatis_id or order.id[:10] }}">Numarayı kopyala</button><br>İlan: {{ order.advert_id }} · {{ order.created_at|date }}</p>
   {% set link = order.link or order.links.get('other','') %}
+  {% if not link and order.get('customer_inputs',[])|length==1 %}{% set link = order.customer_inputs[0] %}{% endif %}
   <p><small>Müşteri / hedef linki</small><br>{{ link or 'Henüz belirlenmedi' }}</p>{% if link %}<button class="order-copy" type="button" data-copy-text="{{ link }}">Linki kopyala</button>{% endif %}
   {% if display.reason %}<div class="order-reason"><strong>Neden?</strong><p>{{ display.reason }}</p><strong>Ne yapmalısın?</strong><p>{{ display.advice }}</p></div>{% endif %}
   {% if order.status_error %}<p class="order-error">⚠️ {{ order.status_error }}</p>{% endif %}
@@ -58,6 +59,11 @@
 </section>
 {% if order.state in manual_states and not order.parts|selectattr('state','in',['submitted','finished','sending','uncertain'])|list %}
 <section class="card" id="repair"><h2>🛠️ Sipariş bilgilerini düzelt</h2><p>İlan ayarı değiştiyse eşleştirmeyi yenileyebilir veya müşteri linkini düzeltebilirsin. Kaydetmek sipariş göndermez.</p>
+  {% if order.reason_code in ['link_missing','link_type','link_short','link_ambiguous'] %}
+  <div class="order-reason"><strong>🔗 Link yardımı</strong><p>Instagram ve TikTok kullanıcı adı veya @kullaniciadi yazılabilir. Eksik https:// tamamlanır. Takipçi için profil; beğeni / izlenme için tam gönderi veya video linki gerekir. Yazım hatası olan site adresi tahmin edilmez; TikTok kısa linki yerine tam adres istenir.</p>
+  {% if order.get('customer_inputs') %}<p>Müşterinin yazdığı:</p><ul>{% for value in order.customer_inputs %}<li>{{ value }}</li>{% endfor %}</ul>{% endif %}
+  <button type="button" data-copy-text="Merhaba, siparişinizi başlatmak için satın aldığınız hizmete ait bağlantıyı tekrar paylaşır mısınız? Takipçi/abone için profil veya kanal, beğeni/izlenme için ilgili gönderi ya da videonun tam bağlantısı gerekiyor. TikTok kullanıyorsanız kısa paylaşım linki yerine tarayıcıdaki tam adresi iletebilirsiniz. Teşekkürler.">Müşteriye yazılacak mesajı kopyala</button><small>Mesajı sen iletirsin; bot müşteriye otomatik mesaj göndermez.</small></div>
+  {% endif %}
   <p><a class="button" href="/admin/services?edit={{ order.advert_id }}">İlan ayarını aç</a></p>
   <form method="post" action="/admin/orders/{{ order.id }}/repair" class="order-form"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="revision" value="{{ order.revision }}">{% if not order.advert_id %}<label>Eksik ilan numarası<input name="advert_id" inputmode="numeric" pattern="[0-9]+" required></label>{% endif %}<label>Müşteri linki<input name="link" value="{{ link }}" required placeholder="https://..."></label><p><button>Bilgileri kaydet ve eşleştirmeyi yenile</button></p></form>
 </section>{% endif %}

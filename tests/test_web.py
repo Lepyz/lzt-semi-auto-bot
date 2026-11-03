@@ -531,7 +531,7 @@ def bulk_form(page):
 
 def test_binding_csv_round_trip_preview_and_all_or_nothing(client, rig):
     exported = client.get("/admin/services/export.csv").text
-    assert exported.lstrip("﻿").splitlines()[0] == "İlan;Ad;Durum;Panel;Servis;Adet;Platform;Servis adı"
+    assert exported.lstrip("﻿").splitlines()[0] == "İlan;Ad;Durum;Panel;Servis;Adet;Platform;Servis adı;Hedef türü"
     assert "10;Takipçi;aktif;SMMRush;123;100;instagram;" in exported
     csrf = token(client, "/admin/services")
     edited = exported.replace("123;100", "123;250") + "20;Yeni paket;aktif;medyabayim;5;50;tiktok;\n20;Yeni paket;aktif;SMMRush;6;60;tiktok;\n"

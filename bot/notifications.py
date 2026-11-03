@@ -92,6 +92,15 @@ class Notifier:
         key = item["key"]
         if not self.store.claim_notification(key):
             return
+        if item.get("order_id") and ":review:" in key and "receipt_verified" not in item:
+            current = self.store.get(item["order_id"])
+            # Old advert-only reviews have no retained purchase evidence. Do not
+            # replay their generic warning after restart or manual delivery retry.
+            if (current and current.get("state") == "review" and current.get("reason_code") == "review"
+                    and not current.get("receipt_kind") and not current.get("itemsatis_id")
+                    and not current.get("parts") and not current.get("links") and not current.get("sale_price")):
+                self.store.cancel_notification(key)
+                return
         if item.get("kind") == "stalled" and not self.store.stalled_current(item):
             self.store.cancel_notification(key)
             return

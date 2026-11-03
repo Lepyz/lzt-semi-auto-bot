@@ -28,6 +28,9 @@ REASONS = {
     "advert_missing": ("Satın alma alındı ancak hangi ilana ait olduğu okunamadı.", "Web panelinden ilan numarasını ve müşteri linkini kontrol edip kaydet. Kaydetmek sipariş göndermez."),
     "binding_missing": ("Bu ilan otomasyona bağlı değil veya eşleştirmesi pasif.", "İstersen ilan ayarını web panelinden düzenleyebilirsin."),
     "link_missing": ("Müşteri linki eksik veya seçilen platformla uyumsuz.", "Linki düzeltip bilgileri kaydet. Kaydetmek sipariş göndermez."),
+    "link_type": ("Link, servisin istediği hedef türüne uymuyor (profil / gönderi).", "Takipçi için profil, beğeni veya izlenme için ilgili gönderi/video linkini kontrol et."),
+    "link_short": ("TikTok kısa paylaşım linkinin gerçek hedefi doğrulanamadı.", "Müşteriden tarayıcıdaki tam profil veya video linkini iste; web panelinden düzelt."),
+    "link_ambiguous": ("Müşteri birden fazla farklı hedef yazmış; hangisinin kullanılacağı belli değil.", "Doğru tek hedefi seçip web panelinden kaydet. Otomatik seçim yapılmadı."),
     "package_target": ("Paket bileşenlerinin hedef linkleri birbiriyle uyumlu değil.", "Paket servislerini ve müşteri linkini kontrol et."),
     "panel_config": ("Panel bağlantı bilgileri eksik.", "Bağlantı ayarlarını kontrol et; ardından kaydı tekrar incele."),
     "balance": ("Panel siparişi bakiye yetersizliği nedeniyle reddetti.", "Panel bakiyesini kendin kontrol et. Bot bakiye sorgulamaz."),
@@ -184,4 +187,5 @@ def alert(order, event):
     else:
         text += "\n\nNeden: " + view["reason"] + "\n👉 " + view["advice"]
     return {"key": key, "text": text[:3500], "order_id": order["id"],
+            "receipt_verified": bool(order.get("receipt_kind") or order.get("itemsatis_id")),
             "action": state == "ready", "grouped": False, "policy": "order-events-v3"}

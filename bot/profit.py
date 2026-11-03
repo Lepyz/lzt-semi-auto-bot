@@ -6,7 +6,7 @@ from .payloads import PRICE_PATHS
 
 COMMISSION = Decimal("0.07")
 CENT = Decimal("0.01")
-DEFAULTS = {"mode": "observe", "min_profit": 10.0, "commission": float(COMMISSION)}
+DEFAULTS = {"mode": "enforce", "min_profit": 0.0, "commission": float(COMMISSION)}
 MODES = {"off": "Kapalı", "observe": "Gözlem (hesaplar, engellemez)", "enforce": "Koruma açık (engeller)"}
 CODES = {"low_profit", "cost_unknown", "price_unknown"}
 

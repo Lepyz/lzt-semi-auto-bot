@@ -20,8 +20,10 @@ Eski sürümden müşteri linki ve webhook okuma uyumluluğu korunmuştur.
   panele gitmemiş kayıt kuyruğa geri alınır, panel cevabı bilinmeyen kayıt
   "Panelden kontrol et" durumuna geçer ve tekrar gönderilmez.
 - Paket bileşenlerinin SMM kimlikleri ayrı saklanır. Başarılı bileşen yeniden açılmaz.
-- Bilgisi/eşleştirmesi eksik veya türü tanınmayan sipariş biçimindeki webhooklar
-  kontrol listesinde kalır; yeni event türü diye sessizce silinmez.
+- Yalnızca ilan numarası / ürün adı / bildirim kimliği satın alma sayılmaz. İlan hareketleri,
+  sohbet ve mevcut sipariş durumları yeni sipariş veya Telegram uyarısı oluşturmaz.
+- Bilinen satış olayı veya açık satın alma numarası taşıyan eksik kayıtlar korunur.
+  Türü değişmiş gerçek satın alma incelemeye alınır; otomatik gönderilmez.
 - İlk kurulumda gönderimler duraklatılmıştır. Eşleştirme ve geçiş doğrulandıktan
   sonra admin panelinden etkinleştirilir. Duraklatılmış kayıtlar elle gönderilir.
 
@@ -68,7 +70,7 @@ bu işlem sipariş göndermez veya panel sorgulamaz. Hesap tahminidir; iptal/kı
 tutarının doğrulandığı gerçekleşen kâr raporu değildir.
 
 Bağlantılar sayfasından mod seçilir: Kapalı / Gözlem / Koruma açık. Gözlemde yalnızca
-hesaplanıp siparişte ve CSV'de gösterilir. Koruma açıkken kâr sınırın (varsayılan 10 TL)
+hesaplanıp siparişte ve CSV'de gösterilir. Varsayılan mod Koruma açık, sınır 0 TL'dir. Kâr sınırın
 altındaysa, panel fiyatı alınamazsa veya satış fiyatı yoksa sipariş bekletilir ve bir kez
 bildirilir. Gönderim özetinde kâr onayı işaretlenerek o tek gönderim için geçilebilir.
 
@@ -236,3 +238,26 @@ bu araçla geri getirilemez. Aktarım sırasında manuel karşılaştırma gerek
   Açık 429/5xx cevaplarında en fazla üç gönderim denemesi yapılır.
 - Günlük kayıtlar konsola kısa hata türü olarak yazılır; ham webhook, müşteri mesajı,
   sorgu logu veya API anahtarı veritabanına eklenmez.
+
+## Müşteri linki koruması
+
+Hedef yalnızca müşteri alanlarından veya eski satış mesajındaki açık URL'den okunur.
+İlan açıklaması, satıcı profili ve görsel URL'si hedef seçilmez. Tam alan adı, yol ve
+platform doğrulanır; yanıltıcı alt alanlar, boş profil/video yolları, giriş sayfaları
+ve servis için yanlış hedef türü gönderilmez. Birden fazla farklı hedefte seçim
+yapılmaz. Eksik https:// ile Instagram / TikTok kullanıcı adı güvenli biçimde
+tamamlanır; yanlış yazılmış site adresi veya eksik video kimliği tahmin edilmez.
+TikTok kısa URL'leri çevrimdışı çözülemediği için tam link istenir. Profilin varlığı,
+hesabın gizliliği veya canlı erişilebilirliği bu çevrimdışı kontrolle doğrulanmaz.
+
+Eşleştirme formunda hedef türü Profil/kanal veya Gönderi/video seçilebilir. Eski
+eşleştirmelerde açık takipçi/abone ya da beğeni/izlenme isimlerinden tür okunur;
+belirsiz paketlerde türü yöneticinin seçmesi gerekir. CSV yeni Hedef türü sütununu
+korur; eski 8 sütunlu dosya mevcut hedef türünü silmez. Link düzeltme ve eşleştirme
+kaydetmek gönderim yapmaz. Ayrıntıda müşterinin girdiği değer ve elle iletilecek
+yardım mesajını kopyalama düğmesi vardır; müşteriye otomatik mesaj gönderilmez.
+
+Eski belirsiz ilan incelemelerinin bekleyen genel uyarıları yeniden oynatılmaz;
+sipariş kayıtları kendiliğinden silinmez. Panel durum hatası üçüncü denemede tek
+uyarı oluşturur; aynı kesinti sürerken sayaç ve kayıt tekrar yazılmaz. İyileşme veya
+gerçek durum değişimi yine kaydedilir. Boşta ek sorgu ya da hatırlatma yoktur.

@@ -116,6 +116,7 @@
       <label>Adet<input data-field="quantity" type="number" min="1" max="1000000" step="1" value="1000" required inputmode="numeric"></label>
       <label>Platform<select data-field="platform">{% for platform,label in [('instagram','Instagram'),('tiktok','TikTok'),('youtube','YouTube'),('x','X'),('twitch','Twitch'),('kick','Kick'),('facebook','Facebook'),('telegram','Telegram'),('other','Diğer')] %}<option value="{{ platform }}">{{ label }}</option>{% endfor %}</select></label>
       <label>Servis adı (isteğe bağlı)<input data-field="name" maxlength="150" placeholder="Örn. Takipçi / Beğeni"></label>
+      <label>İstenen link<select data-field="target_type"><option value="auto">Ürün adına göre kontrol et</option><option value="profile">Profil / kanal (takipçi, abone)</option><option value="content">Gönderi / video (beğeni, izlenme)</option></select><small>Yeni ilanda seç; yanlış türde link gönderilmesin.</small></label>
     </div>
   </section>
 </template>
