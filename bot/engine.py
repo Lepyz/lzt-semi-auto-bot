@@ -7,7 +7,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import panel_key
-from .payloads import classify, extract_links, get_advert_id, get_order_id, get_product_name
+from .payloads import classify, customer_links, extract_links, get_advert_id, get_event, get_order_id, get_product_name
+from .links import PLATFORMS, link_issue, target_type
 from .payloads import get_sale_price, ignored_summary, legacy_payload_key, normalize_panel_link, parse_price, source_key, target_key, valid_link
 from .store import Conflict
 from .history import IN_FLIGHT, STALLED_AFTER, is_stalled, phase_since, stalled_notice
@@ -40,6 +41,10 @@ def normalize_binding(data, panels):
             raise ValueError("Servis bilgisi okunamadı.")
         if not part.get("active", True):
             continue
+        platform = str(part.get("platform") or data.get("platform") or "instagram").lower()
+        kind = part.get("target_type", "auto")
+        if platform not in {*PLATFORMS, "other"} or kind not in {"auto", "profile", "content"}:
+            raise ValueError("Platform veya hedef link türü geçersiz.")
         key = panel_key(part.get("panel_key") or part.get("panel"))
         service = str(part.get("service_id", "")).strip()
         try:
@@ -49,8 +54,10 @@ def normalize_binding(data, panels):
         if key not in panels or not service.isdigit() or not 0 < quantity <= 1_000_000:
             raise ValueError("Panel, servis kimliği veya adet geçersiz.")
         result.append({"panel": key, "service_id": service, "quantity": quantity,
-                       "platform": str(part.get("platform") or data.get("platform") or "instagram").lower(),
+                       "platform": platform,
                        "name": str(part.get("name", ""))[:150]})
+        if kind != "auto":
+            result[-1]["target_type"] = kind
     if not result:
         raise ValueError("Aktif servis bulunamadı.")
     return {"name": str(data.get("name", ""))[:200], "active": bool(data.get("active", True)),
@@ -107,6 +114,8 @@ class Engine:
                  "legacy_source_key": legacy_key,
                  "itemsatis_id": get_order_id(payload), "advert_id": get_advert_id(payload),
                  "product_name": get_product_name(payload)[:200], "links": extract_links(payload),
+                 "customer_inputs": customer_links(payload), "receipt_kind": kind,
+                 "receipt_event": get_event(payload)[:80],
                  "sale_price": price, "price_source": price_source,
                  "price_version": 2,
                  "link": "", "target": "", "parts": [], "state": "queued" if kind == "order" else "review",
@@ -209,6 +218,18 @@ class Engine:
 
     def prepare(self, order):
         if order["parts"]:
+            for part in order["parts"]:
+                if part["state"] in {"new", "error"}:
+                    issue = link_issue(part["link"], part["platform"], target_type(part, order.get("product_name", "")))
+                    if issue:
+                        raise Hold(issue, "Müşteri linki gönderime uygun değil; hedefi kontrol edin.")
+            if all(p["state"] in {"new", "error"} for p in order["parts"]):
+                targets = {target_key(p["link"], p["platform"]) for p in order["parts"]}
+                if len(targets) != 1:
+                    raise Hold("package_target", "Paket bileşenlerinin aynı hedef linki kullanması gerekiyor.")
+                for part in order["parts"]:
+                    part["link"] = normalize_panel_link(part["link"], part["platform"])
+                order.update(target=targets.pop(), link=normalize_panel_link(order["parts"][0]["link"], order["parts"][0]["platform"]))
             return
         binding = self.store.setting("binding:" + order["advert_id"])
         if not binding or not binding.get("active", True):
@@ -219,8 +240,15 @@ class Engine:
         parts = copy.deepcopy(binding["components"])
         for part in parts:
             link = order["links"].get(part["platform"]) or order.get("link") or ""
-            if not valid_link(link, part["platform"]):
-                raise Hold("link_missing", "Müşteri linki eksik veya servis platformuyla uyumsuz.")
+            inputs = order.get("customer_inputs", [])
+            matches = {target_key(v, part["platform"]): v for v in inputs if valid_link(v, part["platform"])}
+            if len(matches) > 1:
+                raise Hold("link_ambiguous", "Birden fazla hedef linki var; doğru hedefi seçip kaydedin.")
+            if not link and len(inputs) == 1:
+                link = inputs[0]
+            issue = link_issue(link, part["platform"], target_type(part, binding["name"]))
+            if issue:
+                raise Hold(issue, "Müşteri linki eksik, belirsiz veya servis hedefiyle uyumsuz.")
             part.update(link=normalize_panel_link(link, part["platform"]), state="new", smm_id="", status="")
         targets = {target_key(p["link"], p["platform"]) for p in parts}
         if len(targets) != 1:
@@ -230,6 +258,7 @@ class Engine:
     def earlier_hold(self, order):
         candidates = self.store.orders(states=MANUAL_STATES | {"uncertain", "queued", "processing"},
                                        target=order["target"], limit=10000)
+        candidates += self.store.alias_orders(order["target"], MANUAL_STATES | {"uncertain", "queued", "processing"})
         return next((o for o in candidates if o["id"] != order["id"] and
                      (o["created_at"], o["id"]) < (order["created_at"], order["id"])), None)
 
@@ -241,6 +270,9 @@ class Engine:
         for candidate in self.store.orders(target=target, limit=100000):
             if any(p["state"] in {"submitted", "sending", "uncertain"} for p in candidate["parts"]):
                 return self.store.acquire_target(target, candidate["id"])
+        for candidate in self.store.alias_orders(target, {"submitted", "error", "processing", "sending", "uncertain"}):
+            if candidate["state"] == "uncertain" or any(p["state"] in {"submitted", "sending", "uncertain"} for p in candidate["parts"]):
+                return candidate["id"]
         return None
 
     def wait(self, order, reason, monitor=True):
@@ -376,10 +408,10 @@ class Engine:
         elif attempted:
             self.check_results[order_id] = {"at": time.time(), "ok": False}
             # Stored on the order (a write only on failure) so a restart doesn't reset it.
-            order["status_failures"] = order.get("status_failures", 0) + 1
-            if order["status_failures"] < 3 or order.get("status_error"):
+            order["status_failures"] = min(order.get("status_failures", 0) + 1, 3)
+            if order["status_failures"] < 3:
                 self.store.save(order)
-            else:
+            elif not order.get("status_error"):
                 order["status_error"] = "Panelden güncel durum alınamadı. Son doğrulanmış durum gösteriliyor."
                 problem = dict(order, state="error", reason_code="status_unavailable", manual_approved=False,
                                alert_panel=next((p["panel"] for p in order["parts"] if p["state"] == "submitted"), ""))
@@ -475,7 +507,7 @@ class Engine:
             if order.get("advert_id") or not advert_id.isdigit() or int(advert_id) <= 0:
                 raise ValueError("Eksik ilan numarası için geçerli bir ilan seçin.")
             order["advert_id"] = advert_id
-        order.update(parts=[], link=link.strip(), links={p: link.strip() for p in (*order["links"], "other")},
+        order.update(parts=[], link=link.strip(), customer_inputs=[link.strip()], links={p: link.strip() for p in (*order["links"], "other")},
                      state="review", manual_required=True, error="", reason_code="")
         # Include all known platforms so a newly added binding can use the corrected link.
         from .payloads import PLATFORMS
@@ -580,7 +612,7 @@ class Engine:
                 owner = self.active_owner(target)
                 if owner:
                     self.refresh(owner, force=False)
-                else:
+                if not self.active_owner(target):
                     self.make_ready(target)
                 # Query only while an actual active order blocks another purchase.
                 owner = self.active_owner(target)

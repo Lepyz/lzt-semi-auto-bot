@@ -66,6 +66,9 @@ def rig(request, tmp_path):
     store = Store(settings.database_url)
     store.initialize()
     store.set_setting("paused", False)
+    # Most flow tests deliberately isolate dispatch from the loss guard.
+    # Default production protection is tested separately without this setting.
+    store.set_setting("profit_guard", {"mode": "observe", "min_profit": 10})
     store.set_setting("binding:10", {
         "name": "Takipçi", "active": True,
         "components": [{"panel": "smmrush", "service_id": "123", "quantity": 100,

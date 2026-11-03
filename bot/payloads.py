@@ -4,20 +4,9 @@ import json
 import re
 import hashlib
 import html
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 
-PLATFORMS = {
-    "instagram": ("instagram.com", "instagr.am"),
-    "tiktok": ("tiktok.com",),
-    "youtube": ("youtube.com", "youtu.be"),
-    "x": ("x.com", "twitter.com"),
-    "twitter": ("x.com", "twitter.com"),
-    "twitch": ("twitch.tv",),
-    "kick": ("kick.com",),
-    "facebook": ("facebook.com", "fb.watch"),
-    "telegram": ("t.me", "telegram.me"),
-}
+from .links import PLATFORMS, normalize_panel_link, target_key, valid_link
 
 
 def payload_variants(data):
@@ -59,6 +48,8 @@ def get_order_id(data):
     explicit = explicit_order_id(data)
     if explicit:
         return explicit
+    if not purchase_event(data):
+        return ""
     for item in variants:
         value = get_nested(item, "details.id", "data.id")
         if value not in ("", None):
@@ -70,32 +61,41 @@ def get_order_id(data):
     return ""
 
 
+def purchase_event(data):
+    event = normalize_panel_status_text(get_event(data))
+    return event in {"order created", "order create", "order paid", "order sold", "new order",
+                     "purchase created", "purchase create", "purchase paid", "sale created", "sale paid",
+                     "advert sold", "ilan satildi", "ilaniniz satildi", "siparis", "satildi", "sale", "purchase"}
+
+
 def classify(data):
-    """Unknown order-shaped messages are saved for review, never silently lost."""
+    """An advert or a generic notification ID is never evidence of a purchase."""
     event = normalize_panel_status_text(get_event(data))
     words = set(event.split())
     order_id, advert_id = get_order_id(data), get_advert_id(data)
     if words & CHAT_WORDS:
         return "ignore"
-    if event in {"listing chat started", "listing chat", "chat started", "advert updated"}:
+    if event in {"listing chat started", "listing chat", "chat started"}:
         return "ignore"
-    purchase = any(term in event for term in ("order created", "order create", "order paid",
-                   "purchase created", "purchase create", "purchase paid", "sale created",
-                   "sale paid", "advert sold", "ilan satildi", "ilaniniz satildi", "new order"))
-    purchase = purchase or event in {"siparis", "satildi", "sale", "purchase"}
-    if purchase:
+    # Listing lifecycle, payment reminders and existing-order status updates must
+    # not become a fresh SMM purchase, even when they carry an order_id.
+    if (not purchase_event(data) and words & {"updated", "update", "deleted", "expired", "renewed", "approved",
+            "rejected", "cancelled", "canceled", "refunded", "completed", "shipped", "delivered", "status"}
+            and not event == "payment completed"):
+        return "ignore"
+    if purchase_event(data):
         # Legacy Itemsatis sale notifications often have no purchase ID.
         # A known sale event + advert can proceed; binding/link checks still
         # happen before add. Exact webhook payloads are deduplicated.
         return "order" if advert_id else "review"
     if order_id and advert_id:
         return "order" if not event else "review"
-    if advert_id:
-        return "review"
     # A purchase in a changed format may lack the advert: keep it for review
     # instead of acknowledging it and losing it silently.
     if explicit_order_id(data) or words & PURCHASE_WORDS:
         return "review"
+    if advert_id and customer_links(data) and get_sale_price(data)[0] is not None:
+        return "review"  # A changed legacy sale format needs inspection, never auto-dispatch.
     return "ignore"
 
 
@@ -104,7 +104,7 @@ def ignored_summary(data):
     event = normalize_panel_status_text(get_event(data))
     reason = ("Sohbet / mesaj bildirimi" if set(event.split()) & CHAT_WORDS or event in {"listing chat started", "listing chat", "chat started"}
               else "İlan güncelleme bildirimi" if event == "advert updated"
-              else "Sipariş veya ilan bilgisi taşımıyor")
+              else "Satın alma kanıtı yok; yalnızca ilan / bildirim bilgisi")
     return {"event": event[:60], "reason": reason,
             "fields": ", ".join(sorted(str(key)[:30] for key in data)[:12])}
 
@@ -129,43 +129,6 @@ def source_key(data):
     return "payload:" + fingerprint
 
 
-def valid_link(link, platform):
-    value = normalize_panel_link(link, platform)
-    if not value or is_blocked_customer_asset_link(value):
-        return False
-    parsed = urlparse(value if "://" in value else "https://" + value)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
-        return False
-    allowed = PLATFORMS.get(platform)
-    if not allowed:
-        allowed = tuple(domain for domains in PLATFORMS.values() for domain in domains)
-    return bool(parsed.path.strip("/")) and any(host == d or host.endswith("." + d) for d in allowed)
-
-
-def target_key(link, platform=""):
-    """Canonicalize tracking parameters, preserving case-sensitive video IDs."""
-    parsed = urlparse(normalize_panel_link(link, platform))
-    host = (parsed.hostname or "").lower().removeprefix("www.").removeprefix("m.")
-    if host == "twitter.com":
-        host = "x.com"
-    path = parsed.path.rstrip("/")
-    if host in {"instagram.com", "tiktok.com"}:
-        path = path.lower()
-    query = dict(parse_qsl(parsed.query))
-    if host in {"youtu.be", "youtube.com"}:
-        video = path.lstrip("/") if host == "youtu.be" else query.get("v")
-        if path.startswith(("/shorts/", "/embed/")):
-            video = path.split("/")[2]
-        if video:
-            return "youtube.com/watch?v=" + video
-    kept = [(k, v) for k, v in parse_qsl(parsed.query)
-            if not k.lower().startswith(("utm_", "_")) and k.lower() not in {"si", "igsh", "feature"}]
-    if host in {"instagram.com", "tiktok.com"}:
-        kept = []
-    return host + path + ("?" + urlencode(sorted(kept)) if kept else "")
-
-
 def extract_links(data):
     result = {}
     for platform in (*PLATFORMS, "other"):
@@ -174,91 +137,9 @@ def extract_links(data):
             result[platform] = normalize_panel_link(link, platform)
     return result
 
-def normalize_text(text: str) -> str:
+
+def normalize_text(text):
     return str(text or "").lower().strip()
-
-
-def normalize_instagram_link(link: str) -> str:
-    link = str(link or "").strip()
-    if not link:
-        return ""
-    if link.startswith("@"):
-        link = f"https://www.instagram.com/{link[1:]}"
-    if not re.match(r"^https?://", link, re.IGNORECASE):
-        if "instagram.com" not in link.lower() and "instagr.am" not in link.lower():
-            link = f"https://www.instagram.com/{link.lstrip('@')}"
-        else:
-            link = "https://" + link
-
-    # Sadece Instagram için soru işaretinden sonrasını temizle.
-    # YouTube/TikTok/X gibi platformlarda ?v= veya benzeri kısımlar linkin parçası olabilir.
-    link = link.split("?")[0].split("#")[0]
-    link = link.rstrip("/")
-    return link
-
-
-def normalize_tiktok_link(link: str) -> str:
-    """TikTok paylaşım linklerini aynı hedef için kanonik hale getirir.
-
-    TikTok aynı profil/video linkine _r, _t, utm vb. geçici query parametreleri
-    ekleyebiliyor. Pending aynı-link koruması bu parametreler yüzünden kaçmasın
-    diye TikTok linklerinde query ve fragment temizlenir. Kısa vt/vm linkleri
-    canlı resolve edilmez; sadece üzerindeki query temizlenir.
-    """
-    link = str(link or "").strip()
-    if not link:
-        return ""
-
-    if link.startswith("@"):
-        handle = link.split("?", 1)[0].split("#", 1)[0].strip().lstrip("@").strip("/")
-        return f"https://www.tiktok.com/@{handle}" if handle else ""
-
-    lower = link.lower()
-    if not lower.startswith(("http://", "https://")):
-        if "tiktok.com" in lower:
-            link = "https://" + link.lstrip("/")
-        else:
-            return link
-
-    try:
-        parsed = urlparse(link)
-        host = (parsed.netloc or "").lower()
-        path = (parsed.path or "").rstrip("/")
-        if not host:
-            return link.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-
-        canonical_host = host
-        if host in {"tiktok.com", "m.tiktok.com", "www.tiktok.com"}:
-            canonical_host = "www.tiktok.com"
-
-        # Query/fragment TikTok hedefini değil paylaşım izleme parametrelerini taşır.
-        return urlunparse((parsed.scheme or "https", canonical_host, path or "/", "", "", "")).rstrip("/")
-    except Exception:
-        return link.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-
-
-def is_tiktok_platform_or_link(link: str = "", platform: str = "") -> bool:
-    platform = normalize_text(platform)
-    link_text = str(link or "").lower()
-    return platform in {"tiktok", "tik_tok", "tt"} or "tiktok.com" in link_text or "vm.tiktok.com" in link_text or "vt.tiktok.com" in link_text
-
-
-def normalize_panel_link(link: str, platform: str = "") -> str:
-    link = str(link or "").strip()
-    platform = normalize_text(platform)
-
-    if not link:
-        return ""
-
-    if platform == "instagram":
-        return normalize_instagram_link(link)
-
-    if is_tiktok_platform_or_link(link, platform):
-        return normalize_tiktok_link(link)
-
-    if not re.match(r"^https?://", link, re.IGNORECASE) and "." in link.split("/")[0]:
-        link = "https://" + link
-    return link
 
 
 def normalize_panel_status_text(value) -> str:
@@ -623,167 +504,44 @@ def collect_strings(obj, results=None):
     return results
 
 
-def find_order_link(data: dict, platform: str = "") -> str:
-    """Müşterinin girdiği gerçek sosyal medya linkini bulur.
-
-    ÖNEMLİ GÜVENLİK KURALI:
-    Itemsatış webhook içinde ilan görseli gibi CDN linkleri de gelebiliyor.
-    Paket sisteminde bu CDN linki yanlışlıkla panele gönderilmesin diye,
-    platform belli ise sadece o platformun domainlerini kabul ederiz.
-    Link bulunamazsa boş döner ve sipariş panele gönderilmez.
-    """
-    platform = normalize_text(platform)
-
-    priority_paths = [
-        # Önce müşterinin doldurduğu post_datas alanları
-        "post_datas.Profil Linki",
-        "post_datas.Link",
-        "post_datas.Video Linki",
-        "post_datas.Gönderi Linki",
-        "post_datas.Kanal Linki",
-        "post_datas.TikTok Linki",
-        "post_datas.Instagram Linki",
-        "post_datas.YouTube Linki",
-        "post_datas.Youtube Linki",
-        "details.post_datas.Profil Linki",
-        "details.post_datas.Link",
-        "details.post_datas.Video Linki",
-        "details.post_datas.Gönderi Linki",
-        "details.post_datas.Kanal Linki",
-        "details.post_datas.TikTok Linki",
-        "details.post_datas.Instagram Linki",
-        "details.post_datas.YouTube Linki",
-        "details.post_datas.Youtube Linki",
-        "data.post_datas.Profil Linki",
-        "data.post_datas.Link",
-        "data.post_datas.Video Linki",
-        "data.post_datas.Gönderi Linki",
-        "data.post_datas.Kanal Linki",
-        "data.post_datas.TikTok Linki",
-        "data.post_datas.Instagram Linki",
-        "data.post_datas.YouTube Linki",
-        "data.post_datas.Youtube Linki",
-        # Sonra açık link alanları
-        "url", "link", "profile_link", "account_link", "video_link", "post_link",
-        "instagram", "instagram_link", "tiktok", "tiktok_link", "youtube", "youtube_link",
-        "details.url", "details.link", "details.instagram_link", "details.tiktok_link", "details.youtube_link",
-        "data.url", "data.link", "data.instagram_link", "data.tiktok_link", "data.youtube_link",
-        # Not alanları en son; burada ilan görseli/linki de olabilir, bu yüzden domain filtresi uygulanır.
-        "note", "message", "order_note", "customer_note",
-        "details.note", "details.message", "details.order_note", "details.customer_note",
-        "data.note", "data.message", "data.order_note", "data.customer_note",
-    ]
-
-    platform_domains = {
-        "instagram": ["instagram.com"],
-        "tiktok": ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"],
-        "youtube": ["youtube.com", "youtu.be"],
-        "x": ["x.com", "twitter.com"],
-        "twitter": ["x.com", "twitter.com"],
-        "twitch": ["twitch.tv"],
-        "kick": ["kick.com"],
-        "facebook": ["facebook.com", "fb.watch"],
-        "telegram": ["t.me", "telegram.me"],
-    }
-
-    blocked_url_markers = [
-        "cdn.itemsatis.com",
-        "itemsatis.com/uploads",
-        "/uploads/",
-        "post_images",
-        "product_images",
-        "advert_images",
-        "ilan-resim",
-    ]
-    blocked_extensions = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico", ".avif")
-
-    def clean_candidate(value: str) -> str:
-        v = str(value or "").strip()
-        # Noktalama/HTML kırıntılarını temizle
-        return v.strip().strip("'\"<>.,;)])}")
-
-    def is_asset_or_itemsatis_image(value: str) -> bool:
-        v = str(value or "").strip().lower()
-        if not v:
-            return True
-        if any(marker in v for marker in blocked_url_markers):
-            return True
-        no_query = v.split("?")[0]
-        if no_query.endswith(blocked_extensions):
-            return True
-        return False
-
-    def has_allowed_platform_domain(value: str) -> bool:
-        v = str(value or "").lower()
-        domains = platform_domains.get(platform, [])
-        return bool(domains and any(domain in v for domain in domains))
-
-    def looks_like_link(value: str) -> bool:
-        v = clean_candidate(value).lower()
-        if not v:
-            return False
-        if is_asset_or_itemsatis_image(v):
-            return False
-
-        domains = platform_domains.get(platform, [])
-
-        # Instagram kullanıcı adı desteklenir.
-        if platform == "instagram" and v.startswith("@") and len(v) > 2:
-            return True
-
-        # Platform belliyse sadece o platformun domainleri kabul edilir.
-        # Böylece cdn.itemsatis.com ilan görseli TikTok linki sanılmaz.
-        if domains:
-            return any(domain in v for domain in domains)
-
-        # Platform other/general ise asset olmayan genel URL kabul edilir.
-        if v.startswith("http://") or v.startswith("https://"):
-            return True
-        if "." in v and " " not in v:
-            return True
-        return False
-
-    # Öncelikli alanlarda tek alan direkt link ise al.
-    # Önemli: Itemsatış bazen asıl alanları raw string içindeki dict olarak gönderir;
-    # bu yüzden hem ana payload hem raw içindeki gömülü payload taranır.
+def customer_links(data):
+    """Only buyer-supplied fields, never seller profiles, listing text or images."""
+    result = []
+    direct = ("url", "link", "profile_link", "account_link", "video_link", "post_link",
+              "instagram", "instagram_link", "tiktok", "tiktok_link", "youtube", "youtube_link")
+    notes = ("note", "message", "order_note", "customer_note", "content")
     for payload in payload_variants(data):
-        for path in priority_paths:
-            value = get_nested(payload, path)
-            if isinstance(value, str) and looks_like_link(value):
-                return normalize_panel_link(clean_candidate(value), platform)
+        for obj in (payload, payload.get("details", {})):
+            if not isinstance(obj, dict):
+                continue
+            for key in ("post_datas", "postData", "post_data"):
+                fields = parse_jsonish_post_datas(obj.get(key))
+                if isinstance(fields, dict):
+                    for label, value in fields.items():
+                        label = normalize_panel_status_text(label)
+                        if isinstance(value, str) and any(word in label for word in
+                                ("link", "url", "profil", "kullanici", "username", "hesap", "kanal", "baglanti", "adres", "hedef")):
+                            result.append(value.strip()[:500])
+            result.extend(obj[key].strip()[:500] for key in direct if isinstance(obj.get(key), str) and obj[key].strip())
+    if not result:
+        # Legacy sale messages may embed a URL. Never extract a substring from an
+        # untrusted hostname (e.g. evil.com/instagram.com/customer).
+        for payload in payload_variants(data):
+            for obj in (payload, payload.get("details", {})):
+                if isinstance(obj, dict):
+                    for key in notes:
+                        text = obj.get(key)
+                        if isinstance(text, str):
+                            result.extend(re.findall(r"(?:https?://|www\.)[^\s<>'\"]+", text)[:10])
+    return list(dict.fromkeys(value for value in result if value))[:10]
 
-    all_strings = collect_strings(data)
-    joined = "\n".join(all_strings)
 
-    # Platform belliyse önce sadece o platformun domainini ara.
-    domains = platform_domains.get(platform, [])
-    if platform == "instagram":
-        match = re.search(r"(https?://)?(www\.)?instagram\.com/[A-Za-z0-9._/\-?=&%]+", joined, re.IGNORECASE)
-        if match:
-            candidate = clean_candidate(match.group(0))
-            if not is_asset_or_itemsatis_image(candidate):
-                return normalize_panel_link(candidate, platform)
-        for text in all_strings:
-            text = clean_candidate(text)
-            if text.startswith("@") and len(text) > 2:
-                return normalize_panel_link(text, platform)
-        return ""
-
-    if domains:
-        domain_pattern = "|".join(re.escape(d) for d in domains)
-        match = re.search(rf"(?:https?://)?(?:www\.)?(?:{domain_pattern})/[^\s<>'\"]+", joined, re.IGNORECASE)
-        if match:
-            value = clean_candidate(match.group(0))
-            if not value.startswith("http"):
-                value = "https://" + value
-            if not is_asset_or_itemsatis_image(value):
-                return normalize_panel_link(value, platform)
-        return ""
-
-    # Platform bilinmiyorsa genel URL ara ama ilan görseli/CDN linklerini reddet.
-    for match in re.finditer(r"https?://[^\s<>'\"]+", joined, re.IGNORECASE):
-        candidate = clean_candidate(match.group(0))
-        if not is_asset_or_itemsatis_image(candidate):
-            return normalize_panel_link(candidate, platform)
-
-    return ""
+def find_order_link(data, platform=""):
+    matches = {}
+    for value in customer_links(data):
+        # Trim wrapping punctuation, preserving dots in usernames.
+        value = value.strip("\"'<> ()[]{};,!")
+        if valid_link(value, platform):
+            matches[target_key(value, platform)] = normalize_panel_link(value, platform)
+    # Two different targets require a human choice, never silently pick the first.
+    return next(iter(matches.values())) if len(matches) == 1 else ""

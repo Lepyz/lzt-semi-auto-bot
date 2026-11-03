@@ -7,7 +7,7 @@ import json
 from .config import panel_key
 from .engine import normalize_binding
 
-HEADER = ["İlan", "Ad", "Durum", "Panel", "Servis", "Adet", "Platform", "Servis adı"]
+HEADER = ["İlan", "Ad", "Durum", "Panel", "Servis", "Adet", "Platform", "Servis adı", "Hedef türü"]
 
 
 def snapshot_hash(bindings):
@@ -23,7 +23,7 @@ def export_csv(bindings, panels):
         for part in binding.get("components", []):
             writer.writerow([advert, binding.get("name", ""), "aktif" if binding.get("active", True) else "pasif",
                              panels.get(part["panel"], {}).get("name", part["panel"]), part["service_id"],
-                             part["quantity"], part["platform"], part.get("name", "")])
+                             part["quantity"], part["platform"], part.get("name", ""), part.get("target_type", "auto")])
     return "﻿" + out.getvalue()
 
 
@@ -45,7 +45,7 @@ def resolve_panel(value, panels):
 
 def parse_import(text, current, panels):
     """Return (changes, errors). Adverts missing from the file are left untouched."""
-    lines = text.splitlines()
+    lines = text.lstrip("\ufeff").splitlines()
     if not lines:
         raise ValueError("Dosya boş.")
     delimiter = ";" if lines[0].count(";") >= lines[0].count(",") else ","
@@ -57,8 +57,12 @@ def parse_import(text, current, panels):
     for number, row in enumerate(reader, start=2):
         if not any(cell.strip() for cell in row):
             continue
-        row = (row + [""] * 8)[:8]
-        advert, name, status, panel, service, quantity, platform, part_name = (cell.strip() for cell in row)
+        row = (row + [""] * 9)[:9]
+        advert, name, status, panel, service, quantity, platform, part_name, target_type = (cell.strip() for cell in row)
+        if len(header) < 9:
+            existing = next((p for p in current.get(advert, {}).get("components", []) if
+                             p.get("service_id") == service and p.get("panel") == resolve_panel(panel, panels)), {})
+            target_type = existing.get("target_type", "auto")
         if not advert.isdigit():
             errors.append(f"Satır {number}: ilan numarası geçersiz.")
             continue
@@ -71,7 +75,7 @@ def parse_import(text, current, panels):
             continue
         entry = grouped.setdefault(advert, {"name": name, "active": status.casefold() == "aktif", "components": []})
         entry["components"].append({"panel": key, "service_id": service, "quantity": quantity,
-                                    "platform": platform or "instagram", "name": part_name})
+                                    "platform": platform or "instagram", "name": part_name, "target_type": target_type or "auto"})
     changes = []
     for advert, data in grouped.items():
         try:

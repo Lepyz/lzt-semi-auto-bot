@@ -101,7 +101,7 @@
     line(`Durum: ${field('active').selectedOptions[0].textContent}`);
     [...rows.children].forEach((row, i) => {
       const get = name => row.querySelector(`[data-field="${name}"]`);
-      line(`${i + 1}. ${get('panel').selectedOptions[0].textContent} · Servis ${get('service_id').value} · ${get('quantity').value} adet · ${get('platform').selectedOptions[0].textContent}`);
+      line(`${i + 1}. ${get('panel').selectedOptions[0].textContent} · Servis ${get('service_id').value} · ${get('quantity').value} adet · ${get('platform').selectedOptions[0].textContent} · ${get('target_type').selectedOptions[0].textContent}`);
     });
     line('Kaydetmek sipariş göndermez. Mevcut panel siparişleri korunur.');
     error.hidden = true;

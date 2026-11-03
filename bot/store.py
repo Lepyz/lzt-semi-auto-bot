@@ -357,6 +357,19 @@ class Store:
             row = self.execute(conn, "SELECT owner FROM target_locks WHERE target=?", (target,)).fetchone()
             return row["owner"] if row else None
 
+    def alias_orders(self, target, states):
+        from .links import old_target_keys, target_key
+        aliases = old_target_keys(target)
+        if not aliases:
+            return []
+        with self.transaction() as conn:
+            rows = self.execute(conn, "SELECT * FROM orders WHERE target IN (" + ",".join("?" for _ in aliases) +
+                                ") AND state IN (" + ",".join("?" for _ in states) + ") ORDER BY created_at,id",
+                                (*aliases, *states)).fetchall()
+        orders = [self.decode(row) for row in rows]
+        return [o for o in orders if o["state"] == "uncertain" and not o.get("parts") or
+                any(target_key(p.get("link", ""), p.get("platform", "")) == target for p in o.get("parts", []))]
+
     def release_target(self, target, owner):
         with self.transaction() as conn:
             self.execute(conn, "DELETE FROM target_locks WHERE target=? AND owner=?", (target, owner))

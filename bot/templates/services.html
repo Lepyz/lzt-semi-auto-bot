@@ -79,7 +79,7 @@
     <div class="mapping-meta"><small>İlan {{ id }}</small><span class="badge {{ 'submitted' if b.active else 'paused' }}">{{ 'Aktif' if b.active else 'Pasif' }}{{ ' · Paket' if b.components|length>1 }}</span></div>
     <h2>{{ b.name or 'İlan ' ~ id }}</h2>
     {% if rejected.get(id) %}<p class="error-text"><small>⚠️ Son 7 günde {{ rejected[id] }} siparişte panel servisi/adedi reddetti. Servis numarasını kontrol et.</small></p>{% endif %}
-    <ul class="mapping-parts">{% for p in b.components %}<li><strong>{{ panels.get(p.panel,{}).get('name',p.panel) }}</strong> · {{ p.quantity }} adet<small>Servis {{ p.service_id }} · {{ p.platform }}{% if p.name %} · {{ p.name }}{% endif %}</small></li>{% endfor %}</ul>
+    <ul class="mapping-parts">{% for p in b.components %}<li><strong>{{ panels.get(p.panel,{}).get('name',p.panel) }}</strong> · {{ p.quantity }} adet<small>Servis {{ p.service_id }} · {{ p.platform }}{% if p.name %} · {{ p.name }}{% endif %}{% if p.get('target_type') %} · {{ 'Profil / kanal' if p.target_type=='profile' else 'Gönderi / video' }}{% endif %}</small></li>{% endfor %}</ul>
     <div class="mapping-actions"><button type="button" data-edit="{{ id }}" aria-label="İlan {{ id }} eşleştirmesini düzenle">Düzenle</button><button type="button" data-copy="{{ id }}" aria-label="İlan {{ id }} eşleştirmesini kopyala">Kopyala</button></div>
   </article>
 {% endfor %}
@@ -116,6 +116,7 @@
       <label>Adet<input data-field="quantity" type="number" min="1" max="1000000" step="1" value="1000" required inputmode="numeric"></label>
       <label>Platform<select data-field="platform">{% for platform,label in [('instagram','Instagram'),('tiktok','TikTok'),('youtube','YouTube'),('x','X'),('twitch','Twitch'),('kick','Kick'),('facebook','Facebook'),('telegram','Telegram'),('other','Diğer')] %}<option value="{{ platform }}">{{ label }}</option>{% endfor %}</select></label>
       <label>Servis adı (isteğe bağlı)<input data-field="name" maxlength="150" placeholder="Örn. Takipçi / Beğeni"></label>
+      <label>İstenen link<select data-field="target_type"><option value="auto">Ürün adına göre kontrol et</option><option value="profile">Profil / kanal (takipçi, abone)</option><option value="content">Gönderi / video (beğeni, izlenme)</option></select><small>Yeni ilanda seç; yanlış türde link gönderilmesin.</small></label>
     </div>
   </section>
 </template>
