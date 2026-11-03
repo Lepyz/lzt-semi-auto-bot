@@ -149,6 +149,19 @@ def test_same_status_outage_does_not_keep_writing_or_notifying(rig, monkeypatch)
     assert len(rig.notices) == 2 and rig.store.owner(order["target"]) == order["id"]
 
 
+def test_manually_approved_old_alias_cannot_bypass_current_active_target(rig):
+    first = receive_and_run(rig, 1)
+    order, _ = rig.engine.receive(payload(2))
+    rig.engine.prepare(order)
+    order["parts"][0]["link"] = "https://instagr.am/customer"
+    order.update(target="instagr.am/customer", state="review")
+    rig.store.save(order)
+    rig.engine.approve(order["id"], order["revision"])
+    rig.engine.execute(order["id"])
+    assert rig.store.get(order["id"])["state"] == "waiting" and len(rig.panels.adds) == 1
+    assert rig.store.owner(first["target"]) == first["id"]
+
+
 @pytest.mark.parametrize("value,code", [
     ("https://instagram.com/p/AbC", "link_type"),
     ("https://tiktok.com/@customer", "link_missing"),
