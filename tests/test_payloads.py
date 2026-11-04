@@ -9,7 +9,7 @@ def test_embedded_legacy_python_dict_payload():
     data = {"raw": "{'event':'advert_sold','order_id':'777','advert_id':'10','post_datas':{'Link':'https://instagram.com/customer'}}"}
     assert classify(data) == "order"
     assert get_order_id(data) == "777"
-    assert extract_links(data)["instagram"] == "https://instagram.com/customer"
+    assert extract_links(data)["instagram"] == "https://www.instagram.com/customer"
 
 
 def test_notification_id_does_not_override_real_purchase_id():

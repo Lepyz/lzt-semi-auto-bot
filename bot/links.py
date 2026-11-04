@@ -18,12 +18,14 @@ def normalize_panel_link(link, platform=""):
     if not value or re.search(r"[\s\\\x00-\x1f]", value):
         return ""
     # A handle is useful only on the two platforms where we know its exact form.
-    handle = value.lstrip("@")
+    handle = value.removeprefix("@").rstrip("/")
     pattern = r"[A-Za-z0-9_][A-Za-z0-9._]{0,29}" if platform == "instagram" else r"[A-Za-z0-9_][A-Za-z0-9._]{0,23}"
-    if platform in {"instagram", "tiktok"} and re.fullmatch(pattern, handle) and not re.search(
-            r"\.(com|net|org|co|io|tv|me|am)$", handle, re.I):
+    if platform in {"instagram", "tiktok"} and re.fullmatch(pattern, handle) and (value.startswith("@") or not re.search(
+            r"\.(com|net|org|co|io|tv|me|am)$", handle, re.I)):
         prefix = "https://www.instagram.com/" if platform == "instagram" else "https://www.tiktok.com/@"
         return prefix + handle
+    if platform == "instagram" and re.fullmatch(r"/?(?:reel|p|tv)/[A-Za-z0-9_-]+/?", value):
+        return "https://www.instagram.com/" + value.lstrip("/")
     if "://" not in value:
         value = "https://" + value
     try:
@@ -38,6 +40,13 @@ def normalize_panel_link(link, platform=""):
                 return ""
         base = host.removeprefix("www.").removeprefix("m.").removeprefix("mobile.")
         host = {"instagr.am": "instagram.com", "twitter.com": "x.com", "telegram.me": "t.me"}.get(base, base)
+        if host == "instagram.com":
+            # Panel URL and duplicate-detection key have different purposes.
+            # Keep the full customer's path, query and fragment; only complete
+            # HTTPS/www. Do not strip or lowercase a Reel's identifier.
+            if "%" in unquote(parsed.path):
+                return ""
+            return urlunsplit(("https", "www.instagram.com", parsed.path, parsed.query, parsed.fragment))
         if host == "tiktok.com":
             host = "www.tiktok.com"
         path = unquote(parsed.path).rstrip("/")
@@ -103,7 +112,7 @@ def target_key(link, platform=""):
         return ""
     parsed = urlsplit(value)
     host = parsed.hostname.removeprefix("www.").removeprefix("m.").removeprefix("mobile.")
-    path = parsed.path.rstrip("/")
+    path = unquote(parsed.path).rstrip("/")
     if host in {"instagram.com", "tiktok.com", "x.com"} and len(path.strip("/").split("/")) == 1:
         path = path.lower()
     query = dict(parse_qsl(parsed.query))
@@ -114,6 +123,8 @@ def target_key(link, platform=""):
         if video:
             return "youtube.com/watch?v=" + video
     kept = [(k, v) for k, v in parse_qsl(parsed.query) if not k.lower().startswith(("utm_", "_")) and k.lower() not in {"si", "igsh", "feature"}]
+    if host in {"instagram.com", "tiktok.com"}:
+        kept = []
     return host + path + ("?" + urlencode(sorted(kept)) if kept else "")
 
 

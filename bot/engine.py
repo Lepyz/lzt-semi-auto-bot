@@ -223,12 +223,11 @@ class Engine:
                     issue = link_issue(part["link"], part["platform"], target_type(part, order.get("product_name", "")))
                     if issue:
                         raise Hold(issue, "Müşteri linki gönderime uygun değil; hedefi kontrol edin.")
+                    part["link"] = normalize_panel_link(part["link"], part["platform"])
             if all(p["state"] in {"new", "error"} for p in order["parts"]):
                 targets = {target_key(p["link"], p["platform"]) for p in order["parts"]}
                 if len(targets) != 1:
                     raise Hold("package_target", "Paket bileşenlerinin aynı hedef linki kullanması gerekiyor.")
-                for part in order["parts"]:
-                    part["link"] = normalize_panel_link(part["link"], part["platform"])
                 order.update(target=targets.pop(), link=normalize_panel_link(order["parts"][0]["link"], order["parts"][0]["platform"]))
             return
         binding = self.store.setting("binding:" + order["advert_id"])
