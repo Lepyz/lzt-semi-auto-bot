@@ -247,6 +247,11 @@ platform doğrulanır; yanıltıcı alt alanlar, boş profil/video yolları, gir
 ve servis için yanlış hedef türü gönderilmez. Birden fazla farklı hedefte seçim
 yapılmaz. Eksik https:// ile Instagram / TikTok kullanıcı adı güvenli biçimde
 tamamlanır; yanlış yazılmış site adresi veya eksik video kimliği tahmin edilmez.
+Instagram profil adresi `https://www.instagram.com/kullaniciadi`, Reels adresi
+`https://www.instagram.com/reel/VIDEO_KIMLIGI` biçimine tamamlanır. Tam URL'deki
+www, yol, sondaki eğik çizgi, sorgu ve parça korunur; video kimliğinin harfleri
+değiştirilmez. Aynı hedef kontrolü ayrı bir anahtarla yapılır; farklı paylaşım
+parametreleri ikinci aktif sipariş açılmasına izin vermez.
 TikTok kısa URL'leri çevrimdışı çözülemediği için tam link istenir. Profilin varlığı,
 hesabın gizliliği veya canlı erişilebilirliği bu çevrimdışı kontrolle doğrulanmaz.
 

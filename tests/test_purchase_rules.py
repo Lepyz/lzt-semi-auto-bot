@@ -99,7 +99,7 @@ def test_seller_listing_and_image_links_are_not_customer_inputs():
 
 
 def test_turkish_customer_connection_label_still_reads_the_target():
-    assert extract_links({"post_datas": {"Bağlantı adresiniz": "instagram.com/customer"}})["instagram"] == "https://instagram.com/customer"
+    assert extract_links({"post_datas": {"Bağlantı adresiniz": "instagram.com/customer"}})["instagram"] == "https://www.instagram.com/customer"
 
 
 def test_alias_and_tracking_formats_lock_the_same_customer(rig):
