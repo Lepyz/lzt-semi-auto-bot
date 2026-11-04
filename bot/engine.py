@@ -7,8 +7,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import panel_key
-from .payloads import classify, customer_links, extract_links, get_advert_id, get_event, get_order_id, get_product_name
-from .links import PLATFORMS, link_issue, target_type
+from .payloads import classify, customer_input_platforms, customer_links, extract_links, get_advert_id, get_event, get_order_id, get_product_name
+from .links import PLATFORMS, canonical_target, link_issue, platform_name, target_type
 from .payloads import get_sale_price, ignored_summary, legacy_payload_key, normalize_panel_link, parse_price, source_key, target_key, valid_link
 from .store import Conflict
 from .history import IN_FLIGHT, STALLED_AFTER, is_stalled, phase_since, stalled_notice
@@ -115,6 +115,7 @@ class Engine:
                  "itemsatis_id": get_order_id(payload), "advert_id": get_advert_id(payload),
                  "product_name": get_product_name(payload)[:200], "links": extract_links(payload),
                  "customer_inputs": customer_links(payload), "receipt_kind": kind,
+                 "input_platforms": customer_input_platforms(payload),
                  "receipt_event": get_event(payload)[:80],
                  "sale_price": price, "price_source": price_source,
                  "price_version": 2,
@@ -216,11 +217,24 @@ class Engine:
             except Exception:
                 pass  # Persisted claim is recovered conservatively on restart.
 
+    def link_inputs(self, order, platform):
+        scopes = order.get("input_platforms", {})
+        values = order.get("customer_inputs", []) or list(order.get("links", {}).values())
+        return [v for v in values if not scopes.get(v) or "" in scopes[v] or platform_name(platform) in scopes[v]]
+
     def prepare(self, order):
         if order["parts"]:
             for part in order["parts"]:
                 if part["state"] in {"new", "error"}:
-                    issue = link_issue(part["link"], part["platform"], target_type(part, order.get("product_name", "")))
+                    kind = target_type(part, order.get("product_name", ""))
+                    existing = target_key(part["link"], part["platform"])
+                    # Older prepared rows may contain a stripped URL. Restore
+                    # the retained buyer URL only when it identifies this same target.
+                    for value in sorted(self.link_inputs(order, part["platform"]), key=lambda v: "://" not in v):
+                        if valid_link(value, part["platform"], kind) and target_key(value, part["platform"]) == existing:
+                            part["link"] = normalize_panel_link(value, part["platform"])
+                            break
+                    issue = link_issue(part["link"], part["platform"], kind)
                     if issue:
                         raise Hold(issue, "Müşteri linki gönderime uygun değil; hedefi kontrol edin.")
                     part["link"] = normalize_panel_link(part["link"], part["platform"])
@@ -239,7 +253,7 @@ class Engine:
         parts = copy.deepcopy(binding["components"])
         for part in parts:
             link = order["links"].get(part["platform"]) or order.get("link") or ""
-            inputs = order.get("customer_inputs", [])
+            inputs = self.link_inputs(order, part["platform"])
             matches = {target_key(v, part["platform"]): v for v in inputs if valid_link(v, part["platform"])}
             if len(matches) > 1:
                 raise Hold("link_ambiguous", "Birden fazla hedef linki var; doğru hedefi seçip kaydedin.")
@@ -255,13 +269,15 @@ class Engine:
         order.update(parts=parts, link=parts[0]["link"], target=targets.pop())
 
     def earlier_hold(self, order):
+        target = canonical_target(order["target"])
         candidates = self.store.orders(states=MANUAL_STATES | {"uncertain", "queued", "processing"},
-                                       target=order["target"], limit=10000)
-        candidates += self.store.alias_orders(order["target"], MANUAL_STATES | {"uncertain", "queued", "processing"})
-        return next((o for o in candidates if o["id"] != order["id"] and
+                                       target=target, limit=10000)
+        candidates += self.store.alias_orders(target, MANUAL_STATES | {"uncertain", "queued", "processing"})
+        return next((o for o in sorted(candidates, key=lambda v: (v["created_at"], v["id"])) if o["id"] != order["id"] and
                      (o["created_at"], o["id"]) < (order["created_at"], order["id"])), None)
 
     def active_owner(self, target):
+        target = canonical_target(target)
         owner = self.store.owner(target)
         if owner:
             return owner
@@ -448,8 +464,10 @@ class Engine:
 
     def make_ready(self, target, previous=None):
         """Only a notice. This method NEVER enqueues or submits a waiting order."""
+        target = canonical_target(target)
         waiting = self.store.orders(states={"waiting"}, target=target, limit=10000)
-        for order in waiting:
+        waiting += self.store.alias_orders(target, {"waiting"})
+        for order in sorted(waiting, key=lambda v: (v["created_at"], v["id"])):
             if self.active_owner(target) or self.earlier_hold(order):
                 continue
             order.update(state="ready", manual_required=True, error="")
@@ -506,7 +524,7 @@ class Engine:
             if order.get("advert_id") or not advert_id.isdigit() or int(advert_id) <= 0:
                 raise ValueError("Eksik ilan numarası için geçerli bir ilan seçin.")
             order["advert_id"] = advert_id
-        order.update(parts=[], link=link.strip(), customer_inputs=[link.strip()], links={p: link.strip() for p in (*order["links"], "other")},
+        order.update(parts=[], link=link.strip(), customer_inputs=[link.strip()], input_platforms={}, links={p: link.strip() for p in (*order["links"], "other")},
                      state="review", manual_required=True, error="", reason_code="")
         # Include all known platforms so a newly added binding can use the corrected link.
         from .payloads import PLATFORMS

@@ -25,7 +25,7 @@ def test_legacy_details_id_is_still_supported():
 
 def test_json_encoded_customer_fields():
     data = {"post_datas": json.dumps({"Link": "https://tiktok.com/@customer"})}
-    assert extract_links(data)["tiktok"] == "https://www.tiktok.com/@customer"
+    assert extract_links(data)["tiktok"] == "https://tiktok.com/@customer"
 
 
 @pytest.mark.parametrize("event", ["listing_chat_started", "message.created", "review_received", "order.message"])

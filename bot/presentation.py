@@ -29,7 +29,7 @@ REASONS = {
     "binding_missing": ("Bu ilan otomasyona bağlı değil veya eşleştirmesi pasif.", "İstersen ilan ayarını web panelinden düzenleyebilirsin."),
     "link_missing": ("Müşteri linki eksik veya seçilen platformla uyumsuz.", "Linki düzeltip bilgileri kaydet. Kaydetmek sipariş göndermez."),
     "link_type": ("Link, servisin istediği hedef türüne uymuyor (profil / gönderi).", "Takipçi için profil, beğeni veya izlenme için ilgili gönderi/video linkini kontrol et."),
-    "link_short": ("TikTok kısa paylaşım linkinin gerçek hedefi doğrulanamadı.", "Müşteriden tarayıcıdaki tam profil veya video linkini iste; web panelinden düzelt."),
+    "link_short": ("Kısa paylaşım linkinin gerçek hedefi doğrulanamadı.", "Müşteriden tarayıcıdaki tam profil veya video linkini iste; web panelinden düzelt."),
     "link_ambiguous": ("Müşteri birden fazla farklı hedef yazmış; hangisinin kullanılacağı belli değil.", "Doğru tek hedefi seçip web panelinden kaydet. Otomatik seçim yapılmadı."),
     "package_target": ("Paket bileşenlerinin hedef linkleri birbiriyle uyumlu değil.", "Paket servislerini ve müşteri linkini kontrol et."),
     "panel_config": ("Panel bağlantı bilgileri eksik.", "Bağlantı ayarlarını kontrol et; ardından kaydı tekrar incele."),

@@ -266,3 +266,28 @@ Eski belirsiz ilan incelemelerinin bekleyen genel uyarıları yeniden oynatılma
 sipariş kayıtları kendiliğinden silinmez. Panel durum hatası üçüncü denemede tek
 uyarı oluşturur; aynı kesinti sürerken sayaç ve kayıt tekrar yazılmaz. İyileşme veya
 gerçek durum değişimi yine kaydedilir. Boşta ek sorgu ya da hatırlatma yoktur.
+
+## Tüm platformlarda link biçimi
+
+Instagram, TikTok, YouTube, X/Twitter, Twitch, Kick, Facebook ve Telegram için
+bağlı servisin platformuna göre kullanıcı adı / @ad ve tanınan eksik içerik yolu
+tamamlanır. Genel bir alan adından video veya profil kimliği tahmin edilmez.
+Instagram'ın istenen www biçimi korunur; diğer platformlarda tam URL'nin geçerli
+hostu (www, mobil veya resmî alternatif), yolu, sondaki eğik çizgi, harf büyüklüğü,
+sorgusu ve parçası panele aynen iletilir. Eksik protokol HTTPS ile tamamlanır.
+
+YouTube v, Facebook id/v/story_fbid/fbid, Twitch clip/video gibi hedef kimliği
+taşıyan sorgular silinmez. Twitch klip/oynatıcı, Facebook profil/video/Reels ve
+Telegram davet/mesaj yolları kendi türleriyle doğrulanır. Aynı hedef karşılaştırması
+ayrı anahtarla yapılır ve önceden desteklenen URL biçimlerinin kayıtlı anahtar
+anlamı korunur; bu değişiklik bekleyen siparişleri otomatik göndermez.
+
+Müşteri alanının platformu da korunur: youtube_link içine girilen @ad Instagram
+hedefi sayılmaz. Kök müşteri alanlarında ve post_datas etiketlerinde tüm destekli
+platformlar okunur; satıcı/ilan açıklamalarından hedef üretilmez. Bu bilgi siparişin
+mevcut kaydında tutulur; ek tarama, zamanlayıcı, SQL tablosu veya panel isteği yoktur.
+
+Biçim referansları: [YouTube kanal adresleri](https://support.google.com/youtube/answer/6180214),
+[Twitch klipleri](https://dev.twitch.tv/docs/api/clips/),
+[Twitch oynatıcıları](https://dev.twitch.tv/docs/embed/video-and-clips/),
+[Telegram bağlantıları](https://core.telegram.org/api/links).

@@ -504,11 +504,19 @@ def collect_strings(obj, results=None):
     return results
 
 
-def customer_links(data):
-    """Only buyer-supplied fields, never seller profiles, listing text or images."""
+def _field_platform(label):
+    text = normalize_panel_status_text(label)
+    aliases = {"instagram": "instagram", "insta": "instagram", "tiktok": "tiktok", "youtube": "youtube",
+               "x": "x", "twitter": "x", "twitch": "twitch", "kick": "kick", "facebook": "facebook", "telegram": "telegram"}
+    found = {value for key, value in aliases.items() if key in text.split()}
+    return next(iter(found)) if len(found) == 1 else ""
+
+
+def _customer_link_entries(data):
+    """Buyer fields with their declared platform; no seller/listing descriptions."""
     result = []
-    direct = ("url", "link", "profile_link", "account_link", "video_link", "post_link",
-              "instagram", "instagram_link", "tiktok", "tiktok_link", "youtube", "youtube_link")
+    direct = ("url", "link", "profile_link", "account_link", "video_link", "post_link") + tuple(
+        field for name in PLATFORMS for field in (name, name + "_link", name + "_url"))
     notes = ("note", "message", "order_note", "customer_note", "content")
     for payload in payload_variants(data):
         for obj in (payload, payload.get("details", {})):
@@ -519,10 +527,11 @@ def customer_links(data):
                 if isinstance(fields, dict):
                     for label, value in fields.items():
                         label = normalize_panel_status_text(label)
-                        if isinstance(value, str) and any(word in label for word in
-                                ("link", "url", "profil", "kullanici", "username", "hesap", "kanal", "baglanti", "adres", "hedef")):
-                            result.append(value.strip()[:500])
-            result.extend(obj[key].strip()[:500] for key in direct if isinstance(obj.get(key), str) and obj[key].strip())
+                        declared = _field_platform(label)
+                        if isinstance(value, str) and (declared or any(word in label for word in
+                                ("link", "url", "profil", "kullanici", "username", "hesap", "kanal", "baglanti", "adres", "hedef"))):
+                            result.append((value.strip()[:500], declared))
+            result.extend((obj[key].strip()[:500], _field_platform(key)) for key in direct if isinstance(obj.get(key), str) and obj[key].strip())
     if not result:
         # Legacy sale messages may embed a URL. Never extract a substring from an
         # untrusted hostname (e.g. evil.com/instagram.com/customer).
@@ -532,15 +541,31 @@ def customer_links(data):
                     for key in notes:
                         text = obj.get(key)
                         if isinstance(text, str):
-                            result.extend(re.findall(r"(?:https?://|www\.)[^\s<>'\"]+", text)[:10])
-    return list(dict.fromkeys(value for value in result if value))[:10]
+                            result.extend((value, "") for value in re.findall(r"(?:https?://|www\.)[^\s<>'\"]+", text)[:10])
+    return list(dict.fromkeys((value, declared) for value, declared in result if value))[:10]
+
+
+def customer_links(data, platform=""):
+    from .links import platform_name
+    wanted = platform_name(platform)
+    return list(dict.fromkeys(value for value, declared in _customer_link_entries(data)
+                              if not wanted or wanted == "other" or not declared or declared == wanted))
+
+
+def customer_input_platforms(data):
+    result = {}
+    for value, declared in _customer_link_entries(data):
+        if declared not in result.setdefault(value, []):
+            result[value].append(declared)
+    return result
 
 
 def find_order_link(data, platform=""):
     matches = {}
-    for value in customer_links(data):
-        # Trim wrapping punctuation, preserving dots in usernames.
-        value = value.strip("\"'<> ()[]{};,!")
+    for value in customer_links(data, platform):
+        # Preserve complete URLs, including meaningful punctuation in fragments.
+        if not valid_link(value, platform):
+            value = value.strip("\"'<> ()[]{}")
         if valid_link(value, platform):
             matches[target_key(value, platform)] = normalize_panel_link(value, platform)
     # Two different targets require a human choice, never silently pick the first.
