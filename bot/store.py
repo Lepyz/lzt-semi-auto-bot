@@ -358,14 +358,22 @@ class Store:
             return row["owner"] if row else None
 
     def alias_orders(self, target, states):
-        from .links import old_target_keys, target_key
+        from .links import old_target_keys, old_target_patterns, target_key
         aliases = old_target_keys(target)
-        if not aliases:
+        patterns = old_target_patterns(target)
+        if not aliases and not patterns:
             return []
+        conditions, values = [], []
+        if aliases:
+            conditions.append("target IN (" + ",".join("?" for _ in aliases) + ")")
+            values.extend(aliases)
+        for pattern in patterns:
+            conditions.append("target LIKE ? ESCAPE '!'")
+            values.append(pattern)
         with self.transaction() as conn:
-            rows = self.execute(conn, "SELECT * FROM orders WHERE target IN (" + ",".join("?" for _ in aliases) +
-                                ") AND state IN (" + ",".join("?" for _ in states) + ") ORDER BY created_at,id",
-                                (*aliases, *states)).fetchall()
+            rows = self.execute(conn, "SELECT * FROM orders WHERE (" + " OR ".join(conditions) +
+                                ") AND target<>? AND state IN (" + ",".join("?" for _ in states) + ") ORDER BY created_at,id",
+                                (*values, target, *states)).fetchall()
         orders = [self.decode(row) for row in rows]
         return [o for o in orders if o["state"] == "uncertain" and not o.get("parts") or
                 any(target_key(p.get("link", ""), p.get("platform", "")) == target for p in o.get("parts", []))]
