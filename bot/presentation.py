@@ -27,6 +27,7 @@ STATES = {
 REASONS = {
     "advert_missing": ("Satın alma alındı ancak hangi ilana ait olduğu okunamadı.", "Web panelinden ilan numarasını ve müşteri linkini kontrol edip kaydet. Kaydetmek sipariş göndermez."),
     "binding_missing": ("Bu ilan otomasyona bağlı değil veya eşleştirmesi pasif.", "İstersen ilan ayarını web panelinden düzenleyebilirsin."),
+    "link_username": ("Siparişte link bulunamadı: müşteri link yerine kullanıcı adı yazmış.", "Müşteriden tam profil veya gönderi linkini al, 'Linki düzelt' ile kaydet. Kaydetmek sipariş göndermez."),
     "link_missing": ("Müşteri linki eksik veya seçilen platformla uyumsuz.", "Linki düzeltip bilgileri kaydet. Kaydetmek sipariş göndermez."),
     "link_type": ("Link, servisin istediği hedef türüne uymuyor (profil / gönderi).", "Takipçi için profil, beğeni veya izlenme için ilgili gönderi/video linkini kontrol et."),
     "link_short": ("TikTok kısa paylaşım linkinin gerçek hedefi doğrulanamadı.", "Müşteriden tarayıcıdaki tam profil veya video linkini iste; web panelinden düzelt."),
@@ -144,7 +145,12 @@ def summary(order):
         return " ".join(str(value).split())[:300]
     return (f"🧾 Kayıt: {order.get('itemsatis_id') or order['id'][:10]}\n"
             f"📦 Ürün: {line(order.get('product_name') or 'İlan ' + order.get('advert_id', ''))}\n"
-            f"🔗 Hedef: {line(order.get('link') or next(iter(order.get('links', {}).values()), 'Link eksik'))}")
+            f"🔗 Hedef: {line(order.get('link') or next(iter(order.get('links', {}).values()), '') or missing_link(order))}")
+
+
+def missing_link(order):
+    typed = next((v for v in order.get("customer_inputs", []) if str(v).strip()), "")
+    return f"Link bulunamadı (müşteri yazdı: {typed})" if typed else "Link eksik"
 
 
 def cleanup_actions(order):
