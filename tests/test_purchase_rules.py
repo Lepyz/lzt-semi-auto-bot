@@ -48,7 +48,7 @@ def test_positive_purchase_evidence_is_still_kept(data, kind):
 
 
 def test_known_legacy_sale_and_true_incomplete_sale_notify_once(rig):
-    data = {"event": "advert_sold", "advert_id": "10", "post_datas": {"Link": "@customer"}}
+    data = {"event": "advert_sold", "advert_id": "10", "post_datas": {"Link": "https://instagram.com/customer"}}
     order, _ = rig.engine.receive(data)
     rig.engine.execute(order["id"])
     assert rig.store.get(order["id"])["state"] == "submitted"
@@ -61,14 +61,22 @@ def test_known_legacy_sale_and_true_incomplete_sale_notify_once(rig):
     assert rig.store.get(order["id"])["reason_code"] == "link_missing"
 
 
-@pytest.mark.parametrize("value,platform", [
-    ("instagram.com/customer", "instagram"), ("@customer", "instagram"), ("customer.name", "instagram"),
-    ("@customer", "tiktok"), ("customer", "tiktok"), ("tiktok.com/@customer", "tiktok"),
-])
-def test_unambiguous_incomplete_customer_links_are_completed(value, platform):
+@pytest.mark.parametrize("value,platform", [("instagram.com/customer", "instagram"), ("tiktok.com/@customer", "tiktok")])
+def test_links_without_scheme_are_completed(value, platform):
     assert valid_link(value, platform, "profile")
-    assert normalize_panel_link(value, platform).startswith("https://")
+    assert normalize_panel_link(value, platform).startswith("https://www.")
     assert platform in extract_links({"post_datas": {"Profil Linki": value}})
+
+
+@pytest.mark.parametrize("value,platform", [
+    ("@customer", "instagram"), ("customer.name", "instagram"), ("customer", "instagram"),
+    ("@customer", "tiktok"), ("customer", "tiktok"),
+])
+def test_usernames_are_never_turned_into_links(value, platform):
+    from bot.links import link_issue
+    assert normalize_panel_link(value, platform) == ""
+    assert link_issue(value, platform, "profile") == "link_username"
+    assert platform not in extract_links({"post_datas": {"Profil Linki": value}})
 
 
 @pytest.mark.parametrize("value,platform", [
@@ -105,9 +113,9 @@ def test_turkish_customer_connection_label_still_reads_the_target():
 def test_alias_and_tracking_formats_lock_the_same_customer(rig):
     first = receive_and_run(rig, 1, "https://instagram.com/Customer?igsh=tracking")
     second = receive_and_run(rig, 2, "instagr.am/customer/")
-    third = receive_and_run(rig, 3, "@CUSTOMER")
+    third = receive_and_run(rig, 3, "https://m.instagram.com/CUSTOMER/#share")
     assert first["state"] == "submitted" and second["state"] == third["state"] == "waiting"
-    assert len(rig.panels.adds) == 1
+    assert len(rig.panels.adds) == 1 and rig.panels.adds[0][1] == "https://www.instagram.com/Customer"
     rig.panels.current = {"status": "Completed", "terminal": True}
     rig.engine.refresh(first["id"])
     assert rig.store.get(second["id"])["state"] == "ready"
@@ -118,7 +126,7 @@ def test_canonical_video_ids_preserve_case_and_ignore_tracking():
     assert target_key("https://instagram.com/p/AbC", "instagram") != target_key("https://instagram.com/p/abc", "instagram")
     assert target_key("https://youtube.com/shorts/AbC?si=1", "youtube") == target_key("https://youtu.be/AbC", "youtube")
     assert target_key("https://instagram.com/%63ustomer", "instagram") == target_key("https://instagram.com/customer", "instagram")
-    assert target_key("https://mobile.instagr.am/Customer", "instagram") == target_key("@customer", "instagram")
+    assert target_key("https://mobile.instagr.am/Customer", "instagram") == target_key("https://www.instagram.com/customer?utm_source=qr", "instagram")
     assert target_key("https://mobile.twitter.com/Customer", "x") == target_key("https://x.com/customer", "x")
 
 
@@ -130,7 +138,7 @@ def test_old_instagram_alias_lock_still_blocks_new_canonical_customer(rig):
     first["parts"][0]["link"] = "https://instagr.am/customer"
     rig.store.save(first)
     rig.store.acquire_target(old, first["id"])
-    second = receive_and_run(rig, 2, "@customer")
+    second = receive_and_run(rig, 2, "https://www.instagram.com/customer")
     assert second["state"] == "waiting" and len(rig.panels.adds) == 1
     # Complete via the old target; the canonical waiter still becomes ready,
     # and is never sent automatically.
@@ -181,7 +189,7 @@ def test_bad_target_is_preserved_with_specific_reason_without_panel_cost_calls(r
 
 def test_multiple_targets_and_tiktok_short_links_require_manual_repair(rig):
     data = payload()
-    data["post_datas"] = {"Profil Linki": "@one", "Link": "@two"}
+    data["post_datas"] = {"Profil Linki": "https://instagram.com/one", "Link": "https://instagram.com/two"}
     order, _ = rig.engine.receive(data)
     rig.engine.execute(order["id"])
     assert rig.store.get(order["id"])["reason_code"] == "link_ambiguous"
@@ -190,7 +198,9 @@ def test_multiple_targets_and_tiktok_short_links_require_manual_repair(rig):
     rig.store.set_setting("binding:10", binding)
     order = receive_and_run(rig, 2, "https://vt.tiktok.com/ABC")
     assert order["reason_code"] == "link_short" and not rig.panels.adds
-    rig.engine.repair(order["id"], "@customer", order["revision"])
+    with pytest.raises(ValueError, match="kullanıcı adı"):
+        rig.engine.repair(order["id"], "@customer", order["revision"])  # a username is not a fix
+    rig.engine.repair(order["id"], "https://www.tiktok.com/@customer?lang=tr", order["revision"])
     repaired = rig.store.get(order["id"])
     assert repaired["parts"][0]["link"] == "https://www.tiktok.com/@customer" and repaired["state"] == "review"
     assert not rig.panels.adds and len(rig.jobs) == 2

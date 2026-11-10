@@ -59,7 +59,7 @@
 </section>
 {% if order.state in manual_states and not order.parts|selectattr('state','in',['submitted','finished','sending','uncertain'])|list %}
 <section class="card" id="repair"><h2>🛠️ Sipariş bilgilerini düzelt</h2><p>İlan ayarı değiştiyse eşleştirmeyi yenileyebilir veya müşteri linkini düzeltebilirsin. Kaydetmek sipariş göndermez.</p>
-  {% if order.reason_code in ['link_missing','link_type','link_short','link_ambiguous'] %}
+  {% if order.reason_code in ['link_missing','link_username','link_type','link_short','link_ambiguous'] %}
   <div class="order-reason"><strong>🔗 Link yardımı</strong><p>Instagram ve TikTok kullanıcı adı veya @kullaniciadi yazılabilir. Instagram adresi https://www.instagram.com/ biçimine tamamlanır; tam linkteki www ve Reels kimliği korunur. Takipçi için profil; beğeni / izlenme için tam gönderi veya video linki gerekir. Yazım hatası olan site adresi tahmin edilmez; TikTok kısa linki yerine tam adres istenir.</p>
   {% if order.get('customer_inputs') %}<p>Müşterinin yazdığı:</p><ul>{% for value in order.customer_inputs %}<li>{{ value }}</li>{% endfor %}</ul>{% endif %}
   <button type="button" data-copy-text="Merhaba, siparişinizi başlatmak için satın aldığınız hizmete ait bağlantıyı tekrar paylaşır mısınız? Takipçi/abone için profil veya kanal, beğeni/izlenme için ilgili gönderi ya da videonun tam bağlantısı gerekiyor. TikTok kullanıyorsanız kısa paylaşım linki yerine tarayıcıdaki tam adresi iletebilirsiniz. Teşekkürler.">Müşteriye yazılacak mesajı kopyala</button><small>Mesajı sen iletirsin; bot müşteriye otomatik mesaj göndermez.</small></div>

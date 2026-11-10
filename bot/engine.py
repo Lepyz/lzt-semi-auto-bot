@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import panel_key
 from .payloads import classify, customer_links, extract_links, get_advert_id, get_event, get_order_id, get_product_name
-from .links import PLATFORMS, link_issue, target_type
+from .links import PLATFORMS, link_issue, looks_like_username, target_type
 from .payloads import get_sale_price, ignored_summary, legacy_payload_key, normalize_panel_link, parse_price, source_key, target_key, valid_link
 from .store import Conflict
 from .history import IN_FLIGHT, STALLED_AFTER, is_stalled, phase_since, stalled_notice
@@ -216,10 +216,20 @@ class Engine:
             except Exception:
                 pass  # Persisted claim is recovered conservatively on restart.
 
+    @staticmethod
+    def username_hold(inputs, platform):
+        """The buyer typed only a username: hold it as 'link bulunamadı', never complete it."""
+        if inputs and not any(valid_link(v, platform) for v in inputs) and any(looks_like_username(v) for v in inputs):
+            shown = next(v for v in inputs if looks_like_username(v))[:60]
+            raise Hold("link_username", f"Link bulunamadı: müşteri link yerine kullanıcı adı yazmış ({shown}). "
+                                        "Müşteriden tam linki alıp düzelt.")
+
     def prepare(self, order):
         if order["parts"]:
             for part in order["parts"]:
                 if part["state"] in {"new", "error"}:
+                    # Older records may hold a link completed from a username.
+                    self.username_hold(order.get("customer_inputs", []), part["platform"])
                     issue = link_issue(part["link"], part["platform"], target_type(part, order.get("product_name", "")))
                     if issue:
                         raise Hold(issue, "Müşteri linki gönderime uygun değil; hedefi kontrol edin.")
@@ -245,7 +255,11 @@ class Engine:
                 raise Hold("link_ambiguous", "Birden fazla hedef linki var; doğru hedefi seçip kaydedin.")
             if not link and len(inputs) == 1:
                 link = inputs[0]
+            if not link:
+                self.username_hold(inputs, part["platform"])
             issue = link_issue(link, part["platform"], target_type(part, binding["name"]))
+            if issue == "link_username":
+                self.username_hold([link], part["platform"])
             if issue:
                 raise Hold(issue, "Müşteri linki eksik, belirsiz veya servis hedefiyle uyumsuz.")
             part.update(link=normalize_panel_link(link, part["platform"]), state="new", smm_id="", status="")
